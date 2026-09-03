@@ -629,9 +629,6 @@ mod tests {
     fn reconcile_refreshes_index_after_file_change() {
         // End-to-end smoke test for the watch action: a file change followed by
         // a reconcile must land in the on-disk index.
-        let _guard = crate::HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock is after epoch")
@@ -640,8 +637,7 @@ mod tests {
             std::env::temp_dir().join(format!("varde-watch-home-{}-{stamp}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("home creates");
-        let original_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", &home) };
+        let _home_override = crate::test_support::HomeOverride::new(&home);
 
         let root =
             std::env::temp_dir().join(format!("varde-watch-repo-{}-{stamp}", std::process::id()));
@@ -671,10 +667,6 @@ mod tests {
         assert!(beta >= 1, "reconcile picked up the newly added function");
         drop(conn);
 
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&root);
     }

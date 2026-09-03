@@ -1,8 +1,8 @@
 ---
 type: task
 parent: 2026-09-03-test-home-isolation-graph-timeout
-status: backlog
-verified: pending
+status: done
+verified: passed
 depends_on: []
 modifies:
   - crates/varde-code/src/build.rs
@@ -30,3 +30,4 @@ restoration. Replace direct test mutations in each affected module.
 
 #### Progress
 
+- Centralized test HOME mutation behind an RAII guard; all 506 library tests pass.

@@ -603,9 +603,6 @@ mod tests {
         // `run_with_force` resolves its db path from `HOME` (the conventional
         // repo-db layout) — isolate it like every other HOME-touching test to
         // avoid racing the real home dir or other parallel tests.
-        let _guard = crate::HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "varde-build-home-eager-cache-{}-{}",
             std::process::id(),
@@ -616,8 +613,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("home creates");
-        let original_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", &home) };
+        let _home_override = crate::test_support::HomeOverride::new(&home);
 
         let root = temp_fixture_root("eager-cache-full-build");
         std::fs::write(root.join("a.rs"), "fn a() { b(); }").expect("a.rs writes");
@@ -639,10 +635,6 @@ mod tests {
         assert!(rev >= 0, "graph_cache rev must be a valid ledger value");
 
         drop(conn);
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -654,9 +646,6 @@ mod tests {
         // repo must serialize on the repo lock and all succeed — not race
         // SQLite's per-connection EXCLUSIVE lock into a SQLITE_BUSY error, which
         // `run_incremental` has no busy-retry of its own to absorb.
-        let _guard = crate::HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "varde-build-home-concurrent-{}-{}",
             std::process::id(),
@@ -667,8 +656,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("home creates");
-        let original_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", &home) };
+        let _home_override = crate::test_support::HomeOverride::new(&home);
 
         let root = temp_fixture_root("concurrent-build");
         std::fs::write(root.join("a.rs"), "fn a() { b(); }").expect("a.rs writes");
@@ -694,10 +682,6 @@ mod tests {
                 .expect("concurrent incremental build succeeds without SQLITE_BUSY");
         }
 
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -993,29 +993,9 @@ mod tests {
         }
     }
 
-    /// Redirect `HOME` (which drives the conventional DB path) to an isolated
-    /// temp dir for the duration of `f`, serialized against every other test
-    /// that mutates `HOME` via the shared [`crate::HOME_TEST_LOCK`].
+    /// Run `f` with an isolated HOME-derived conventional DB path.
     fn with_isolated_home<F: FnOnce()>(label: &str, f: F) {
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
-        let home = std::env::temp_dir().join(format!(
-            "varde-slice-home-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).expect("home creates");
-        let original = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", &home) };
-        f();
-        match original {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        let _ = std::fs::remove_dir_all(&home);
+        crate::test_support::with_isolated_home(&format!("slice-{label}"), f);
     }
 
     fn db_of(root: &std::path::Path) -> std::path::PathBuf {

@@ -992,25 +992,18 @@ query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files 
         std::fs::write(path, contents).expect("fixture writes");
     }
 
-    /// Point HOME at `home`, then build a fresh index for `repo` at the
-    /// conventional (HOME-derived) DB path.
+    /// Build a fresh index using `home` as the conventional DB root.
     fn with_fresh_db(home: &std::path::Path, repo: &std::path::Path) {
-        unsafe { std::env::set_var("HOME", home) };
+        let _home_override = crate::test_support::HomeOverride::while_locked(home);
         crate::build::run_with_force(repo.to_str().expect("repo is utf8"), true)
             .expect("fresh build succeeds");
     }
 
-    /// Restore the previous HOME (captured before the test redirected it).
-    fn restore_home(original: Option<std::ffi::OsString>) {
-        match original {
-            Some(home) => unsafe { std::env::set_var("HOME", home) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-    }
+    // `with_fresh_db` owns its RAII restoration. These preserve the existing
+    // fixture call shape while no longer mutating HOME directly.
+    fn capture_home() {}
 
-    fn capture_home() -> Option<std::ffi::OsString> {
-        std::env::var_os("HOME")
-    }
+    fn restore_home(_: ()) {}
 
     /// Run `git <args>` inside `repo`, asserting success.
     fn git(repo: &std::path::Path, args: &[&str]) {
