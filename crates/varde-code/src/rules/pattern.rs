@@ -221,7 +221,7 @@ fn run_pattern_rule(
         };
 
     let langs: Vec<ast_grep_language::SupportLang> = match &rule.languages {
-        Some(names) => {
+        Some(names) if !names.is_empty() => {
             let mut resolved = Vec::new();
             for name in names {
                 match crate::parse::language_from_name(name) {
@@ -236,6 +236,7 @@ fn run_pattern_rule(
             resolved
         }
         None => crate::parse::SUPPORTED_LANGUAGES.to_vec(),
+        Some(_) => crate::parse::SUPPORTED_LANGUAGES.to_vec(),
     };
 
     let mut findings = Vec::new();
@@ -265,7 +266,7 @@ fn run_pattern_rule(
         let input = serde_json::json!({
             "pattern": pattern,
             "path": repo_root.display().to_string(),
-            "language": lang_name(&lang),
+            "language": crate::parse::language_name(&lang),
         });
         let matches = match crate::query::find_pattern::find_pattern(&input) {
             Ok(matches) => matches,
@@ -329,27 +330,51 @@ fn run_pattern_rule(
     Ok((findings, diagnostics))
 }
 
-/// Canonical language name accepted by find_pattern's `language` input.
-fn lang_name(lang: &ast_grep_language::SupportLang) -> &'static str {
-    use ast_grep_language::SupportLang;
-    match lang {
-        SupportLang::Rust => "rust",
-        SupportLang::TypeScript => "typescript",
-        SupportLang::Tsx => "tsx",
-        SupportLang::JavaScript => "javascript",
-        SupportLang::Go => "go",
-        SupportLang::Java => "java",
-        SupportLang::CSharp => "csharp",
-        SupportLang::Kotlin => "kotlin",
-        SupportLang::Swift => "swift",
-        SupportLang::Python => "python",
-        _ => "rust",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn php_rules_use_the_php_grammar() {
+        assert_eq!(
+            crate::parse::language_name(&ast_grep_language::SupportLang::Php),
+            "php"
+        );
+    }
+
+    #[test]
+    fn every_supported_rule_language_has_its_own_grammar_name() {
+        use ast_grep_language::SupportLang::*;
+
+        let cases = [
+            (TypeScript, "typescript"),
+            (Tsx, "tsx"),
+            (JavaScript, "javascript"),
+            (C, "c"),
+            (Cpp, "cpp"),
+            (Go, "go"),
+            (Java, "java"),
+            (CSharp, "csharp"),
+            (Kotlin, "kotlin"),
+            (Swift, "swift"),
+            (Python, "python"),
+            (Ruby, "ruby"),
+            (Php, "php"),
+            (Lua, "lua"),
+            (Scala, "scala"),
+            (Dart, "dart"),
+            (Elixir, "elixir"),
+            (Solidity, "solidity"),
+            (Haskell, "haskell"),
+            (Bash, "bash"),
+            (Rust, "rust"),
+        ];
+
+        assert_eq!(crate::parse::SUPPORTED_LANGUAGES.len(), cases.len());
+        for (lang, name) in cases {
+            assert_eq!(crate::parse::language_name(&lang), name, "{lang:?}");
+        }
+    }
 
     fn match_with_captures(
         captures: serde_json::Map<String, serde_json::Value>,
@@ -766,6 +791,31 @@ function render(): void {
             assert!(findings.is_empty());
             assert_eq!(diagnostics.len(), 1);
             assert!(diagnostics[0].reason.contains("cobol"));
+
+            let _ = fs::remove_dir_all(&repo);
+            let _ = fs::remove_file(&db_path);
+        }
+
+        #[test]
+        fn empty_language_list_matches_omitted_language_list() {
+            let repo = tempdir("empty-languages");
+            let file_path = repo.join("main.ts");
+            fs::write(&file_path, FIXTURE).expect("fixture writes");
+            let db_path = persist_fixture_db(&repo, &file_path);
+            let conn = crate::db::open(&db_path).expect("db opens");
+
+            let omitted = rule("omitted-languages", "console.log($MSG)", None);
+            let mut empty = rule("empty-languages", "console.log($MSG)", None);
+            empty.languages = Some(Vec::new());
+
+            let (omitted_findings, omitted_diagnostics) =
+                run_pattern_rules(&[omitted], &repo, &conn).expect("pipeline succeeds");
+            let (empty_findings, empty_diagnostics) =
+                run_pattern_rules(&[empty], &repo, &conn).expect("pipeline succeeds");
+
+            assert_eq!(empty_diagnostics, omitted_diagnostics);
+            assert_eq!(empty_findings.len(), omitted_findings.len());
+            assert_eq!(empty_findings.len(), 2, "both console calls match");
 
             let _ = fs::remove_dir_all(&repo);
             let _ = fs::remove_file(&db_path);

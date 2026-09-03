@@ -546,7 +546,7 @@ fn open_or_build(repo_root: &str, scope: &Scope) -> Result<rusqlite::Connection>
             // a full repo build repopulates every slice, regardless of the
             // requesting scope.
             drop(conn);
-            crate::build::run_with_force(repo_root, true)?;
+            crate::build::run_full_while_locked(repo_root, &db_path)?;
             crate::db::open_incremental(&db_path)
         }
     }
@@ -565,7 +565,7 @@ fn build_or_open(
             Err(_) => drop(conn), // fall through to a full build on any failure
         }
     }
-    crate::build::run_with_force(repo_root, true)?;
+    crate::build::run_full_while_locked(repo_root, db_path)?;
     crate::db::open_incremental(db_path)
 }
 
@@ -1141,6 +1141,35 @@ mod tests {
                 "a schema-mismatch rebuild triggered by a per-file scope must repopulate every file, not just the requested one"
             );
 
+            let _ = std::fs::remove_file(db_of(&root));
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    #[test]
+    fn repo_scope_missing_index_full_build_reuses_freshen_lock() {
+        // `ensure_fresh` holds `repo_lock` before `open_or_build` falls back
+        // to a full build. The fallback must reuse that lock, not wait for its
+        // own non-reentrant flock until the 30-second acquisition timeout.
+        with_isolated_home("missing-index-full-build", || {
+            let root = temp_root("missing-index-full-build");
+            std::fs::write(root.join("a.rs"), "fn a() {}\n").expect("writes a");
+            std::fs::write(root.join("b.rs"), "fn b() {}\n").expect("writes b");
+
+            ensure_fresh(
+                &[Slice::Raw],
+                root.to_str().expect("utf-8 root"),
+                &Scope::Repo,
+            )
+            .expect("missing-index full build succeeds while freshen lock is held");
+
+            let conn = crate::db::open(&db_of(&root)).expect("db opens");
+            let file_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                .expect("file count reads");
+            assert_eq!(file_count, 2, "full fallback indexes every repo file");
+
+            drop(conn);
             let _ = std::fs::remove_file(db_of(&root));
             let _ = std::fs::remove_dir_all(&root);
         });

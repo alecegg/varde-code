@@ -195,7 +195,7 @@ fn match_snippet(rule: &Rule, snippet: &str) -> Result<Vec<serde_json::Value>, A
         let input = serde_json::json!({
             "pattern": pattern_text,
             "filePath": path.display().to_string(),
-            "language": lang_name(&lang),
+            "language": crate::parse::language_name(&lang),
         });
         let result = crate::query::find_pattern::find_pattern(&input);
         let _ = std::fs::remove_file(&path);
@@ -224,23 +224,6 @@ fn write_snippet(snippet: &str) -> Result<std::path::PathBuf, ApiError> {
     std::fs::write(&path, snippet)
         .map_err(|e| ApiError::new("file_error", format!("failed to write test snippet: {e}")))?;
     Ok(path)
-}
-
-fn lang_name(lang: &ast_grep_language::SupportLang) -> &'static str {
-    use ast_grep_language::SupportLang;
-    match lang {
-        SupportLang::Rust => "rust",
-        SupportLang::TypeScript => "typescript",
-        SupportLang::Tsx => "tsx",
-        SupportLang::JavaScript => "javascript",
-        SupportLang::Go => "go",
-        SupportLang::Python => "python",
-        SupportLang::Java => "java",
-        SupportLang::CSharp => "csharp",
-        SupportLang::Kotlin => "kotlin",
-        SupportLang::Swift => "swift",
-        _ => "rust",
-    }
 }
 
 /// Run every `[[test]]` entry declared on a `kind = "sql"` rule.

@@ -276,6 +276,7 @@ pub(crate) fn resolve_imports(
         .map(|(i, p)| (p.as_str(), i as u32))
         .collect();
     let stem_index = build_stem_index(files);
+    let relative_path_index = build_relative_path_index(files);
 
     let mut edges = Vec::new();
     for (i, entity) in entities.iter().enumerate() {
@@ -296,7 +297,13 @@ pub(crate) fn resolve_imports(
             );
             continue;
         };
-        let target = match_import_target(&entity.name, from_file, &by_path, &stem_index);
+        let target = match_import_target(
+            &entity.name,
+            from_file,
+            &by_path,
+            &stem_index,
+            &relative_path_index,
+        );
         if target.is_none() {
             // debug, not warn: on a large repo this fires per-unresolved-import
             // (often tens of thousands of times) — warn-level volume made
@@ -331,6 +338,12 @@ pub(crate) fn resolve_imports(
 type StemIndex =
     std::collections::HashMap<String, Vec<(u32, Option<ast_grep_language::SupportLang>)>>;
 
+/// Normalized, extensionless file path -> (file id, language). This serves
+/// relative imports such as `./x` without making unrelated same-stem files
+/// compete in the global fallback index.
+type RelativePathIndex =
+    std::collections::HashMap<String, Vec<(u32, Option<ast_grep_language::SupportLang>)>>;
+
 /// Build the stem index once per resolve pass (not once per import).
 fn build_stem_index(files: &[String]) -> StemIndex {
     let mut index: StemIndex = std::collections::HashMap::new();
@@ -346,20 +359,48 @@ fn build_stem_index(files: &[String]) -> StemIndex {
     index
 }
 
+fn build_relative_path_index(files: &[String]) -> RelativePathIndex {
+    let mut index: RelativePathIndex = std::collections::HashMap::new();
+    for (i, file) in files.iter().enumerate() {
+        let path = normalize_path(std::path::Path::new(file));
+        let stem_path = path.with_extension("");
+        let lang = crate::parse::language_for_path(&path);
+        index
+            .entry(stem_path.to_string_lossy().into_owned())
+            .or_default()
+            .push((i as u32, lang));
+    }
+    index
+}
+
 /// Find the file an import specifier points at, or `None`.
 fn match_import_target(
     spec: &str,
     from_file: &str,
     by_path: &std::collections::HashMap<&str, u32>,
     stem_index: &StemIndex,
+    relative_path_index: &RelativePathIndex,
 ) -> Option<u32> {
     // 1. Relative-path resolution against the importing file's directory,
     //    using the unquoted specifier BEFORE prefix stripping (so `../x`
     //    and `./x` resolve from the importing file, not globally).
-    if let Some(rel) = resolve_relative(spec, from_file)
-        && let Some(&pos) = by_path.get(rel.as_str())
-    {
-        return Some(pos);
+    if let Some(rel) = resolve_relative(spec, from_file) {
+        if let Some(&pos) = by_path.get(rel.as_str()) {
+            return Some(pos);
+        }
+
+        let from_lang = crate::parse::language_for_path(std::path::Path::new(from_file));
+        let relative_stem = normalize_path(std::path::Path::new(&rel)).with_extension("");
+        let matches: Vec<u32> = relative_path_index
+            .get(relative_stem.to_string_lossy().as_ref())
+            .into_iter()
+            .flatten()
+            .filter(|(_, lang)| from_lang.is_none() || *lang == from_lang)
+            .map(|(i, _)| *i)
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0]);
+        }
     }
 
     let norm = normalize_spec(spec);
@@ -444,11 +485,33 @@ fn resolve_relative(spec: &str, from_file: &str) -> Option<String> {
     } else {
         t
     };
-    if !unquoted.contains('/') {
+    if !(unquoted.starts_with("./") || unquoted.starts_with("../")) {
         return None;
     }
     let dir = std::path::Path::new(from_file).parent()?;
-    Some(dir.join(unquoted).to_string_lossy().into_owned())
+    Some(
+        normalize_path(&dir.join(unquoted))
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Collapse `.` and `..` components without consulting the filesystem.
+fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -472,17 +535,13 @@ mod test_util {
     use crate::parse::parse_file;
 
     /// Parse + extract every fixture file under
-    /// `tests/resolve_fixtures/<rel>` (non-recursive, sorted).
+    /// `tests/resolve_fixtures/<rel>` (recursive, sorted).
     pub fn load_project(rel: &str) -> (Vec<Entity>, Vec<Symbol>, Vec<String>) {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/resolve_fixtures")
             .join(rel);
-        let mut paths: Vec<_> = std::fs::read_dir(&root)
-            .expect("resolve fixture dir exists")
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_file())
-            .collect();
+        let mut paths = Vec::new();
+        collect_paths(&root, &mut paths);
         paths.sort();
         let files: Vec<String> = paths
             .iter()
@@ -499,6 +558,20 @@ mod test_util {
             symbols.extend(result.symbols);
         }
         (entities, symbols, files)
+    }
+
+    fn collect_paths(root: &std::path::Path, paths: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(root)
+            .expect("resolve fixture dir exists")
+            .filter_map(|entry| entry.ok())
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_paths(&path, paths);
+            } else if path.is_file() {
+                paths.push(path);
+            }
+        }
     }
 
     /// File id of the node whose path ends with `suffix`.
@@ -548,6 +621,33 @@ mod import_resolution {
         assert_eq!(unresolved.len(), 1, "exactly one unresolved import edge");
         assert_eq!(unresolved[0].from, c);
         assert_eq!(unresolved[0].to, EdgeTarget::Unknown);
+    }
+
+    #[test]
+    fn relative_imports_resolve_before_duplicate_global_stems() {
+        let (entities, symbols, files) = load_project("typescript/relative_imports");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+        let sibling_importer = file_id(&graph, "/sibling/importer.ts");
+        let sibling_target = file_id(&graph, "/sibling/x.ts");
+        let parent_importer = file_id(&graph, "/parent/child/importer.ts");
+        let parent_target = file_id(&graph, "/parent/x.ts");
+
+        let import_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Import)
+            .collect();
+        assert_eq!(import_edges.len(), 2);
+        assert!(import_edges.iter().any(|edge| {
+            edge.from == sibling_importer
+                && edge.to == EdgeTarget::File(sibling_target)
+                && edge.resolved
+        }));
+        assert!(import_edges.iter().any(|edge| {
+            edge.from == parent_importer
+                && edge.to == EdgeTarget::File(parent_target)
+                && edge.resolved
+        }));
     }
 }
 

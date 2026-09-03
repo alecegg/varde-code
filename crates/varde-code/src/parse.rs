@@ -166,6 +166,39 @@ pub fn language_from_name(name: &str) -> Option<SupportLang> {
     })
 }
 
+/// Canonical name accepted by ast-grep for an extraction-supported language.
+pub fn language_name(lang: &SupportLang) -> &'static str {
+    use SupportLang::*;
+    match lang {
+        TypeScript => "typescript",
+        Tsx => "tsx",
+        JavaScript => "javascript",
+        C => "c",
+        Cpp => "cpp",
+        Go => "go",
+        Java => "java",
+        CSharp => "csharp",
+        Kotlin => "kotlin",
+        Swift => "swift",
+        Python => "python",
+        Ruby => "ruby",
+        Php => "php",
+        Lua => "lua",
+        Scala => "scala",
+        Dart => "dart",
+        Elixir => "elixir",
+        Solidity => "solidity",
+        Haskell => "haskell",
+        Bash => "bash",
+        Rust => "rust",
+        // Rules resolve only `SUPPORTED_LANGUAGES`. Keep this exhaustive so
+        // a new supported language requires an explicit canonical name.
+        Css | Hcl | Html | Json | Markdown | Nix | Yaml => {
+            unreachable!("non-rule language cannot reach the pattern rule pipeline")
+        }
+    }
+}
+
 /// A parsed source file: the ast-grep root plus a syntax-error flag.
 pub struct ParsedFile {
     pub lang: SupportLang,
