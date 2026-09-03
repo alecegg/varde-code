@@ -1,8 +1,8 @@
 ---
 type: task
 parent: 2026-09-03-test-home-isolation-graph-timeout
-status: backlog
-verified: pending
+status: done
+verified: passed
 depends_on:
   - isolate-test-home
 modifies:
@@ -27,3 +27,4 @@ bottleneck while retaining its graph-count coverage.
 
 #### Progress
 
+- Profiled `query_graph_counts`: warm runtime was 0.10s, so no graph change was justified; workspace tests passed in 16.81s after HOME recovery.
