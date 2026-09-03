@@ -12,7 +12,7 @@ subcommands read back.
 
 | Module | Location | Role |
 |---|---|---|
-| `parse` | `src/parse.rs` | Language detection and full-tree parsing (via `ast-grep-language`); maps file extensions to the supported languages (TS/TSX, JS/JSX, Go, Java, C#, Kotlin, Swift, Python, Rust) |
+| `parse` | `src/parse.rs` | Language detection and full-tree parsing (via `ast-grep-language`); maps file extensions to the twenty-one indexed languages (JS/TS/TSX, Go, C, C++, C#, Java, Swift, Kotlin, Rust, Python, Ruby, PHP, Scala, Dart, Lua, Elixir, Solidity, Haskell, Bash) |
 | `extract` | `src/extract/` | Entity/symbol extraction via a single merged tree walk; per-language visitors live under `extract/langs/`, plus `entity.rs`, `symbol.rs`, and `minhash.rs` (clone detection) |
 | `model` | `src/model.rs` | In-memory AST types: `ExtractOutput` (entities/symbols/diagnostics per file), `Entity`/`Symbol`, and the handoff structs passed from extraction to resolution to persistence |
 | `resolve` | `src/resolve.rs` | Cross-file resolution: import/dependency edges, call graph, type hierarchy; submodules `graph.rs` (edge indexing), `clones.rs` (clone bands), `community.rs` (community detection) |
