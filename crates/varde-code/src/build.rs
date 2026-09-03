@@ -131,6 +131,21 @@ pub fn ensure_file_fresh(repo_root: &str, file_path: &str) -> Result<()> {
 }
 
 fn run_full(repo_root: &str, db_path: &Path) -> Result<BuildSummary> {
+    // A full build owns a fixed sibling temp path before atomically renaming
+    // it into place. Hold the repository lock for that entire lifecycle so
+    // concurrent forced or first-time builds cannot delete, write, or rename
+    // one another's temporary database.
+    let _lock = crate::repo_lock::acquire(db_path, std::time::Duration::from_secs(30))?;
+
+    run_full_while_locked(repo_root, db_path)
+}
+
+/// Build while the caller holds this repository's advisory lock.
+///
+/// [`crate::slice::ensure_fresh`] already owns the lock when a missing or
+/// schema-mismatched index requires a full rebuild. Reacquiring it would wait
+/// on that caller's own non-reentrant `flock`.
+pub(crate) fn run_full_while_locked(repo_root: &str, db_path: &Path) -> Result<BuildSummary> {
     let profile = std::env::var_os("VARDE_PROFILE").is_some();
     let t0 = std::time::Instant::now();
 
@@ -191,14 +206,15 @@ fn run_incremental(repo_root: &str, db_path: &Path) -> Result<BuildSummary> {
     let t0 = std::time::Instant::now();
 
     // Hold the repo lock for the whole in-place incremental write. Unlike
-    // `run_full` (temp-file + atomic rename, so a concurrent writer can never
-    // observe a partial state), the incremental path mutates the live index
+    // `run_full` takes this same lock while it owns its temp-file lifecycle.
+    // The incremental path mutates the live index
     // through a sequence of transactions — a concurrent CLI `build` or a
     // query-triggered `slice::ensure_fresh` writing the same DB could otherwise
     // interleave partial writes. This is the same lock `ensure_fresh` takes.
     // Deadlock-free: `run_incremental` is reached only via
     // `run_with_force(force=false)`, which no lock holder ever calls
-    // (`ensure_fresh`'s fallback is `force=true` → `run_full`, unlocked).
+    // (`ensure_fresh`'s fallback is `force=true` → `run_full`, which takes
+    // this lock itself).
     let _lock = crate::repo_lock::acquire(db_path, std::time::Duration::from_secs(30))?;
 
     let current = crate::scan::list_source_files(repo_root)?;
@@ -217,7 +233,7 @@ fn run_incremental(repo_root: &str, db_path: &Path) -> Result<BuildSummary> {
         Ok(v) if v == crate::db::SCHEMA_VERSION => {}
         Ok(_) | Err(_) => {
             drop(conn);
-            return run_full(repo_root, db_path);
+            return run_full_while_locked(repo_root, db_path);
         }
     }
 
@@ -231,13 +247,13 @@ fn run_incremental(repo_root: &str, db_path: &Path) -> Result<BuildSummary> {
         }
         Ok(_) | Err(_) => {
             drop(conn);
-            return run_full(repo_root, db_path);
+            return run_full_while_locked(repo_root, db_path);
         }
     };
 
     if stored.is_empty() {
         drop(conn);
-        return run_full(repo_root, db_path);
+        return run_full_while_locked(repo_root, db_path);
     }
 
     let classifications = classify_files(&stored, &current);
@@ -680,6 +696,42 @@ mod tests {
                 .join()
                 .expect("build thread joins")
                 .expect("concurrent incremental build succeeds without SQLITE_BUSY");
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_initial_and_forced_full_builds_serialize_without_error() {
+        let home = std::env::temp_dir().join(format!(
+            "varde-build-home-concurrent-full-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("home creates");
+        let _home_override = crate::test_support::HomeOverride::new(&home);
+
+        let root = temp_fixture_root("concurrent-full-build");
+        std::fs::write(root.join("a.rs"), "fn a() { b(); }").expect("a.rs writes");
+        std::fs::write(root.join("b.rs"), "fn b() {}").expect("b.rs writes");
+        let root_s = root.to_str().expect("root is utf-8").to_string();
+
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let root_s = root_s.clone();
+                std::thread::spawn(move || run_with_force(&root_s, index % 2 == 0))
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .expect("build thread joins")
+                .expect("concurrent initial or forced full build succeeds");
         }
 
         let _ = std::fs::remove_dir_all(&home);

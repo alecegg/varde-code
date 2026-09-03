@@ -30,6 +30,29 @@ fn symbol_kind_to_i64(s: &str) -> Option<i64> {
     }
 }
 
+/// Whether a path language matches a `filter_symbols` language predicate.
+///
+/// TypeScript filters intentionally include TSX files. A TSX filter remains
+/// specific to TSX, while every other accepted name maps directly to its
+/// `SupportLang` value.
+fn matches_language_filter(
+    file_language: Option<ast_grep_language::SupportLang>,
+    language_filter: &str,
+) -> bool {
+    use ast_grep_language::SupportLang;
+
+    match crate::parse::language_from_name(language_filter) {
+        Some(SupportLang::TypeScript) => matches!(
+            file_language,
+            Some(SupportLang::TypeScript) | Some(SupportLang::Tsx)
+        ),
+        Some(language) => file_language == Some(language),
+        // Preserve the existing behavior for an unrecognized predicate. The
+        // caller only promises language filtering for accepted language names.
+        None => true,
+    }
+}
+
 /// `filePath` matching: exact path, or a path whose trailing components equal
 /// the query (`a.rs` matches `/x/a.rs` but not `/x/ab.rs`).
 pub fn matches_path(path: &str, query: &str) -> bool {
@@ -569,21 +592,8 @@ pub fn filter_symbols(input: &serde_json::Value) -> Result<serde_json::Value, Ap
     for row in rows {
         let (k, n, sb, eb, sl, sc, el, ec, path, _complexity) = row.map_err(db_err)?;
         if let Some(lang) = language {
-            use ast_grep_language::SupportLang;
             let file_lang = crate::parse::language_for_path(std::path::Path::new(&path));
-            let matches = match lang {
-                "rust" => file_lang == Some(SupportLang::Rust),
-                "typescript" | "ts" => {
-                    matches!(
-                        file_lang,
-                        Some(SupportLang::TypeScript) | Some(SupportLang::Tsx)
-                    )
-                }
-                "javascript" | "js" => file_lang == Some(SupportLang::JavaScript),
-                "go" => file_lang == Some(SupportLang::Go),
-                _ => true,
-            };
-            if !matches {
+            if !matches_language_filter(file_lang, lang) {
                 continue;
             }
         }
@@ -610,7 +620,10 @@ pub fn filter_symbols(input: &serde_json::Value) -> Result<serde_json::Value, Ap
 
 #[cfg(test)]
 mod build_on_read_tests {
-    use super::{filter_symbols, find_imports, get_symbol, symbols_in_file};
+    use super::{
+        filter_symbols, find_imports, get_symbol, matches_language_filter, symbols_in_file,
+    };
+    use ast_grep_language::SupportLang;
 
     fn temp_root(label: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -634,6 +647,69 @@ mod build_on_read_tests {
             .iter()
             .filter_map(|s| s.get("name").and_then(|n| n.as_str()).map(String::from))
             .collect()
+    }
+
+    #[test]
+    fn language_filters_match_every_supported_language() {
+        let cases = [
+            ("rust", SupportLang::Rust),
+            ("typescript", SupportLang::TypeScript),
+            ("ts", SupportLang::TypeScript),
+            ("tsx", SupportLang::Tsx),
+            ("javascript", SupportLang::JavaScript),
+            ("js", SupportLang::JavaScript),
+            ("c", SupportLang::C),
+            ("cpp", SupportLang::Cpp),
+            ("c++", SupportLang::Cpp),
+            ("cxx", SupportLang::Cpp),
+            ("go", SupportLang::Go),
+            ("golang", SupportLang::Go),
+            ("java", SupportLang::Java),
+            ("csharp", SupportLang::CSharp),
+            ("cs", SupportLang::CSharp),
+            ("kotlin", SupportLang::Kotlin),
+            ("kt", SupportLang::Kotlin),
+            ("swift", SupportLang::Swift),
+            ("python", SupportLang::Python),
+            ("py", SupportLang::Python),
+            ("ruby", SupportLang::Ruby),
+            ("rb", SupportLang::Ruby),
+            ("php", SupportLang::Php),
+            ("lua", SupportLang::Lua),
+            ("scala", SupportLang::Scala),
+            ("dart", SupportLang::Dart),
+            ("elixir", SupportLang::Elixir),
+            ("ex", SupportLang::Elixir),
+            ("solidity", SupportLang::Solidity),
+            ("sol", SupportLang::Solidity),
+            ("haskell", SupportLang::Haskell),
+            ("hs", SupportLang::Haskell),
+            ("bash", SupportLang::Bash),
+            ("sh", SupportLang::Bash),
+            ("shell", SupportLang::Bash),
+        ];
+
+        for (filter, language) in cases {
+            assert!(
+                matches_language_filter(Some(language), filter),
+                "{filter} accepts its language"
+            );
+            assert!(
+                !matches_language_filter(Some(SupportLang::Rust), filter)
+                    || language == SupportLang::Rust,
+                "{filter} excludes Rust when it targets another language"
+            );
+        }
+
+        assert!(matches_language_filter(
+            Some(SupportLang::Tsx),
+            "typescript"
+        ));
+        assert!(matches_language_filter(Some(SupportLang::Tsx), "ts"));
+        assert!(!matches_language_filter(
+            Some(SupportLang::TypeScript),
+            "tsx"
+        ));
     }
 
     /// The §0 build-on-read contract: a `symbols_in_file` call with a `repoRoot`

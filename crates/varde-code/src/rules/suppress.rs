@@ -1,9 +1,8 @@
 //! Inline suppression comments: `varde-ignore-file` / `varde-ignore-next-line`.
 //!
-//! Matched as a literal marker anywhere on a source line rather than via a
-//! per-language comment grammar, so the same two markers work across `//`,
-//! `#`, `--`, `<!-- -->`, etc. without teaching this crate every language's
-//! comment syntax.
+//! Matched only within comments identified by the configured tree-sitter
+//! grammar. This keeps marker text inside string literals from suppressing
+//! unrelated findings.
 //!
 //! Syntax: `<marker> [rule-id ...] [-- reason]`. No rule ids = suppress every
 //! rule on that line/file. `varde-ignore-file` suppresses file-wide (line 0);
@@ -14,6 +13,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::parse::{language_for_path, parse_source};
 use crate::rules::finding::Finding;
 
 const FILE_MARKER: &str = "varde-ignore-file";
@@ -78,30 +78,57 @@ fn parse_marker_tail(rest: &str) -> (Vec<String>, Option<String>) {
     (rule_ids, reason)
 }
 
-/// Parse every `varde-ignore-file` / `varde-ignore-next-line` marker out of
-/// a file's raw source text.
+/// Parse every `varde-ignore-file` / `varde-ignore-next-line` marker from
+/// comments in a supported source file.
 #[must_use]
-pub fn parse_suppressions(source: &str) -> Vec<Suppression> {
+pub fn parse_suppressions(source: &str, path: &Path) -> Vec<Suppression> {
+    let Some(lang) = language_for_path(path) else {
+        return Vec::new();
+    };
+    let parsed = parse_source(&lang, source);
+    let comment_ranges: Vec<_> = parsed
+        .root
+        .root()
+        .dfs()
+        .filter(|node| node.kind().contains("comment"))
+        .map(|node| node.range())
+        .collect();
+
     let mut out = Vec::new();
-    for (idx, line) in source.lines().enumerate() {
+    let mut line_start = 0;
+    for (idx, raw_line) in source.split_inclusive('\n').enumerate() {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
         let comment_line = (idx + 1) as u32;
         if let Some(pos) = line.find(FILE_MARKER) {
-            let (rule_ids, reason) = parse_marker_tail(&line[pos + FILE_MARKER.len()..]);
-            out.push(Suppression {
-                line: 0,
-                comment_line,
-                rule_ids,
-                reason,
-            });
+            let marker_start = line_start + pos;
+            if comment_ranges
+                .iter()
+                .any(|range| range.start <= marker_start && marker_start < range.end)
+            {
+                let (rule_ids, reason) = parse_marker_tail(&line[pos + FILE_MARKER.len()..]);
+                out.push(Suppression {
+                    line: 0,
+                    comment_line,
+                    rule_ids,
+                    reason,
+                });
+            }
         } else if let Some(pos) = line.find(NEXT_LINE_MARKER) {
-            let (rule_ids, reason) = parse_marker_tail(&line[pos + NEXT_LINE_MARKER.len()..]);
-            out.push(Suppression {
-                line: comment_line + 1,
-                comment_line,
-                rule_ids,
-                reason,
-            });
+            let marker_start = line_start + pos;
+            if comment_ranges
+                .iter()
+                .any(|range| range.start <= marker_start && marker_start < range.end)
+            {
+                let (rule_ids, reason) = parse_marker_tail(&line[pos + NEXT_LINE_MARKER.len()..]);
+                out.push(Suppression {
+                    line: comment_line + 1,
+                    comment_line,
+                    rule_ids,
+                    reason,
+                });
+            }
         }
+        line_start += raw_line.len();
     }
     out
 }
@@ -141,7 +168,7 @@ pub fn filter_findings(
         let Ok(source) = std::fs::read_to_string(&abs) else {
             continue;
         };
-        let suppressions = parse_suppressions(&source);
+        let suppressions = parse_suppressions(&source, &abs);
         if suppressions.is_empty() {
             continue;
         }
@@ -218,7 +245,7 @@ mod tests {
 
     #[test]
     fn parses_bare_file_marker() {
-        let supps = parse_suppressions("// varde-ignore-file\nconst x = 1;\n");
+        let supps = parse_suppressions("// varde-ignore-file\nconst x = 1;\n", Path::new("a.ts"));
         assert_eq!(supps.len(), 1);
         assert_eq!(supps[0].line, 0);
         assert!(supps[0].rule_ids.is_empty());
@@ -229,6 +256,7 @@ mod tests {
     fn parses_scoped_next_line_marker_with_reason() {
         let supps = parse_suppressions(
             "// varde-ignore-next-line no-console -- flagged, safe here\nconsole.log(1);\n",
+            Path::new("a.ts"),
         );
         assert_eq!(supps.len(), 1);
         assert_eq!(supps[0].line, 2);
@@ -239,7 +267,10 @@ mod tests {
 
     #[test]
     fn parses_multiple_scoped_rule_ids() {
-        let supps = parse_suppressions("// varde-ignore-next-line no-console, no-debugger\nx();\n");
+        let supps = parse_suppressions(
+            "// varde-ignore-next-line no-console, no-debugger\nx();\n",
+            Path::new("a.ts"),
+        );
         assert_eq!(
             supps[0].rule_ids,
             vec!["no-console".to_string(), "no-debugger".to_string()]
@@ -277,6 +308,25 @@ mod tests {
         let findings = vec![finding("no-console", "b.ts", 2)];
         let (kept, stale) = filter_findings(findings, &dir);
         assert!(kept.is_empty());
+        assert!(stale.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn marker_inside_string_literal_does_not_suppress_findings() {
+        let dir =
+            std::env::temp_dir().join(format!("varde-suppress-string-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("string.ts"),
+            "const directive = \"varde-ignore-file\";\nconsole.log(1);\n",
+        )
+        .unwrap();
+
+        let findings = vec![finding("no-console", "string.ts", 2)];
+        let (kept, stale) = filter_findings(findings, &dir);
+        assert_eq!(kept.len(), 1);
         assert!(stale.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
