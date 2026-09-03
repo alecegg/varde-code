@@ -1,0 +1,73 @@
+# Built-in rules: debug-statement-strict (narrowed set)
+#
+# Only the high-confidence half of debug-statement detection ships here:
+# Rust `dbg!()`, the JS/TS `debugger` statement, and `console.log()`.
+# Print-style variants (Python `print`, Go `fmt.Println`, Rust `println!`)
+# are deliberately excluded from the built-in pack — in CLI tools and
+# scripts they are legitimate program output, so flagging them is noisy
+# (see BUILT_IN_RULES.md #7, which recommends the two-rule split).
+#
+# Three rules, one per shape: a pattern-kind rule carries a single
+# `pattern`, and the shapes are per-language (Rust macro invocation vs.
+# JS/TS statement vs. member call). Severity warning — a debug statement
+# left in committed code is a smell, not a bug. The `dbg!` pattern
+# requires a bare `dbg` callee; `println!` and `console.warn/error` do
+# not match (verified empirically via the find_pattern CLI).
+#
+# `exclude_test_paths = true` on all three: sample/fixture snippets under a
+# test convention (e.g. this repo's own tests/fixtures/**) legitimately
+# contain the exact statements these rules look for, since they exist to
+# exercise the extractor against real-looking code, not to run in
+# production. Confirmed against a live cyano scan too: 27/27 raw
+# console-log-strict findings there were in `scripts/*.mjs` CLI utilities —
+# the same "legitimate program output, not a leftover" class already
+# carved out for Python `print`/Go `fmt.Println` (see above), just not
+# caught by a `tests/`-only heuristic.
+#
+# `exclude_tooling_paths = true` on `console-log-strict` closes that gap:
+# `files.is_tooling_path` (schema v11, see db.rs) covers `bench/`,
+# `scripts/`, `docs/`, and `.claude/` directories. Cross-repo triage
+# reconfirmed the same pattern beyond this repo — axios's
+# `docs/scripts/utils.js` (a `printSuccessMessage`-style CLI helper) and
+# zod's `packages/bench/**`/`.claude/skills/**` tooling both false-positived
+# on `console.log` calls that are the script's actual intended output, not
+# leftover debugging. Only applied to `console-log-strict`, not
+# `debug-macro-strict`/`debug-statement-strict`: `dbg!()` and `debugger;`
+# are never legitimate output mechanisms in a benchmark or build script the
+# way `console.log` is.
+[[rule]]
+id = "debug-macro-strict"
+kind = "pattern"
+severity = "warning"
+name = "Debug macro left in code"
+description = "A Rust dbg!() invocation is present — typically a leftover debug print."
+message = "dbg!() macro left in code; debug output leaks into production builds"
+remediation = "remove the dbg!() call before committing, or replace it with proper structured logging"
+pattern = "dbg!($$$ARGS)"
+languages = ["rust"]
+exclude_test_paths = true
+
+[[rule]]
+id = "debug-statement-strict"
+kind = "pattern"
+severity = "warning"
+name = "Debugger statement left in code"
+description = "A JavaScript/TypeScript debugger statement is present — it halts execution when devtools are open."
+message = "debugger statement left in code; execution pauses for anyone with devtools open"
+remediation = "remove the debugger statement before committing"
+pattern = "debugger;"
+languages = ["javascript", "typescript", "tsx"]
+exclude_test_paths = true
+
+[[rule]]
+id = "console-log-strict"
+kind = "pattern"
+severity = "warning"
+name = "console.log left in code"
+description = "A console.log() call is present — typically a leftover debug print in frontend or Node code."
+message = "console.log() call left in code; debug output leaks into production"
+remediation = "remove the console.log() call before committing, or route it through a logging facility that is disabled in production"
+pattern = "console.log($$$ARGS)"
+languages = ["javascript", "typescript", "tsx"]
+exclude_test_paths = true
+exclude_tooling_paths = true

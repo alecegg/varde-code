@@ -1,0 +1,117 @@
+name: release
+
+# Cross-platform release binaries for varde-code.
+#
+# Targets (no Windows): aarch64-apple-darwin, x86_64-apple-darwin,
+# x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu.
+#
+# Each job runs on a runner whose native architecture matches the target:
+# the macOS arm64 job is the host build; the macOS x86_64 job covers the
+# Intel mac target (Rosetta-less hosts cannot run it locally, so this is the
+# verification point); the two Linux jobs cross-compile with plain cargo
+# plus the target's std (no Windows toolchain needed). Artifacts are
+# uploaded per target.
+#
+# The release job publishes a `SHA256SUMS` file alongside the tarballs and
+# records a signed build-provenance attestation for each binary (verifiable
+# with `gh attestation verify <tarball> --repo <owner>/<repo>`), so a
+# downloader can confirm integrity and that the artifact came from this CI.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build -p varde-code --release --target ${{ matrix.target }}
+
+      - name: Verify binary lists the core query subcommands
+        run: |
+          BIN="target/${{ matrix.target }}/release/varde-code"
+          for mode in symbols_in_file get_symbol dependencies dependents \
+                       tests_for_file hotspots map_file map_symbol map_path \
+                       explore blast_radius symbol_blast_radius detect_changes \
+                       find_imports type_hierarchy filter_symbols find_pattern; do
+            "$BIN" --help | grep -q "$mode" || { echo "missing subcommand: $mode"; exit 1; }
+          done
+          echo "core query subcommands present in $BIN"
+
+      # Attribution bundle for the statically-linked dependencies (all
+      # bundled tree-sitter grammars included). Their MIT/BSD/ISC/Apache-2.0
+      # licenses require reproducing the copyright + license notice when the
+      # binary is redistributed; this file is that reproduction, generated from
+      # Cargo.lock and shipped alongside the binary in every tarball.
+      - name: Generate third-party license bundle
+        run: python3 scripts/gen-third-party-licenses.py
+
+      - name: Package binary
+        run: |
+          cp THIRD-PARTY-LICENSES.md target/${{ matrix.target }}/release/
+          cd target/${{ matrix.target }}/release
+          tar czf varde-code-${{ matrix.target }}.tar.gz varde-code THIRD-PARTY-LICENSES.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: varde-code-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/varde-code-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write # create the GitHub release
+      id-token: write # OIDC token for build provenance
+      attestations: write # record the provenance attestation
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz | tee SHA256SUMS
+
+      - name: Attest build provenance for the release binaries
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true

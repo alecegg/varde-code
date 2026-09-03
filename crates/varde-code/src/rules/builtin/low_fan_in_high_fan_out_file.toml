@@ -1,0 +1,36 @@
+# Built-in rule: low-fan-in-high-fan-out-file
+#
+# Flags files that depend on a lot but are depended on by little — the
+# orchestration/glue-code shape (a layering smell), using files.fan_in /
+# files.fan_out (resolved reference-graph edge counts) that no other rule
+# queries.
+#
+# Severity is `info`, not `warning` — the doc's fallback for this rule:
+# entry points (CLI mains, top-level handlers) are structurally low
+# fan-in / high fan-out and would false-positive at warning. Info findings
+# never fail a scan at the default threshold, so the rule is safe to
+# default-on.
+#
+# Thresholds calibrated against real repos (see BUILT_IN_RULES.md #4):
+# fan_in <= 2 AND fan_out >= 15 flags 4 of 6050 files in code-rails
+# (0.07%) — three heavy integration tests plus a barrel re-export file no
+# one imports — and 0 of 2574 in varde-code. Both observed classes are
+# genuine structural signals.
+#
+# Test-path exclusion: `files.is_test_path` (generated column, see db.rs)
+# filters out test suites, which are structurally low fan-in / high
+# fan-out by nature (a test file imports everything it exercises and is
+# itself imported by nothing) — confirmed empirically on cyano, where
+# 28 of 29 raw findings were `*.test.ts` files before this filter.
+[[rule]]
+id = "low-fan-in-high-fan-out-file"
+kind = "sql"
+severity = "info"
+name = "Low fan-in, high fan-out file"
+description = "The file references many other files but is itself referenced by few — orchestration/glue code that has grown past its role."
+message = "file depends on many modules but is depended on by few; consider whether its orchestration role is intentional"
+remediation = "split the orchestrator into narrower collaborators, or move shared logic into a module others import"
+query = "SELECT path AS file, 1 AS line FROM files WHERE is_test_path = 0 AND fan_in <= :max_fan_in AND fan_out >= :min_fan_out"
+[rule.thresholds]
+max_fan_in = 2.0
+min_fan_out = 15.0

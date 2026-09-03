@@ -1,0 +1,7 @@
+/target
+.DS_Store
+/memory-bank
+# Generated at release time by scripts/gen-third-party-licenses.py and bundled
+# into each release tarball; the license policy is gated in CI, so the file
+# itself is a build artifact rather than a committed source.
+/THIRD-PARTY-LICENSES.md

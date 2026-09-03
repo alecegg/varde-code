@@ -1,0 +1,72 @@
+# Built-in rule: duplicate-code-clone
+#
+# Clone detection already runs at resolve time (MinHash + LSH over
+# 5-token shingles of function bodies, see resolve/clones.rs) and is
+# persisted in clone_bands / clone_band_members. Surfacing bands above a
+# size threshold is a pure aggregation — no new analysis.
+#
+# Threshold rationale (min_band_size = 3.0): a clone band forms when two or
+# more entities share one 4-row LSH band of a 16-row MinHash signature. At
+# Jaccard similarity ~0.5 the per-band collision probability is only ~23%,
+# so a *pair* can still be incidental; three members sharing a band is a
+# strong triplication signal. Bands of two are deliberately not flagged.
+#
+# Query notes vs. the BUILT_IN_RULES.md sketch: the sketch self-joined
+# clone_band_members (cbm_t) and counted COUNT(*) over the join, which
+# counts N^2 rows per band — a 2-member band would score 4 and pass a
+# min_band_size of 3. The shipped query instead filters bands by member
+# count in a subquery, then emits one finding per member of each
+# qualifying band (each duplicated location is individually actionable;
+# the band label rides along as evidence).
+#
+# Test-entity exclusion: `entities.is_test` (Rust `#[test]`/`#[tokio::test]`
+# etc., see extract/langs/node_is_test) is filtered out of both the member
+# count and the emitted rows. Shared test scaffolding (temp-dir setup,
+# fixture builders) legitimately forms large clone bands that aren't
+# production duplication — on this repo, excluding tests dropped ~1000 of
+# ~1090 findings from a single rescan, confirming the rule was mostly
+# flagging test boilerplate rather than real duplicated logic.
+#
+# `entities.is_test` only fires for Rust's attribute-based test convention
+# (see extract/langs/mod.rs `node_is_test` — every other language always
+# reports `false` there), so it alone missed most test-file duplication in
+# non-Rust repos: pytest files, `*_test.go`, JUnit fixtures, and mocha/jest
+# specs all scored `is_test = 0` and still flooded clone bands. Cross-repo
+# triage (psf/requests, axios, spf13/cobra, google/gson) found test files
+# accounted for 48-94% of all clone findings despite this filter. Layering
+# `files.is_test_path`/`files.is_tooling_path` (path-pattern generated
+# columns on `files`, schema v11 — see db.rs) on top closes that gap
+# without new extraction work.
+#
+# Thin-wrapper exclusion (`min_span_lines`): a 1-2 line entity is almost
+# always a single delegating call (`return self.request("GET", url,
+# **kwargs)`) or a trait-mandated single-expression impl (`fn doc_short(&self)
+# -> &str { "..." }`), not copy-pasted logic — see REPORT.md's `ripgrep`
+# and `requests` findings. These are structurally near-identical by design
+# (same shape, different literal/verb) and are not meaningful refactor
+# targets, so entities at or below the threshold are dropped from both the
+# member count and the emitted rows, same treatment as the test/tooling
+# path filters above.
+#
+# Trait-mandated boilerplate exclusion (`owner_type` distinctness): the
+# ~90 unit structs in ripgrep's `crates/core/flags/defs.rs`, each with a
+# single `impl Flag for X` block, kept forming clone bands even after the
+# filters above (1919 of 2637 findings on a rescan — see REPORT.md). The
+# structural signal for "many types independently implementing the same
+# trait" is that every band member belongs to a *different* owner_type —
+# there's no copy-paste, the trait shape just forces similar bodies once
+# per implementing type. Genuine copy-paste duplication, by contrast,
+# tends to repeat within the same type/file or across a small number of
+# them. So a band is only kept if at least two members share an
+# owner_type (repetition), or owner_type is unset for every member (e.g.
+# free functions, where this signal doesn't apply).
+[[rule]]
+id = "duplicate-code-clone"
+kind = "sql"
+severity = "warning"
+name = "Duplicate code clone band"
+description = "Three or more entities share a near-identical body — the same code exists in several places."
+message = "duplicated code: member of a clone band with 3 or more near-identical entities"
+remediation = "extract the duplicated logic into a single shared implementation and reuse it"
+query = "SELECT f.path AS file, e.start_line AS line, cb.label FROM clone_band_members cbm JOIN entities e ON e.id = cbm.entity_id JOIN files f ON f.id = e.file_id JOIN clone_bands cb ON cb.id = cbm.band_id WHERE e.is_test = 0 AND f.is_test_path = 0 AND f.is_tooling_path = 0 AND (e.end_line - e.start_line + 1) > :min_span_lines AND cb.id IN (SELECT cbm_t.band_id FROM clone_band_members cbm_t JOIN entities e2 ON e2.id = cbm_t.entity_id JOIN files f2 ON f2.id = e2.file_id WHERE e2.is_test = 0 AND f2.is_test_path = 0 AND f2.is_tooling_path = 0 AND (e2.end_line - e2.start_line + 1) > :min_span_lines GROUP BY cbm_t.band_id HAVING COUNT(*) >= :min_band_size AND (COUNT(DISTINCT e2.owner_type) < COUNT(*) OR COUNT(DISTINCT e2.owner_type) = 0))"
+thresholds = { min_band_size = 3.0, min_span_lines = 2.0 }

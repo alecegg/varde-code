@@ -1,0 +1,201 @@
+# Built-in rule set: SOLID (ported from cyano's `solid.toml`)
+#
+# All five rules key off `entities.owner_type` (schema v10): a Function
+# entity's `owner_type` names the immediately enclosing class/interface, set
+# at extract time from a per-language `TYPE_SCOPES` stack (see
+# extract/mod.rs, extract/langs/mod.rs). That's the piece cyano gets for
+# free from `scan_entities.parent_id` and varde-code didn't have before —
+# without it, "how many methods does this class/interface have" has no
+# answer from the flat entity list.
+#
+# `Implements`/`Extends` entities (kind 16/15) encode the relationship as
+# `name` = target type, `enclosing_function` = owner type — consistent
+# across every language extractor (see rust.rs/ts.rs/java.rs/cs.rs/
+# kotlin.rs/swift.rs/go.rs `push_type_ref`-style calls).
+#
+# Scope: cyano's sixth SOLID rule, `solid-dip` (concrete-type parameter
+# dependency), is intentionally NOT ported here — it needs a parameter
+# *type* string, and `Parameter` entities don't carry one (only `name`).
+# That's the same shape of gap `owner_type` just closed, but for a
+# different field on a different entity kind; deferred as a follow-up
+# rather than bundled into this change.
+#
+# entity kind integers used below (see model.rs `EntityKind::as_i64`):
+#   0 = Function, 1 = Class, 2 = Interface, 15 = Extends, 16 = Implements.
+
+# Default-method exclusion: the original query counted *every* method
+# declared on the interface (owner_type = interface name) as "required",
+# and compared that against the implementer's *total* method count (not
+# matched by name). Both are wrong for any language with default/provided
+# interface methods (Rust trait default methods, Java 8+/Kotlin/C# default
+# interface methods): ripgrep's `Flag` trait declares 12 methods but only
+# 4-5 have no default body, so every one of its ~90 implementers scored
+# "incomplete" — 97/97 findings on ripgrep were this false positive alone.
+# Fixed by (1) only counting interface methods with a single-line span
+# (`end_line == start_line`, i.e. a bare signature like `fn foo(&self);`
+# with no body) as "required", since a provided/default body needs at
+# least an opening brace on its own or a multi-line block by convention in
+# every mainstream formatter, and (2) matching required methods by name
+# against the implementer's own methods instead of comparing raw counts.
+[[rule]]
+id = "solid-lsp"
+kind = "sql"
+severity = "warning"
+name = "Solid LSP Violation"
+description = "A class implements an interface with fewer required (no-default-body) methods than the interface declares — a possible Liskov Substitution Principle violation."
+message = "class '{class_name}' implements only {class_methods}/{iface_methods} required methods of '{interface_name}' — possible LSP violation"
+remediation = "ensure the implementing class fulfills the full contract of the interface"
+agent_instructions = "Verify whether the class intentionally implements a subset of the interface (e.g. a partial adapter) or inadvertently violates the contract. Required methods are approximated as single-line (no-body) interface method declarations; methods with a default/provided body are excluded."
+thresholds = { coverage_threshold = 0.7 }
+query = """
+SELECT file, line, class_name, interface_name, class_methods, iface_methods, threshold FROM (
+  SELECT f.path AS file, imp.start_line AS line,
+    imp.enclosing_function AS class_name, imp.name AS interface_name,
+    (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.name
+       AND m.end_line = m.start_line
+       AND EXISTS (SELECT 1 FROM entities cm WHERE cm.kind = 0
+         AND cm.owner_type = imp.enclosing_function AND cm.name = m.name)) AS class_methods,
+    (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.name
+       AND m.end_line = m.start_line) AS iface_methods,
+    :coverage_threshold AS threshold
+  FROM entities imp
+  JOIN files f ON f.id = imp.file_id
+  WHERE imp.kind = 16
+    AND f.is_test_path = 0
+    AND EXISTS (SELECT 1 FROM entities iface WHERE iface.kind = 2 AND iface.name = imp.name)
+)
+WHERE iface_methods > 0 AND CAST(class_methods AS REAL) / iface_methods < threshold
+"""
+
+[[rule]]
+id = "solid-isp"
+kind = "sql"
+severity = "warning"
+name = "Solid ISP Violation"
+description = "A fat interface (method count exceeds a threshold) whose implementing class contains many empty-stub method bodies — an Interface Segregation Principle smell."
+message = "interface '{interface_name}' has {iface_method_count} methods and '{class_name}' implements {empty_stubs}/{class_methods} as empty stubs (<=2 lines) — possible ISP violation"
+remediation = "consider splitting the fat interface into smaller, focused interfaces"
+agent_instructions = "Confirm whether the empty stub methods represent unused interface members (ISP violation) or intentional no-ops. Check if multiple smaller interfaces would better model the different client needs."
+thresholds = { method_threshold = 7, empty_body_threshold = 0.3 }
+query = """
+SELECT file, line, class_name, interface_name, iface_method_count, class_methods, empty_stubs, threshold FROM (
+  SELECT f.path AS file, imp.start_line AS line,
+    imp.enclosing_function AS class_name, imp.name AS interface_name,
+    (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.name) AS iface_method_count,
+    (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.enclosing_function) AS class_methods,
+    (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.enclosing_function
+       AND (m.end_line - m.start_line + 1) <= 2) AS empty_stubs,
+    :empty_body_threshold AS threshold
+  FROM entities imp
+  JOIN files f ON f.id = imp.file_id
+  WHERE imp.kind = 16
+    AND f.is_test_path = 0
+    AND (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.name) > :method_threshold
+)
+WHERE class_methods > 0 AND CAST(empty_stubs AS REAL) / class_methods > threshold
+"""
+
+# Fluent-builder/facade exclusion: a class named `*Builder`/`*Facade`, or
+# whose own name matches its file's `*Builder` pairing (e.g. `GsonBuilder`),
+# almost always earns a high method count *by design* — each method is one
+# chainable configuration knob or one delegated facade entry point, not
+# independent responsibilities crammed into one type. Cross-repo triage
+# confirmed this pattern is the dominant false-positive shape for this rule
+# (axios `AxiosInstance`, zod `ZodString`/`ZodNumber`, gson `GsonBuilder`/
+# `Gson`) — method count alone doesn't distinguish a cohesive fluent API
+# from an unrelated grab-bag class, and there's no cheap SQL-level signal
+# for "most methods return `this`", so name convention is the practical
+# proxy. `max_members` is also raised from 10 to 15: the original threshold
+# was tuned before this exclusion existed and is the same repo's own
+# fixture reasoning (cyano's `solid.toml`), not a value re-validated against
+# real-world classes.
+[[rule]]
+id = "fat-interface"
+kind = "sql"
+severity = "warning"
+name = "Fat Interface"
+description = "A class or interface declares more than a threshold number of methods."
+message = "'{class_name}' declares {member_count} methods, exceeding threshold of {threshold}"
+remediation = "consider splitting the class or interface into smaller, focused types"
+thresholds = { max_members = 15 }
+query = """
+SELECT file, line, class_name, member_count, threshold FROM (
+  SELECT f.path AS file, c.start_line AS line, c.name AS class_name,
+    (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = c.name) AS member_count,
+    :max_members AS threshold
+  FROM entities c
+  JOIN files f ON f.id = c.file_id
+  WHERE c.kind IN (1, 2) AND f.is_test_path = 0
+    AND c.name NOT LIKE '%Builder' AND c.name NOT LIKE '%Facade'
+)
+WHERE member_count > threshold
+"""
+
+# Well-known std/stdlib marker-trait exclusion: implementing `Debug`,
+# `Display`, `Clone`, `PartialEq`/`Eq`, `Hash`, `Default`, `From`/`Into`,
+# `FromStr`, `AsRef`, `Ord`/`PartialOrd` (Rust) or their Java/Kotlin/C#
+# equivalents (`Comparable`, `Serializable`, `Cloneable`, `Iterable`,
+# `Runnable`, `AutoCloseable`) is completely idiomatic for even the
+# smallest value type — it says nothing about the class's own design.
+# Cross-repo triage found ripgrep's `Glob` struct flagged for implementing
+# exactly this list (`AsRef`, `PartialEq`, `Hash`, `Debug`, `Display`,
+# `FromStr`) and nothing else, a 100% false positive. Excluded from the
+# count entirely rather than just raising the threshold, since a class
+# could legitimately combine several marker traits with zero real interface
+# bloat.
+[[rule]]
+id = "too-many-interfaces"
+kind = "sql"
+severity = "warning"
+name = "Too Many Interfaces"
+description = "A class implements more than a threshold number of interfaces."
+message = "class '{class_name}' implements {implements_count} interfaces, exceeding threshold of {threshold}"
+remediation = "consider reducing the number of implemented interfaces or splitting the class"
+thresholds = { max_interfaces = 3 }
+query = """
+SELECT f.path AS file, MIN(imp.start_line) AS line, imp.enclosing_function AS class_name,
+  COUNT(*) AS implements_count, :max_interfaces AS threshold
+FROM entities imp
+JOIN files f ON f.id = imp.file_id
+WHERE imp.kind = 16 AND f.is_test_path = 0
+  AND imp.name NOT IN (
+    'Debug', 'Display', 'Clone', 'Copy', 'PartialEq', 'Eq', 'Hash', 'Default',
+    'From', 'Into', 'TryFrom', 'TryInto', 'FromStr', 'AsRef', 'AsMut',
+    'Ord', 'PartialOrd', 'Send', 'Sync', 'Iterator', 'IntoIterator',
+    'Deref', 'DerefMut', 'Drop', 'ToString',
+    'Comparable', 'Serializable', 'Cloneable', 'Iterable', 'Runnable',
+    'AutoCloseable', 'Closeable'
+  )
+GROUP BY imp.file_id, imp.enclosing_function
+HAVING implements_count > :max_interfaces
+"""
+
+[[rule]]
+id = "deep-inheritance"
+kind = "sql"
+severity = "warning"
+name = "Deep Inheritance"
+description = "A class's inheritance depth (via `extends` relations, resolved by name across the indexed repo) exceeds a configured threshold."
+message = "class '{class_name}' has inheritance depth of {chain_depth}, exceeding threshold of {threshold}"
+remediation = "consider flattening the inheritance hierarchy by favoring composition over inheritance"
+thresholds = { max_depth = 3 }
+query = """
+WITH RECURSIVE ancestry(start_id, start_file_id, current_name, depth, visited) AS (
+  SELECT c.id, c.file_id, c.name, 0, ('/' || c.name || '/')
+  FROM entities c
+  WHERE c.kind = 1
+  UNION ALL
+  SELECT a.start_id, a.start_file_id, e.name, a.depth + 1, a.visited || e.name || '/'
+  FROM ancestry a
+  JOIN entities e ON e.kind = 15 AND e.enclosing_function = a.current_name
+  WHERE instr(a.visited, '/' || e.name || '/') = 0
+)
+SELECT f.path AS file, c.start_line AS line, c.name AS class_name,
+  MAX(a.depth) AS chain_depth, :max_depth AS threshold
+FROM ancestry a
+JOIN entities c ON c.id = a.start_id
+JOIN files f ON f.id = a.start_file_id
+WHERE f.is_test_path = 0
+GROUP BY a.start_id
+HAVING chain_depth > :max_depth
+"""

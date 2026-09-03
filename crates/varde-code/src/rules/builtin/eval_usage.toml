@@ -1,0 +1,23 @@
+# Built-in rule: eval-usage
+#
+# eval() executes a string as code in the calling scope — on anything that
+# can carry attacker influence it is a code-injection vulnerability, and
+# even on trusted input it defeats static analysis and is essentially never
+# legitimate in application code. Python's eval shares the concern (exec is
+# deliberately left out of this pack: it is a statement, not a call, and
+# would need its own pattern).
+#
+# `$$$ARGS` matches any argument list (including empty), so both
+# `eval(x)` and `eval(x, globals)` are flagged; member calls like
+# `obj.eval(x)` do not match — the callee must be a bare `eval`
+# identifier. See BUILT_IN_RULES.md for the full scoping rationale.
+[[rule]]
+id = "eval-usage"
+kind = "pattern"
+severity = "warning"
+name = "eval() usage"
+description = "eval executes a string as code; with dynamic input it is a code-injection risk."
+message = "eval() with dynamic input is a code-injection risk"
+remediation = "replace eval with a safe, restricted parser or an explicit dispatch table"
+pattern = "eval($$$ARGS)"
+languages = ["javascript", "typescript", "tsx", "python"]

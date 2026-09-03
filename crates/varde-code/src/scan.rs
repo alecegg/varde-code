@@ -1,0 +1,398 @@
+//! Directory walking with skip-and-report semantics.
+//!
+//! Contract (plan): unparseable files (syntax error, unsupported/binary,
+//! tree-sitter failure) are skipped and reported as per-file diagnostics; the
+//! run continues and exits 0 unless a fatal (non-per-file) error occurs — a
+//! missing/unreadable root path is fatal.
+
+use crate::extract;
+use crate::model::{Diagnostic, ExtractOutput, FileMeta};
+use crate::parse::{language_for_path, parse_source};
+use anyhow::Result;
+use rayon::prelude::*;
+use std::path::Path;
+
+/// Sentinel used when filesystem metadata cannot be trusted.
+pub const UNKNOWN_METADATA: i64 = -1;
+
+/// Metadata collected for a file in the current source listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFile {
+    pub path: String,
+    pub mtime: i64,
+    pub size: i64,
+    pub content_hash: Option<String>,
+}
+
+/// List files and collect metadata without reading file contents.
+///
+/// The directory walk runs in parallel (`WalkBuilder::build_parallel`) and each
+/// entry's cached `file_type()` (from `readdir`, no syscall) decides file-ness,
+/// with `entry.metadata()` supplying mtime/size — one stat per file instead of
+/// the previous `path().is_file()` + `fs::metadata` double-stat.
+pub fn list_source_files(path: &str) -> Result<Vec<SourceFile>> {
+    let root = Path::new(path);
+    if !root.exists() {
+        return Err(anyhow::anyhow!("path does not exist: {path}"));
+    }
+
+    if root.is_file() {
+        return Ok(vec![source_file(root)]);
+    }
+
+    let collected = std::sync::Mutex::new(Vec::<SourceFile>::new());
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .build_parallel()
+        .run(|| {
+            Box::new(|result| {
+                if let Ok(entry) = result
+                    && entry.file_type().is_some_and(|ft| ft.is_file())
+                {
+                    collected
+                        .lock()
+                        .expect("walk collector lock poisoned")
+                        .push(source_file_from_entry(&entry));
+                }
+                ignore::WalkState::Continue
+            })
+        });
+
+    let mut files = collected
+        .into_inner()
+        .expect("walk collector lock poisoned");
+    files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// Extract `(mtime, size)` from a `Metadata`, with `UNKNOWN_METADATA` sentinels
+/// for any field that can't be trusted (nanos/len overflow, bad timestamp).
+fn metadata_mtime_size(metadata: &std::fs::Metadata) -> (i64, i64) {
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(UNKNOWN_METADATA);
+    let size = i64::try_from(metadata.len()).unwrap_or(UNKNOWN_METADATA);
+    (mtime, size)
+}
+
+/// Build a `SourceFile` from a single path (single-file input case).
+fn source_file(path: &Path) -> SourceFile {
+    let (mtime, size) = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata_mtime_size(&metadata))
+        .unwrap_or((UNKNOWN_METADATA, UNKNOWN_METADATA));
+
+    source_file_with_metadata(path, mtime, size)
+}
+
+/// Build a `SourceFile` from a walker entry, reusing the entry's cached
+/// metadata (one `stat` total). `content_hash` stays `None` — it is computed at
+/// scan time from the bytes actually read, never here.
+fn source_file_from_entry(entry: &ignore::DirEntry) -> SourceFile {
+    let path = entry.path().display().to_string();
+    let (mtime, size) = entry
+        .metadata()
+        .ok()
+        .map(|metadata| metadata_mtime_size(&metadata))
+        .unwrap_or((UNKNOWN_METADATA, UNKNOWN_METADATA));
+    SourceFile {
+        path,
+        mtime,
+        size,
+        content_hash: None,
+    }
+}
+
+fn source_file_with_metadata(path: &Path, mtime: i64, size: i64) -> SourceFile {
+    let content_hash = if mtime == UNKNOWN_METADATA && size == UNKNOWN_METADATA {
+        std::fs::read(path)
+            .ok()
+            .map(|contents| content_hash(&contents))
+    } else {
+        None
+    };
+
+    SourceFile {
+        path: path.display().to_string(),
+        mtime,
+        size,
+        content_hash,
+    }
+}
+
+fn content_hash(contents: &[u8]) -> String {
+    const FNV_OFFSET_BASIS: u64 = 14_695_981_039_346_656_037;
+    const FNV_PRIME: u64 = 1_099_511_628_211;
+    let hash = contents.iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    });
+    format!("{hash:016x}")
+}
+
+/// Walk a file or directory tree and extract everything parseable.
+///
+/// Directory walking uses `ignore::WalkBuilder` (same crate + `.hidden(false)`
+/// policy as `find_pattern`'s directory walk, for the same reason: match
+/// `ast-grep`'s observed traversal rather than a hand-rolled recursive
+/// `read_dir` that blanket-skips dot-prefixed entries) and per-file
+/// parse+extract runs in parallel via `rayon`, since it was previously fully
+/// sequential and was the dominant cost in `build`'s scan phase — see
+/// `BENCHMARK.md`.
+pub fn run(path: &str) -> Result<ExtractOutput> {
+    tracing::info!(file = path, "extracting");
+    let profile = std::env::var_os("VARDE_PROFILE").is_some();
+    let t = std::time::Instant::now();
+    let files = list_source_files(path)?;
+    if profile {
+        eprintln!(
+            "VARDE_PROFILE scan: list_source_files done at {:?} ({} files)",
+            t.elapsed(),
+            files.len()
+        );
+    }
+
+    let mut output = ExtractOutput {
+        entities: Vec::new(),
+        symbols: Vec::new(),
+        diagnostics: Vec::new(),
+        files: Vec::with_capacity(files.len()),
+        file_meta: Vec::with_capacity(files.len()),
+    };
+
+    // Parse + extract in parallel; each file also yields its scan-time
+    // content hash so persistence never re-reads the bytes.
+    let processed: Vec<ProcessedFile> = files
+        .par_iter()
+        .enumerate()
+        .map(|(i, file)| process_file(Path::new(&file.path), i as u32))
+        .collect();
+    if profile {
+        eprintln!(
+            "VARDE_PROFILE scan: parallel parse+extract done at {:?}",
+            t.elapsed()
+        );
+    }
+
+    // Reserve exact capacity up front from counts already computed by the
+    // parallel step above: without this, `extend` below regrows `entities`/
+    // `symbols` by doubling as files merge in, and at repo scale (millions
+    // of entities) the last few doublings each copy a multi-million-element
+    // Vec of non-trivial structs — real, measured cost (see BENCHMARK.md).
+    let (entity_total, symbol_total) = processed.iter().fold((0, 0), |(e, s), p| match &p.result {
+        FileResult::Extracted { entities, symbols } => (e + entities.len(), s + symbols.len()),
+        FileResult::Diagnostic(_) => (e, s),
+    });
+    output.entities.reserve_exact(entity_total);
+    output.symbols.reserve_exact(symbol_total);
+
+    for (file, processed) in files.into_iter().zip(processed) {
+        let ProcessedFile {
+            content_hash,
+            result,
+        } = processed;
+        output.file_meta.push(FileMeta {
+            mtime: file.mtime,
+            size: file.size,
+            content_hash,
+        });
+        output.files.push(file.path);
+        merge(&mut output, result);
+    }
+    if profile {
+        eprintln!(
+            "VARDE_PROFILE scan: sequential merge done at {:?}",
+            t.elapsed()
+        );
+    }
+
+    tracing::info!(
+        entities = output.entities.len(),
+        symbols = output.symbols.len(),
+        diagnostics = output.diagnostics.len(),
+        "extract complete"
+    );
+    Ok(output)
+}
+
+enum FileResult {
+    Diagnostic(Diagnostic),
+    Extracted {
+        entities: Vec<crate::model::Entity>,
+        symbols: Vec<crate::model::Symbol>,
+    },
+}
+
+/// The per-file output of `process_file`: the extracted entities/symbols (or
+/// skip diagnostic) plus the scan-time content hash of the file bytes.
+struct ProcessedFile {
+    content_hash: String,
+    result: FileResult,
+}
+
+fn merge(out: &mut ExtractOutput, result: FileResult) {
+    match result {
+        FileResult::Diagnostic(d) => out.diagnostics.push(d),
+        FileResult::Extracted { entities, symbols } => {
+            out.entities.extend(entities);
+            out.symbols.extend(symbols);
+        }
+    }
+}
+
+/// Parsed fragment for a contiguous slice of the file list, produced by
+/// [`parse_chunk`]. Entities/symbols/diagnostics carry their *global*
+/// `file_id` (`start_index + position_in_slice`), so the streaming full build
+/// ([`crate::persist::persist_full_streaming`]) can insert them against one
+/// repo-wide file-id table exactly as a whole-repo [`run`] would.
+pub(crate) struct ChunkParsed {
+    pub entities: Vec<crate::model::Entity>,
+    pub symbols: Vec<crate::model::Symbol>,
+    pub diagnostics: Vec<Diagnostic>,
+    /// One content hash per file in the slice, in slice order (index-aligned
+    /// with the slice passed to [`parse_chunk`]).
+    pub content_hashes: Vec<String>,
+}
+
+/// Parse+extract a contiguous slice of the file list in parallel, assigning
+/// each file the global id `start_index + position_in_slice`.
+///
+/// Order-preserving: the returned entities/symbols follow the slice's file
+/// order (the parallel map is collected in order, then merged sequentially),
+/// so a streaming writer assigns row ids in the same order a single whole-repo
+/// [`run`] would — the property the streaming full build relies on to produce
+/// a byte-identical index.
+pub(crate) fn parse_chunk(files: &[SourceFile], start_index: usize) -> ChunkParsed {
+    let processed: Vec<ProcessedFile> = files
+        .par_iter()
+        .enumerate()
+        .map(|(i, file)| process_file(Path::new(&file.path), (start_index + i) as u32))
+        .collect();
+
+    let mut parsed = ChunkParsed {
+        entities: Vec::new(),
+        symbols: Vec::new(),
+        diagnostics: Vec::new(),
+        content_hashes: Vec::with_capacity(files.len()),
+    };
+    for p in processed {
+        parsed.content_hashes.push(p.content_hash);
+        match p.result {
+            FileResult::Diagnostic(d) => parsed.diagnostics.push(d),
+            FileResult::Extracted { entities, symbols } => {
+                parsed.entities.extend(entities);
+                parsed.symbols.extend(symbols);
+            }
+        }
+    }
+    parsed
+}
+
+/// Parse + extract one file, or return a skip diagnostic.
+///
+/// The raw file bytes are read exactly once: `content_hash` is derived from
+/// them, and source files parse from the same read (via `from_utf8`) rather
+/// than issuing a second `read_to_string`. Non-source files are detected by
+/// extension *before* any read, so they contribute no I/O and only a stable
+/// empty-content hash.
+fn process_file(path: &Path, file_id: u32) -> ProcessedFile {
+    let Some(lang) = language_for_path(path) else {
+        let msg = "unsupported file type — skipped";
+        // debug, not warn: fires once per non-source file walked (docs,
+        // assets, configs) — often the majority of files in a repo. The
+        // info-severity `Diagnostic` below is the persisted record; this is
+        // just a log echo, and at warn-level it dominated `build`'s log
+        // output on large repos.
+        tracing::debug!(file = %path.display(), "{msg}");
+        return ProcessedFile {
+            content_hash: content_hash(&[]),
+            result: FileResult::Diagnostic(Diagnostic {
+                file_id,
+                message: msg.to_string(),
+                severity: "info".to_string(),
+            }),
+        };
+    };
+
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // Unreadable source file (e.g. permission denied) — same skip
+            // diagnostic as a binary body, with a stable empty-content hash.
+            let msg = "binary or non-UTF-8 — skipped";
+            tracing::warn!(file = %path.display(), "{msg}");
+            return ProcessedFile {
+                content_hash: content_hash(&[]),
+                result: FileResult::Diagnostic(Diagnostic {
+                    file_id,
+                    message: msg.to_string(),
+                    severity: "error".to_string(),
+                }),
+            };
+        }
+    };
+    let content_hash = content_hash(&bytes);
+
+    let source = match std::str::from_utf8(&bytes) {
+        Ok(source) => source,
+        Err(_) => {
+            let msg = "binary or non-UTF-8 — skipped";
+            tracing::warn!(file = %path.display(), "{msg}");
+            return ProcessedFile {
+                content_hash,
+                result: FileResult::Diagnostic(Diagnostic {
+                    file_id,
+                    message: msg.to_string(),
+                    severity: "error".to_string(),
+                }),
+            };
+        }
+    };
+    let parsed = parse_source(&lang, source);
+    let result = extract::extract(&parsed, file_id);
+    if result.has_error {
+        let msg = "syntax error — skipped";
+        tracing::warn!(file = %path.display(), "{msg}");
+        return ProcessedFile {
+            content_hash,
+            result: FileResult::Diagnostic(Diagnostic {
+                file_id,
+                message: msg.to_string(),
+                severity: "error".to_string(),
+            }),
+        };
+    }
+    tracing::debug!(
+        file = %path.display(),
+        entities = result.entities.len(),
+        symbols = result.symbols.len(),
+        "parsed file"
+    );
+    ProcessedFile {
+        content_hash,
+        result: FileResult::Extracted {
+            entities: result.entities,
+            symbols: result.symbols,
+        },
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::{UNKNOWN_METADATA, source_file_with_metadata};
+
+    #[test]
+    fn source_file_hashes_content_when_metadata_is_unknown() {
+        let path =
+            std::env::temp_dir().join(format!("varde-scan-content-hash-{}.rs", std::process::id()));
+        let contents = b"fn main() {}\n";
+        std::fs::write(&path, contents).expect("source writes");
+
+        let source = source_file_with_metadata(&path, UNKNOWN_METADATA, UNKNOWN_METADATA);
+
+        assert_eq!(source.content_hash.as_deref(), Some("355463d2db8c9b7f"));
+
+        let _ = std::fs::remove_file(path);
+    }
+}

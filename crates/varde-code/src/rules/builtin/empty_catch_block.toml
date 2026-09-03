@@ -1,0 +1,64 @@
+# Built-in rule: empty-catch-block (family)
+#
+# Swallowed errors are close to unambiguously bad: the handler does nothing,
+# so the failure silently disappears. Near-zero false-positive rate.
+#
+# One rule per language family because the pattern engine ships a single
+# `pattern` per rule and each family's syntax differs (try/catch in
+# TS/JS/TSX, try/except in Python, do/catch in Swift). Java/C#/Kotlin also
+# have try/catch semantics but the hand-rolled pattern matcher cannot parse
+# a catch-clause-shaped pattern in those grammars (the pattern wrapper only
+# supports statement-level snippets), so they are left out of the pack.
+#
+# Escape hatch: a comment inside the block body makes the block non-empty
+# (comments are AST children), so `catch (e) { /* intentional */ }` and
+# `except X as e:\n    # reason\n    pass` are NOT flagged. Truly empty
+# handlers are. See BUILT_IN_RULES.md for the full scoping rationale.
+[[rule]]
+id = "empty-catch-block"
+kind = "pattern"
+severity = "warning"
+name = "Empty catch block"
+description = "A catch handler whose block is empty swallows the error silently."
+message = "empty catch block swallows the error silently"
+remediation = "handle or log the error, or add a comment inside the block explaining why suppression is intentional"
+pattern = "try { $$$A } catch ($ERR) { }"
+languages = ["typescript", "tsx", "javascript"]
+
+# `constraints.ERR = "!^(ImportError|ModuleNotFoundError)$"` (negated, see
+# `pattern::compile_constraints`) excludes two idiomatic suppression shapes
+# confirmed as false positives against psf/requests:
+#   - `except ImportError: pass` / `except ModuleNotFoundError: pass` inside
+#     a loop probing candidate module names for an optional dependency
+#     (`src/requests/compat.py`) — the loop moves on to the next candidate,
+#     nothing is silently lost.
+# `except StopIteration: pass` immediately after a bare `next(...)` call
+# (`src/requests/sessions.py`, peeking one redirect ahead) is a second
+# confirmed false-positive shape, but isn't excluded here: telling that
+# apart from a real swallowed `StopIteration` needs to inspect the
+# preceding statement inside `$$$A`, which a per-capture regex constraint
+# on `$ERR` alone can't see — left as a known residual (see REPORT.md)
+# rather than adding body-content matching to the pattern engine for one
+# rule.
+[[rule]]
+id = "empty-except-block"
+kind = "pattern"
+severity = "warning"
+name = "Empty except block"
+description = "A Python except handler whose body is only `pass` swallows the exception silently."
+message = "empty except block swallows the exception silently"
+remediation = "handle or log the exception, or add a comment inside the block explaining why suppression is intentional"
+pattern = "try:\n    $$$A\nexcept $ERR: pass"
+languages = ["python"]
+constraints = { ERR = "!^(ImportError|ModuleNotFoundError)$" }
+
+[[rule]]
+id = "empty-catch-block-swift"
+kind = "pattern"
+severity = "warning"
+name = "Empty catch block (Swift)"
+description = "A Swift catch clause with an empty block swallows the error silently."
+message = "empty catch block swallows the error silently"
+remediation = "handle or log the error, or add a comment inside the block explaining why suppression is intentional"
+pattern = "do { $$$A } catch { }"
+languages = ["swift"]

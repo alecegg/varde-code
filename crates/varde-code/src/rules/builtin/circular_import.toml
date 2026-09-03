@@ -1,0 +1,50 @@
+# Built-in rule: circular-import
+#
+# A direct two-file import cycle (A imports B, and B imports A) is a
+# structural risk: initialization order becomes load-order-dependent, and
+# in some module systems (CJS, some bundlers) one side sees a partially
+# populated module. `resolved_edges` already persists every resolved
+# import edge (see resolve.rs's `EdgeKind::Import`), so this is a pure
+# self-join, no new extraction or schema work.
+#
+# Scope: direct (2-file) cycles only. Longer transitive cycles (A -> B ->
+# C -> A) would need a recursive CTE with a depth guard to avoid path
+# explosion on dense graphs — deferred as a follow-up, not needed for the
+# common case this rule targets.
+#
+# `e1.from_file_id < e1.to_file_id` dedupes the symmetric pair down to one
+# finding per cycle (without it, both directions would independently match
+# and double-report the same cycle).
+#
+# Test-path exclusion: `files.is_test_path` (generated column, see db.rs)
+# filters both sides of the cycle out. Fixtures that deliberately exercise
+# cycle detection (e.g. this repo's own
+# tests/resolve_fixtures/rust/communities/{d,e,f}.rs) aren't a real
+# initialization-order risk — they're test data for the resolver, not
+# production import structure.
+#
+# Type-only-import exclusion: a Python `if TYPE_CHECKING:`-guarded import or
+# a TypeScript `import type` is erased before runtime — no module reference
+# ever executes, so it cannot cause a real load-order cycle (see
+# extract/langs/python.rs `mark_if_type_checking_only` and
+# extract/langs/ts.rs `is_ts_type_only_import`, both of which tag the Import
+# entity's otherwise-unused `body_shape` as `'type_only'`). Import edges now
+# carry `from_entity_id` (see resolve.rs `resolve_imports`), so both sides
+# of the cycle are joined back to their originating entity and dropped if
+# either one is type-only.
+#
+# Java exclusion: unlike ES modules/CJS/Python, Java import statements never
+# affect class-initialization order or produce a runtime cycle error — two
+# classes importing each other is a completely ordinary mutual-collaborator
+# relationship (e.g. visitor/strategy pairs). Cross-repo triage against
+# google/gson found this rule 13/13 false positive there, so `.java` files
+# are excluded from this rule entirely rather than tuned further.
+[[rule]]
+id = "circular-import"
+kind = "sql"
+severity = "warning"
+name = "Circular import"
+description = "Two files import each other directly — a structural cycle that makes initialization order load-order-dependent."
+message = "circular import: this file and its counterpart import each other directly"
+remediation = "break the cycle by extracting the shared dependency into a third module both sides import, or invert one of the two imports"
+query = "SELECT fa.path AS file, 1 AS line, fb.path AS other FROM resolved_edges e1 JOIN resolved_edges e2 ON e2.from_file_id = e1.to_file_id AND e2.to_file_id = e1.from_file_id JOIN files fa ON fa.id = e1.from_file_id JOIN files fb ON fb.id = e1.to_file_id LEFT JOIN entities ie1 ON ie1.id = e1.from_entity_id LEFT JOIN entities ie2 ON ie2.id = e2.from_entity_id WHERE e1.kind = 1 AND e1.resolved = 1 AND e2.kind = 1 AND e2.resolved = 1 AND e1.from_file_id < e1.to_file_id AND fa.is_test_path = 0 AND fb.is_test_path = 0 AND fa.path NOT LIKE '%.java' AND fb.path NOT LIKE '%.java' AND (ie1.body_shape IS NULL OR ie1.body_shape != 'type_only') AND (ie2.body_shape IS NULL OR ie2.body_shape != 'type_only')"

@@ -1,0 +1,50 @@
+# Built-in rule: vertical-slice-sprawl
+#
+# Per-function analog of "this file reaches into too many unrelated parts
+# of the codebase," at symbol granularity instead of file granularity.
+# `files.community_id` already labels each file's Louvain community (a
+# densely-connected cluster — the closest deterministic proxy for a
+# "vertical slice" varde can compute; see resolve/community.rs, which
+# documents the algorithm as deterministic: nodes visited in id order, ties
+# broken toward the smallest community id). A function whose outgoing calls
+# resolve into several different communities is reaching across slice
+# boundaries — exactly the shape that makes a refactor toward coherent
+# module ownership hard to reason about.
+#
+# This is only possible because `resolved_edges.from_entity_id` (added
+# alongside this rule) tags each resolved Call edge with the specific
+# call-site entity that produced it — previously edges only carried
+# `from_file_id`, so this signal could only ever be computed per-file, which
+# would blame an entire file for one sprawling function while missing it
+# entirely in an otherwise-clean file, or blur it across unrelated
+# functions that happen to share a file. See BUILT_IN_RULES.md for the
+# full write-up (from the same investigation that fixed cross-language
+# Import-entity coverage for circular-import/low-fan-in-high-fan-out-file).
+#
+# Query shape: join each Function entity (`fn`) to its call-site entities
+# via the same `enclosing_function` name-matching `function-complexity-
+# hotspot` already uses (and accepts the same same-name-collision caveat
+# documented there — two same-named functions in one file share a bucket).
+# Each call site's resolved Call edges are joined to their target file's
+# community; only targets in a *different* community than the function's
+# own file count (a function calling plenty of same-slice helpers is not
+# sprawl). `COUNT(DISTINCT ...)` on the target community id, not the raw
+# edge count, is what makes this "touches N slices" rather than "makes N
+# cross-slice calls" — a function hammering one foreign module ten times
+# is not sprawl either.
+#
+# Scope, same as every rule built on `resolved_edges`: only calls that
+# resolve within the repo count. A function fanning out to five different
+# third-party APIs won't flag, since those calls never resolve to a file —
+# this catches internal architectural sprawl specifically, not "does too
+# much" in general.
+[[rule]]
+id = "vertical-slice-sprawl"
+kind = "sql"
+severity = "warning"
+name = "Function spans multiple vertical slices"
+description = "A function's resolved calls reach into several different architectural communities — it crosses more slice boundaries than a single well-scoped function should."
+message = "function reaches across multiple unrelated parts of the codebase"
+remediation = "split this function along the slice boundaries it crosses, or move the cross-slice orchestration into a dedicated coordinator so each slice's internals stay encapsulated"
+query = "SELECT f.path AS file, MIN(fn.start_line) AS line, fn.name, COUNT(DISTINCT tf.community_id) AS slices FROM entities fn JOIN files f ON f.id = fn.file_id JOIN entities call_ent ON call_ent.file_id = fn.file_id AND call_ent.enclosing_function = fn.name AND call_ent.kind = 6 JOIN resolved_edges e ON e.from_entity_id = call_ent.id AND e.kind = 0 AND e.resolved = 1 JOIN files tf ON tf.id = e.to_file_id AND tf.community_id != f.community_id WHERE fn.kind = 0 GROUP BY f.id, fn.name HAVING COUNT(DISTINCT tf.community_id) >= :min_foreign_slices"
+thresholds = { min_foreign_slices = 3.0 }

@@ -1,0 +1,1062 @@
+//! varde-code CLI binary.
+//!
+//! Dispatches `extract` and the 20 query-mode subcommands. Query subcommands
+//! print the uniform JSON envelope; the process never exits non-zero for a
+//! query-mode error (errors are carried inside the envelope).
+
+use clap::Parser;
+use varde_code::cli::{Cli, Command, HooksCommand};
+
+fn main() {
+    install_panic_hook();
+    let cli = Cli::parse();
+    init_tracing(cli.verbose);
+    match cli.command {
+        Command::Extract { path } => run_extract(&path),
+        Command::Build { repo_root, force } => run_build(&repo_root, force),
+        Command::Batch { json } => run_query("batch", &json),
+        Command::SymbolsInFile { json } => run_query("symbols_in_file", &json),
+        Command::SymbolsInFiles { json } => run_query("symbols_in_files", &json),
+        Command::GetSymbol { json } => run_query("get_symbol", &json),
+        Command::Dependencies { json } => run_query("dependencies", &json),
+        Command::Dependents { json } => run_query("dependents", &json),
+        Command::TestsForFile { json } => run_query("tests_for_file", &json),
+        Command::Hotspots { json } => run_query("hotspots", &json),
+        Command::Clusters { json } => run_query("clusters", &json),
+        Command::MapFile { json } => run_query("map_file", &json),
+        Command::MapSymbol { json } => run_query("map_symbol", &json),
+        Command::MapPath { json } => run_query("map_path", &json),
+        Command::Explore { json } => run_query("explore", &json),
+        Command::BlastRadius { json } => run_query("blast_radius", &json),
+        Command::SymbolBlastRadius { json } => run_query("symbol_blast_radius", &json),
+        Command::DetectChanges { json } => run_query("detect_changes", &json),
+        Command::FindImports { json } => run_query("find_imports", &json),
+        Command::TypeHierarchy { json } => run_query("type_hierarchy", &json),
+        Command::FilterSymbols { json } => run_query("filter_symbols", &json),
+        Command::FindPattern { json } => run_query("find_pattern", &json),
+        Command::ContextPack { json } => run_query("context_pack", &json),
+        Command::NavMap { json, format } => run_nav_map(&json, &format),
+        // `scan` is a read-and-report operation like the query modes, but it
+        // must be able to exit non-zero (findings at/above the severity
+        // threshold → CI gate), so it gets its own dispatch arm instead of
+        // `run_query` (which never exits non-zero by contract).
+        Command::Scan { json, apply, force } => std::process::exit(run_scan(&json, apply, force)),
+        // `test` is a read-and-report operation like `scan`: it must exit
+        // non-zero when any `[[test]]` case fails (CI gate), so it gets its
+        // own dispatch arm instead of `run_query`.
+        Command::Test { json } => std::process::exit(run_test(&json)),
+        Command::RulesList { json } => run_rules_list(&json),
+        Command::RulesSeed { json, user, force } => run_rules_seed(&json, user, force),
+        Command::RulesRemove { json, user, force } => run_rules_remove(&json, user, force),
+        Command::SkillsList => run_skills_list(),
+        Command::SkillsInstall { dir, force } => run_skills_install(&dir, force),
+        Command::SkillsRemove { dir, force } => run_skills_remove(&dir, force),
+        Command::Hooks(HooksCommand::List) => run_hooks_list(),
+        Command::Hooks(HooksCommand::Install { agent, force, dir }) => {
+            run_hooks_install(&agent, force, dir.as_deref())
+        }
+        Command::Hooks(HooksCommand::Remove { agent, force, dir }) => {
+            run_hooks_remove(&agent, force, dir.as_deref())
+        }
+        Command::SliceState { json } => run_query("slice_state", &json),
+        Command::Watch {
+            repos,
+            config,
+            debounce_ms,
+            list,
+            stop,
+            stop_all,
+        } => std::process::exit(if list {
+            run_watch_list()
+        } else if stop_all {
+            run_watch_stop_all()
+        } else if stop {
+            run_watch_stop(&repos, config.as_deref())
+        } else {
+            run_watch(&repos, config.as_deref(), debounce_ms)
+        }),
+    }
+}
+
+/// Replace the default panic handler with a concise, user-facing message.
+/// An unexpected panic is a bug, not a normal error path (those flow through
+/// the JSON envelope or a `Result`), so a raw multi-line Rust panic dump at a
+/// user is unhelpful. Print one clear line plus a report pointer; the process
+/// still exits non-zero (101) so scripts and CI detect the failure. Honors
+/// `RUST_BACKTRACE` implicitly — set it to still get the default trace.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown cause".to_string());
+        let loc = info
+            .location()
+            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        eprintln!("varde-code: internal error: {msg}{loc}");
+        eprintln!(
+            "This is a bug; please report it at https://github.com/alecegg/varde-code/issues"
+        );
+    }));
+}
+
+/// Run one `scan` invocation: flow + envelope + threshold exit code.
+///
+/// `apply`/`force` (from the `--apply`/`--force` flags) are merged into the
+/// JSON input so `scan_repo` — and the MCP surface, which drives scan purely
+/// via the JSON input — see one contract. An explicit JSON `apply`/`force`
+/// field is honored as-is unless the corresponding flag is passed, in which
+/// case the flag wins (an explicit CLI switch beats an embedded value).
+///
+/// Returns the process exit code: 0 when no finding meets/exceeds the
+/// severity threshold (default `error`), non-zero otherwise; any tool-level
+/// error (bad input, missing/stale DB, unwritable `output`) emits the
+/// `{ok:false,error}` envelope and returns non-zero. `output` present →
+/// envelope written to that file and nothing on stdout; absent → stdout.
+fn run_scan(json: &str, apply: bool, force: bool) -> i32 {
+    let mut value: serde_json::Value = match serde_json::from_str(json) {
+        Ok(value) => value,
+        Err(e) => {
+            println!(
+                "{}",
+                varde_code::query::render(Err(varde_code::query::ApiError::new(
+                    "invalid_input",
+                    format!("input is not valid JSON: {e}"),
+                )))
+            );
+            return 1;
+        }
+    };
+    if apply {
+        value["apply"] = serde_json::json!(true);
+    }
+    if force {
+        value["force"] = serde_json::json!(true);
+    }
+
+    let result = varde_code::scan_cli::scan_repo(&value)
+        .map(|payload| serde_json::json!({ "ok": true, "data": payload }));
+    let envelope = match result {
+        Ok(envelope) => envelope.to_string(),
+        Err(err) => varde_code::query::render(Err(err)),
+    };
+
+    if let Some(path) = value.get("output").and_then(|o| o.as_str()) {
+        if let Err(e) = std::fs::write(path, &envelope) {
+            println!(
+                "{}",
+                varde_code::query::render(Err(varde_code::query::ApiError::new(
+                    "write_error",
+                    format!("cannot write scan output to {path}: {e}"),
+                )))
+            );
+            return 1;
+        }
+    } else {
+        println!("{envelope}");
+    }
+
+    // Compute the exit code from the emitted payload: re-parse the envelope
+    // (already valid JSON — we just serialized it) and compare severities.
+    let payload: serde_json::Value = match serde_json::from_str(&envelope) {
+        Ok(payload) => payload,
+        Err(err) => {
+            eprintln!("varde-code: internal error re-parsing result envelope: {err}");
+            return 2;
+        }
+    };
+    if payload["ok"] == true {
+        let threshold = varde_code::scan_cli::severity_threshold(&value)
+            .unwrap_or(varde_code::rules::Severity::Error);
+        // Applied-aware: findings whose rewrite was applied (`rewrite_status`
+        // = "applied") are resolved and don't trip the gate; everything else
+        // gates exactly as before (identical for non-apply runs).
+        if varde_code::scan_cli::unresolved_findings_at_or_above(&payload["data"], threshold) {
+            1
+        } else {
+            0
+        }
+    } else {
+        1
+    }
+}
+
+/// Run one `test` invocation: flow + envelope + failure-gate exit code.
+///
+/// Mirrors `run_scan`'s shape: parses `json`, runs the operation, prints the
+/// `{ok, data}`/`{ok:false, error}` envelope to stdout, and returns the
+/// process exit code — `0` when `summary.failed == 0`, non-zero when any
+/// test failed or a tool-level error occurred (bad input JSON, invalid
+/// `rulesDir`, etc).
+fn run_test(json: &str) -> i32 {
+    let value: serde_json::Value = match serde_json::from_str(json) {
+        Ok(value) => value,
+        Err(e) => {
+            println!(
+                "{}",
+                varde_code::query::render(Err(varde_code::query::ApiError::new(
+                    "invalid_input",
+                    format!("input is not valid JSON: {e}"),
+                )))
+            );
+            return 1;
+        }
+    };
+
+    let result = varde_code::test_cli::run_tests(&value)
+        .map(|payload| serde_json::json!({ "ok": true, "data": payload }));
+    let envelope = match result {
+        Ok(envelope) => envelope.to_string(),
+        Err(err) => varde_code::query::render(Err(err)),
+    };
+    println!("{envelope}");
+
+    let payload: serde_json::Value = match serde_json::from_str(&envelope) {
+        Ok(payload) => payload,
+        Err(err) => {
+            eprintln!("varde-code: internal error re-parsing result envelope: {err}");
+            return 2;
+        }
+    };
+    if payload["ok"] == true {
+        let failed = payload["data"]["summary"]["failed"].as_u64().unwrap_or(0);
+        if failed == 0 { 0 } else { 1 }
+    } else {
+        1
+    }
+}
+
+/// Resolve the watch list (explicit `--repo`s + optional config file, or
+/// the default `~/.config/varde-code/watch.toml` when neither is given),
+/// then run the watcher until killed. Prints a clear error and exits
+/// non-zero on any setup failure (bad config, no repos resolved, another
+/// watcher already running for this repo set); once running, per-repo
+/// reconcile failures are logged by `watch::run` and do not exit the
+/// process — one repo's transient failure must not take down every other
+/// watched repo.
+fn run_watch(repos: &[String], config_path: Option<&str>, debounce_ms: u64) -> i32 {
+    let resolved = match resolve_watch_repos(repos, config_path) {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
+    };
+
+    match varde_code::watch::run(&resolved, std::time::Duration::from_millis(debounce_ms)) {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("varde-code watch: {err:#}");
+            1
+        }
+    }
+}
+
+/// Shared `--repo`/`--config` resolution for `run_watch` and `run_watch_stop`
+/// — same repo set must resolve identically for both, since `--stop` looks
+/// up a running watcher's lock by hashing this same resolved list (see
+/// `watch::watch_set_id`). On failure, prints the error and returns the exit
+/// code the caller should return.
+fn resolve_watch_repos(
+    repos: &[String],
+    config_path: Option<&str>,
+) -> Result<Vec<std::path::PathBuf>, i32> {
+    let config = match config_path {
+        Some(path) => match varde_code::watch::WatchConfig::load(std::path::Path::new(path)) {
+            Ok(config) => Some(config),
+            Err(err) => {
+                eprintln!("varde-code watch: {err:#}");
+                return Err(1);
+            }
+        },
+        None => {
+            let default_path = varde_code::watch::WatchConfig::default_path();
+            if repos.is_empty() && default_path.exists() {
+                match varde_code::watch::WatchConfig::load(&default_path) {
+                    Ok(config) => Some(config),
+                    Err(err) => {
+                        eprintln!("varde-code watch: {err:#}");
+                        return Err(1);
+                    }
+                }
+            } else {
+                None
+            }
+        }
+    };
+
+    varde_code::watch::resolve_repos(repos, config.as_ref()).map_err(|err| {
+        eprintln!("varde-code watch: {err:#}");
+        1
+    })
+}
+
+/// `varde-code watch --list`: print every watcher instance (live or
+/// stale-locked) as a JSON array and exit 0. Never exits non-zero — this is
+/// a read-only listing, same posture as `rules_list`/`slice_state`.
+fn run_watch_list() -> i32 {
+    match varde_code::watch::list_instances() {
+        Ok(instances) => {
+            println!(
+                "{}",
+                serde_json::to_string(&instances).unwrap_or_else(|_| "[]".to_string())
+            );
+            0
+        }
+        Err(err) => {
+            eprintln!("varde-code watch --list: {err:#}");
+            1
+        }
+    }
+}
+
+/// `varde-code watch --stop`: stop the watcher for the `--repo`/`--config`-
+/// resolved repo set and exit. Non-zero if no watcher lock exists for that
+/// repo set or the stop itself fails.
+fn run_watch_stop(repos: &[String], config_path: Option<&str>) -> i32 {
+    let resolved = match resolve_watch_repos(repos, config_path) {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
+    };
+    match varde_code::watch::stop(&resolved) {
+        Ok(outcome) => {
+            println!(
+                "{}",
+                serde_json::to_string(&outcome).unwrap_or_else(|_| "{}".to_string())
+            );
+            0
+        }
+        Err(err) => {
+            eprintln!("varde-code watch --stop: {err:#}");
+            1
+        }
+    }
+}
+
+/// `varde-code watch --stop-all`: stop every running watcher instance and
+/// exit. Non-zero only if enumerating instances itself fails; a per-instance
+/// stop failure is reported inline in the JSON output, not a process exit.
+fn run_watch_stop_all() -> i32 {
+    match varde_code::watch::stop_all() {
+        Ok(outcomes) => {
+            println!(
+                "{}",
+                serde_json::to_string(&outcomes).unwrap_or_else(|_| "[]".to_string())
+            );
+            0
+        }
+        Err(err) => {
+            eprintln!("varde-code watch --stop-all: {err:#}");
+            1
+        }
+    }
+}
+
+/// Run one `rules_list` invocation: parses input, delegates to
+/// `scan_cli::rules_list`, prints the uniform envelope. Never exits
+/// non-zero — this is a read-only listing, not a CI gate like `scan`.
+fn run_rules_list(json: &str) {
+    let value: serde_json::Value = match serde_json::from_str(json) {
+        Ok(value) => value,
+        Err(e) => {
+            println!(
+                "{}",
+                varde_code::query::render(Err(varde_code::query::ApiError::new(
+                    "invalid_input",
+                    format!("input is not valid JSON: {e}"),
+                )))
+            );
+            return;
+        }
+    };
+    println!(
+        "{}",
+        varde_code::query::render(varde_code::scan_cli::rules_list(&value))
+    );
+}
+
+/// Run one `rules_seed` invocation: parses input, delegates to
+/// `scan_cli::rules_seed`, prints the uniform envelope. Never exits
+/// non-zero — writing seed files is not a CI gate.
+fn run_rules_seed(json: &str, user: bool, force: bool) {
+    let value: serde_json::Value = match serde_json::from_str(json) {
+        Ok(value) => value,
+        Err(e) => {
+            println!(
+                "{}",
+                varde_code::query::render(Err(varde_code::query::ApiError::new(
+                    "invalid_input",
+                    format!("input is not valid JSON: {e}"),
+                )))
+            );
+            return;
+        }
+    };
+    println!(
+        "{}",
+        varde_code::query::render(varde_code::scan_cli::rules_seed(&value, user, force))
+    );
+}
+
+/// Run one `rules_remove` invocation: parses input, delegates to
+/// `scan_cli::rules_remove`, prints the uniform envelope. Never exits
+/// non-zero — deleting seed files is not a CI gate.
+fn run_rules_remove(json: &str, user: bool, force: bool) {
+    let value: serde_json::Value = match serde_json::from_str(json) {
+        Ok(value) => value,
+        Err(e) => {
+            println!(
+                "{}",
+                varde_code::query::render(Err(varde_code::query::ApiError::new(
+                    "invalid_input",
+                    format!("input is not valid JSON: {e}"),
+                )))
+            );
+            return;
+        }
+    };
+    println!(
+        "{}",
+        varde_code::query::render(varde_code::scan_cli::rules_remove(&value, user, force))
+    );
+}
+
+/// Run one `skills_list` invocation: describes the bundled skill packs and
+/// the directory name each installs as. No filesystem access.
+fn run_skills_list() {
+    let packs: Vec<serde_json::Value> = varde_code::skills::SKILL_PACKS
+        .iter()
+        .map(|pack| {
+            serde_json::json!({
+                "name": pack.name,
+                "installDirName": varde_code::skills::install_dir_name(pack.name),
+                "files": pack.files.iter().map(|f| f.rel_path).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        varde_code::query::render(Ok::<_, varde_code::query::ApiError>(
+            serde_json::json!({ "packs": packs })
+        ))
+    );
+}
+
+/// Run one `skills_install` invocation: writes every bundled skill pack into
+/// `dir` as `varde-code-<name>/`, prints the uniform envelope. Never exits
+/// non-zero — installing skills is not a CI gate.
+fn run_skills_install(dir: &str, force: bool) {
+    let target_dir = std::path::Path::new(dir);
+    let result = varde_code::skills::install_skills(target_dir, force)
+        .map(|installed| {
+            let installed_json: Vec<serde_json::Value> = installed
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "packName": r.pack_name,
+                        "path": r.path.display().to_string(),
+                        "written": r.written,
+                        "skippedExisting": r.skipped_existing,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "targetDir": target_dir.display().to_string(), "installed": installed_json })
+        })
+        .map_err(|e| {
+            varde_code::query::ApiError::new("io_error", format!("failed to install skills into {}: {e}", target_dir.display()))
+        });
+    println!("{}", varde_code::query::render(result));
+}
+
+/// Run one `skills_remove` invocation: deletes previously installed
+/// `varde-code-<name>/` skill directories from `dir`, prints the uniform
+/// envelope. Never exits non-zero — removing skills is not a CI gate.
+fn run_skills_remove(dir: &str, force: bool) {
+    let target_dir = std::path::Path::new(dir);
+    let result = varde_code::skills::remove_skills(target_dir, force)
+        .map(|removed| {
+            let removed_json: Vec<serde_json::Value> = removed
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "packName": r.pack_name,
+                        "path": r.path.display().to_string(),
+                        "removed": r.removed,
+                        "skippedModified": r.skipped_modified,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "targetDir": target_dir.display().to_string(), "removed": removed_json })
+        })
+        .map_err(|e| {
+            varde_code::query::ApiError::new("io_error", format!("failed to remove skills from {}: {e}", target_dir.display()))
+        });
+    println!("{}", varde_code::query::render(result));
+}
+
+/// Resolve the requested `--agent` names to `HookTarget`s. Empty (no
+/// `--agent` given) defaults to every target in `HOOK_TARGETS`. Unknown
+/// agent names are reported as an error rather than silently ignored.
+fn resolve_hook_targets(agents: &[String]) -> Result<Vec<varde_code::hooks::HookTarget>, String> {
+    if agents.is_empty() {
+        return Ok(varde_code::hooks::HOOK_TARGETS.to_vec());
+    }
+    agents
+        .iter()
+        .map(|name| {
+            varde_code::hooks::HOOK_TARGETS
+                .iter()
+                .find(|t| t.agent == name)
+                .copied()
+                .ok_or_else(|| {
+                    let known: Vec<&str> = varde_code::hooks::HOOK_TARGETS
+                        .iter()
+                        .map(|t| t.agent)
+                        .collect();
+                    format!("unknown agent {name:?}; expected one of {known:?}")
+                })
+        })
+        .collect()
+}
+
+/// The real per-agent, per-OS default install directory (user-level scope),
+/// used when `--dir` is not given.
+fn default_hook_dir(agent: &str) -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("~"));
+    match agent {
+        varde_code::hooks::CLAUDE_AGENT => home.join(".claude"),
+        varde_code::hooks::CODEX_AGENT => home.join(".codex"),
+        varde_code::hooks::OPENCODE_AGENT => home.join(".config").join("opencode"),
+        varde_code::hooks::PI_AGENT => home.join(".pi").join("agent").join("extensions"),
+        other => home.join(format!(".{other}")),
+    }
+}
+
+/// Run one `hooks list` invocation: describes the 4 supported agent hook
+/// targets and where each installs to. No filesystem access.
+fn run_hooks_list() {
+    let targets: Vec<serde_json::Value> = varde_code::hooks::HOOK_TARGETS
+        .iter()
+        .map(|target| {
+            let (rel_path, kind) = match target.kind {
+                varde_code::hooks::HookKind::MergeInto(rel_path, _) => (rel_path, "merge"),
+                varde_code::hooks::HookKind::WriteFile(rel_path, _) => (rel_path, "write_file"),
+            };
+            let default_dir = default_hook_dir(target.agent);
+            serde_json::json!({
+                "agent": target.agent,
+                "kind": kind,
+                "relPath": rel_path,
+                "defaultTargetDir": default_dir.display().to_string(),
+                "defaultPath": default_dir.join(rel_path).display().to_string(),
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        varde_code::query::render(Ok::<_, varde_code::query::ApiError>(
+            serde_json::json!({ "targets": targets })
+        ))
+    );
+}
+
+/// Run one `hooks install` invocation: installs the session-start hook for
+/// each requested agent (default: all 4) into either `--dir` (uniformly, for
+/// testing) or each agent's real per-OS default directory. Never exits
+/// non-zero — installing hooks is not a CI gate.
+fn run_hooks_install(agents: &[String], force: bool, dir: Option<&str>) {
+    let targets = match resolve_hook_targets(agents) {
+        Ok(targets) => targets,
+        Err(err) => {
+            println!(
+                "{}",
+                varde_code::query::render(Err::<serde_json::Value, _>(
+                    varde_code::query::ApiError::new("invalid_argument", err)
+                ))
+            );
+            return;
+        }
+    };
+    let result = install_or_remove_hooks(&targets, dir, |target_dir, one_target| {
+        varde_code::hooks::install_hooks(target_dir, one_target, force)
+    })
+    .map(|(installed, dirs)| {
+        let installed_json: Vec<serde_json::Value> = installed
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "agent": r.agent,
+                    "path": r.path.display().to_string(),
+                    "written": r.written,
+                    "skippedExisting": r.skipped_existing,
+                })
+            })
+            .collect();
+        serde_json::json!({ "targetDirs": dirs, "installed": installed_json })
+    })
+    .map_err(|e| {
+        varde_code::query::ApiError::new("io_error", format!("failed to install hooks: {e}"))
+    });
+    println!("{}", varde_code::query::render(result));
+}
+
+/// Run one `hooks remove` invocation: undoes `hooks install` for each
+/// requested agent (default: all 4). Never exits non-zero — removing hooks
+/// is not a CI gate.
+fn run_hooks_remove(agents: &[String], force: bool, dir: Option<&str>) {
+    let targets = match resolve_hook_targets(agents) {
+        Ok(targets) => targets,
+        Err(err) => {
+            println!(
+                "{}",
+                varde_code::query::render(Err::<serde_json::Value, _>(
+                    varde_code::query::ApiError::new("invalid_argument", err)
+                ))
+            );
+            return;
+        }
+    };
+    let result = install_or_remove_hooks(&targets, dir, |target_dir, one_target| {
+        varde_code::hooks::remove_hooks(target_dir, one_target, force)
+    })
+    .map(|(removed, dirs)| {
+        let removed_json: Vec<serde_json::Value> = removed
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "agent": r.agent,
+                    "path": r.path.display().to_string(),
+                    "removed": r.removed,
+                    "skippedModified": r.skipped_modified,
+                })
+            })
+            .collect();
+        serde_json::json!({ "targetDirs": dirs, "removed": removed_json })
+    })
+    .map_err(|e| {
+        varde_code::query::ApiError::new("io_error", format!("failed to remove hooks: {e}"))
+    });
+    println!("{}", varde_code::query::render(result));
+}
+
+/// Shared install/remove driver: with `--dir`, all `targets` are installed
+/// into that single directory in one call (matches `hooks.rs`'s own tests,
+/// which pass one dir for multiple agents since each target's `rel_path` is
+/// a distinct filename). Without `--dir`, each target is installed into its
+/// own resolved per-agent default directory via a separate call. Returns the
+/// concatenated per-target results plus a `{agent: targetDir}` map for the
+/// envelope.
+fn install_or_remove_hooks<T>(
+    targets: &[varde_code::hooks::HookTarget],
+    dir: Option<&str>,
+    op: impl Fn(&std::path::Path, &[varde_code::hooks::HookTarget]) -> std::io::Result<Vec<T>>,
+) -> std::io::Result<(Vec<T>, serde_json::Value)> {
+    match dir {
+        Some(dir) => {
+            let target_dir = std::path::Path::new(dir);
+            let results = op(target_dir, targets)?;
+            let dirs: serde_json::Map<String, serde_json::Value> = targets
+                .iter()
+                .map(|t| {
+                    (
+                        t.agent.to_string(),
+                        serde_json::Value::String(target_dir.display().to_string()),
+                    )
+                })
+                .collect();
+            Ok((results, serde_json::Value::Object(dirs)))
+        }
+        None => {
+            let mut all_results = Vec::new();
+            let mut dirs = serde_json::Map::new();
+            for target in targets {
+                let target_dir = default_hook_dir(target.agent);
+                let results = op(&target_dir, std::slice::from_ref(target))?;
+                dirs.insert(
+                    target.agent.to_string(),
+                    serde_json::Value::String(target_dir.display().to_string()),
+                );
+                all_results.extend(results);
+            }
+            Ok((all_results, serde_json::Value::Object(dirs)))
+        }
+    }
+}
+
+fn run_query(mode: &str, json: &str) {
+    println!("{}", varde_code::query::run_mode(mode, json));
+}
+
+/// `nav_map` — JSON is the canonical envelope, printed as-is; `--format
+/// text` derives a plain-text rendering from the same JSON (never a second
+/// data-gathering path).
+fn run_nav_map(json: &str, format: &str) {
+    let envelope = varde_code::query::run_mode("nav_map", json);
+    if format == "text" {
+        println!("{}", render_nav_map_text(&envelope));
+    } else {
+        println!("{}", envelope);
+    }
+}
+
+/// Render the `nav_map` JSON envelope as plain text: one header + item
+/// count per section. On error (or unparseable input), fall back to the raw
+/// envelope so no information is lost.
+fn render_nav_map_text(envelope: &str) -> String {
+    const SECTIONS: [&str; 7] = [
+        "entrypoints",
+        "foundational_files",
+        "module_layers",
+        "subsystems",
+        "symbols",
+        "flows",
+        "hotspots",
+    ];
+    let value: serde_json::Value = match serde_json::from_str(envelope) {
+        Ok(v) => v,
+        Err(_) => return envelope.to_string(),
+    };
+    if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return envelope.to_string();
+    }
+    let data = value
+        .get("data")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let mut out = String::new();
+    for section in SECTIONS {
+        out.push_str(&format!("## {section}\n"));
+        match data.get(section) {
+            Some(serde_json::Value::Array(items)) => {
+                out.push_str(&format!("{} item(s)\n\n", items.len()));
+            }
+            Some(other) => {
+                out.push_str(&format!("{other}\n\n"));
+            }
+            None => out.push_str("(missing)\n\n"),
+        }
+    }
+    out
+}
+
+fn init_tracing(verbose: bool) {
+    use tracing_subscriber::EnvFilter;
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(val) => EnvFilter::new(val),
+        Err(_) => EnvFilter::new(if verbose {
+            "debug"
+        } else {
+            "varde_code=info,warn,error"
+        }),
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+fn run_build(repo_root: &str, force: bool) {
+    match varde_code::build::run_with_force(repo_root, force) {
+        Ok(summary) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": true,
+                    "dbPath": summary.db_path,
+                    "entities": summary.entities,
+                    "symbols": summary.symbols,
+                    "diagnostics": summary.diagnostics,
+                    "unchanged": summary.unchanged,
+                    "reparsed": summary.reparsed,
+                    "changedFiles": summary.changed_files,
+                })
+            );
+        }
+        Err(e) => {
+            tracing::error!(repo_root = repo_root, "fatal error: {e:#}");
+            eprintln!("varde-code: error: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_extract(path: &str) {
+    match varde_code::scan::run(path) {
+        Ok(output) => {
+            tracing::debug!(file = path, "emitting JSON document");
+            let mut doc = serde_json::to_value(&output).expect("output serializes");
+            // The JSON contract exposes a resolved `file` path per
+            // entity/symbol/diagnostic (external CLI consumers, not the
+            // in-process `file_id` used internally) — inject it here rather
+            // than growing `model::Entity`/`Symbol`/`Diagnostic` back to
+            // carrying an owned path.
+            for key in ["entities", "symbols", "diagnostics"] {
+                if let Some(items) = doc.get_mut(key).and_then(|v| v.as_array_mut()) {
+                    for item in items {
+                        if let Some(id) = item.get("file_id").and_then(|v| v.as_u64()) {
+                            item["file"] = serde_json::json!(output.files[id as usize]);
+                        }
+                    }
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&doc).expect("output serializes")
+            );
+        }
+        Err(e) => {
+            tracing::error!(file = path, "fatal error: {e:#}");
+            eprintln!("varde-code: error: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod nav_map_text_tests {
+    use super::{
+        default_hook_dir, install_or_remove_hooks, render_nav_map_text, resolve_hook_targets,
+        run_hooks_list,
+    };
+
+    /// AC3: every section name present in the JSON also appears in the text
+    /// rendering.
+    #[test]
+    fn text_rendering_lists_every_json_section() {
+        let envelope = serde_json::json!({
+            "ok": true,
+            "data": {
+                "entrypoints": [{"symbol": "hello"}],
+                "foundational_files": [],
+                "module_layers": {"edges": [], "cycles": []},
+                "subsystems": [],
+                "symbols": [],
+                "flows": [],
+                "hotspots": [],
+            }
+        })
+        .to_string();
+
+        let text = render_nav_map_text(&envelope);
+
+        for section in [
+            "entrypoints",
+            "foundational_files",
+            "module_layers",
+            "subsystems",
+            "symbols",
+            "flows",
+            "hotspots",
+        ] {
+            assert!(
+                text.contains(section),
+                "text rendering missing section {section:?}: {text}"
+            );
+        }
+    }
+
+    /// An error envelope falls back to the raw envelope rather than
+    /// producing a bespoke text shape.
+    #[test]
+    fn text_rendering_falls_back_to_raw_envelope_on_error() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {"code": "not_found", "message": "no such repo"}
+        })
+        .to_string();
+
+        let text = render_nav_map_text(&envelope);
+        assert_eq!(text, envelope);
+    }
+
+    // --- `hooks` CLI wiring: resolve_hook_targets / default dirs / round trip
+
+    fn tempdir(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("varde-hooks-cli-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir creates");
+        dir
+    }
+
+    #[test]
+    fn resolve_hook_targets_empty_agent_list_means_all_four() {
+        let targets = resolve_hook_targets(&[]).expect("empty --agent resolves");
+        assert_eq!(targets.len(), varde_code::hooks::HOOK_TARGETS.len());
+        let agents: Vec<&str> = targets.iter().map(|t| t.agent).collect();
+        assert!(agents.contains(&varde_code::hooks::CLAUDE_AGENT));
+        assert!(agents.contains(&varde_code::hooks::CODEX_AGENT));
+        assert!(agents.contains(&varde_code::hooks::OPENCODE_AGENT));
+        assert!(agents.contains(&varde_code::hooks::PI_AGENT));
+    }
+
+    #[test]
+    fn resolve_hook_targets_filters_to_requested_subset() {
+        let targets = resolve_hook_targets(&["claude".to_string(), "codex".to_string()])
+            .expect("known agents resolve");
+        assert_eq!(targets.len(), 2);
+        let agents: Vec<&str> = targets.iter().map(|t| t.agent).collect();
+        assert_eq!(
+            agents,
+            vec![
+                varde_code::hooks::CLAUDE_AGENT,
+                varde_code::hooks::CODEX_AGENT
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_hook_targets_rejects_unknown_agent() {
+        let err = resolve_hook_targets(&["not-a-real-agent".to_string()])
+            .expect_err("unknown agent errors");
+        assert!(
+            err.contains("not-a-real-agent"),
+            "error names the bad agent: {err}"
+        );
+    }
+
+    #[test]
+    fn hooks_list_performs_no_filesystem_writes_and_covers_all_four_agents() {
+        // `run_hooks_list` only reads `HOOK_TARGETS` (static) and formats
+        // default dirs; assert it doesn't touch disk by checking no new
+        // entries appear under a scratch dir it's never told about, and that
+        // its output covers all 4 agents.
+        let before = tempdir("list-no-writes");
+        let entries_before: Vec<_> = std::fs::read_dir(&before).unwrap().collect();
+        assert!(entries_before.is_empty());
+
+        run_hooks_list();
+
+        let entries_after: Vec<_> = std::fs::read_dir(&before).unwrap().collect();
+        assert!(
+            entries_after.is_empty(),
+            "hooks list must not write to the filesystem"
+        );
+
+        for agent in [
+            varde_code::hooks::CLAUDE_AGENT,
+            varde_code::hooks::CODEX_AGENT,
+            varde_code::hooks::OPENCODE_AGENT,
+            varde_code::hooks::PI_AGENT,
+        ] {
+            assert!(
+                varde_code::hooks::HOOK_TARGETS
+                    .iter()
+                    .any(|t| t.agent == agent),
+                "hooks list source data covers agent {agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn hooks_install_no_agent_installs_all_four_into_dir() {
+        let dir = tempdir("install-all");
+        let targets = resolve_hook_targets(&[]).unwrap();
+        let (installed, dirs) = install_or_remove_hooks(
+            &targets,
+            Some(dir.to_str().unwrap()),
+            |target_dir, one_target| {
+                varde_code::hooks::install_hooks(target_dir, one_target, false)
+            },
+        )
+        .expect("install succeeds");
+        assert_eq!(installed.len(), varde_code::hooks::HOOK_TARGETS.len());
+        assert_eq!(dirs.as_object().unwrap().len(), 4);
+        assert!(dir.join("settings.json").exists());
+        assert!(dir.join("config.toml").exists());
+        assert!(dir.join("plugin/varde-code-nav-map.js").exists());
+        assert!(dir.join("pi-extension.js").exists());
+    }
+
+    #[test]
+    fn hooks_install_agent_subset_installs_only_those_two() {
+        let dir = tempdir("install-subset");
+        let targets = resolve_hook_targets(&["claude".to_string(), "codex".to_string()]).unwrap();
+        install_or_remove_hooks(
+            &targets,
+            Some(dir.to_str().unwrap()),
+            |target_dir, one_target| {
+                varde_code::hooks::install_hooks(target_dir, one_target, false)
+            },
+        )
+        .expect("install succeeds");
+        assert!(dir.join("settings.json").exists());
+        assert!(dir.join("config.toml").exists());
+        assert!(!dir.join("plugin/varde-code-nav-map.js").exists());
+        assert!(!dir.join("pi-extension.js").exists());
+    }
+
+    #[test]
+    fn hooks_install_then_remove_round_trips_whole_file_and_merge_targets() {
+        let dir = tempdir("round-trip");
+        let targets = resolve_hook_targets(&[]).unwrap();
+
+        // Whole-file target (opencode): round trip restores pre-install state
+        // (file absent).
+        assert!(!dir.join("plugin/varde-code-nav-map.js").exists());
+        // Merge target (claude): seed unrelated content first so we can
+        // assert only the injected entry is removed, not the whole file.
+        std::fs::write(dir.join("settings.json"), r#"{"unrelated": true}"#).unwrap();
+
+        install_or_remove_hooks(
+            &targets,
+            Some(dir.to_str().unwrap()),
+            |target_dir, one_target| {
+                varde_code::hooks::install_hooks(target_dir, one_target, false)
+            },
+        )
+        .expect("install succeeds");
+        assert!(dir.join("plugin/varde-code-nav-map.js").exists());
+        assert!(dir.join("pi-extension.js").exists());
+
+        install_or_remove_hooks(
+            &targets,
+            Some(dir.to_str().unwrap()),
+            |target_dir, one_target| varde_code::hooks::remove_hooks(target_dir, one_target, false),
+        )
+        .expect("remove succeeds");
+
+        // Whole-file targets: pre-install state restored (files gone).
+        assert!(!dir.join("plugin/varde-code-nav-map.js").exists());
+        assert!(!dir.join("pi-extension.js").exists());
+
+        // Merge targets: the shared config file remains (it's not a
+        // whole-file target), but only this tool's injected entry is
+        // removed, never unrelated content.
+        let codex_doc = std::fs::read_to_string(dir.join("config.toml"))
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .expect("valid toml");
+        assert!(
+            codex_doc.get("hooks").is_none(),
+            "injected session_start table removed"
+        );
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["unrelated"], true);
+        assert!(
+            settings.get("hooks").is_none(),
+            "injected SessionStart hook removed"
+        );
+    }
+
+    #[test]
+    fn hooks_install_without_dir_resolves_per_agent_default_dirs() {
+        let targets = resolve_hook_targets(&["claude".to_string(), "pi".to_string()]).unwrap();
+        let claude_dir = default_hook_dir("claude");
+        let pi_dir = default_hook_dir("pi");
+        assert_ne!(
+            claude_dir, pi_dir,
+            "each agent resolves its own default dir"
+        );
+        assert!(claude_dir.ends_with(".claude"));
+        assert!(pi_dir.ends_with("agent/extensions"));
+        // Sanity: install_or_remove_hooks with dir=None would target these
+        // dirs (not exercised here to avoid touching the real home dir).
+        assert_eq!(targets.len(), 2);
+    }
+}

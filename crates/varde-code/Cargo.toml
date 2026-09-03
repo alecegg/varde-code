@@ -1,0 +1,48 @@
+[package]
+name = "varde-code"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Code-intelligence core: multi-language tree-sitter parsing and entity/symbol extraction"
+readme = "../../README.md"
+keywords = ["code-intelligence", "tree-sitter", "ast-grep", "static-analysis"]
+
+[dependencies]
+ast-grep-language = "0.45.1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ast-grep-core = "0.45.1"
+rusqlite = { version = "0.32", features = ["bundled", "trace"] }
+rayon = "1"
+ignore = "0.4"
+toml = "0.8"
+toml_edit = "0.22"
+regex = "1"
+# default-features off drops postcard's `heapless` support (which we don't
+# use) and with it the unmaintained `atomic-polyfill` transitive dep; we only
+# need `alloc` for Vec-based serialize/deserialize of the graph_cache blob.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+notify = "6"
+
+[dev-dependencies]
+serde_json = "1"
+
+[[test]]
+name = "coverage_parity"
+harness = false
+
+[[test]]
+name = "coverage_parity_harness"
+path = "tests/resolve_coverage_parity.rs"
+harness = false
+
+[[test]]
+name = "coverage_parity_persistence"
+path = "tests/coverage_parity_persistence.rs"
+harness = false

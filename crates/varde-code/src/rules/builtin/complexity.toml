@@ -1,0 +1,66 @@
+# Built-in rule set: complexity
+#
+# Three complexity-derived rules live in one pack because they share a
+# single underlying signal (cyclomatic complexity, computed as
+# `1 + count(ControlFlow entities)`) at three different granularities:
+# whole-file, file-crossed-with-churn, and single-function. See
+# BUILT_IN_RULES.md at the repo root for the full scoping rationale.
+
+[[rule]]
+id = "file-complexity-hotspot"
+kind = "sql"
+severity = "warning"
+name = "File complexity hotspot"
+description = "File exceeds the complexity threshold — complex code concentrates defects."
+message = "file is high-complexity"
+remediation = "consider splitting this file into smaller, single-purpose modules"
+query = "SELECT path AS file, 1 AS line FROM files WHERE complexity > :max_complexity"
+thresholds = { max_complexity = 50.0 }
+
+[[rule]]
+id = "churn-complexity-hotspot"
+kind = "sql"
+severity = "warning"
+name = "Churn/complexity hotspot"
+description = "File exceeds both the complexity and churn thresholds — the combination most correlated with defects."
+message = "file is both high-complexity and frequently changed"
+remediation = "consider splitting this file or adding test coverage before further changes"
+query = "SELECT path AS file, 1 AS line FROM files WHERE complexity > :max_complexity AND churn > :min_churn"
+thresholds = { max_complexity = 50.0, min_churn = 20.0 }
+
+# function-complexity-hotspot: complexity per function, not per file.
+#
+# `entities.enclosing_function` names the narrowest enclosing named-function
+# scope for every entity extracted inside it (see extract/langs/mod.rs) — so
+# a ControlFlow entity's `enclosing_function` is already the function it
+# belongs to, no new schema/extraction work needed. Complexity per function
+# is `1 + count(ControlFlow entities whose enclosing_function = this
+# function's name, in the same file)`, the same formula complexity.rs uses
+# per-file, applied at function granularity via SQL aggregation instead.
+#
+# `enclosing_function` is a bare name, not an entity id, so two functions
+# with the same name in the same file (overloads, or same-named methods on
+# different classes, e.g. `BaseAdapter.send` vs. `HTTPAdapter.send`) still
+# share the join key. `owner_type` (schema v10, and since v11 populated on
+# every entity kind including ControlFlow — see extract/entity.rs) breaks
+# that tie: a ControlFlow entity's `owner_type` is its enclosing method's
+# owner_type, so joining on `cf.owner_type IS fn.owner_type` in addition to
+# the name keeps same-named methods on different classes in separate
+# buckets. `GROUP BY fn.id` (not `f.id, fn.name`) keeps those buckets from
+# being collapsed back together, so both the complexity count and the
+# reported `line` always refer to the same function entity — no more
+# arbitrary MIN()-picked line pointing at the wrong (often trivial)
+# same-named definition. Two functions with the *same* name and the *same*
+# owner_type (true overloads in one class, or two top-level same-named
+# functions with no owner_type) still merge — a residual, much rarer case
+# than the original bug.
+[[rule]]
+id = "function-complexity-hotspot"
+kind = "sql"
+severity = "warning"
+name = "Function complexity hotspot"
+description = "A single function's cyclomatic complexity exceeds the threshold — the file-level rules can miss one complex function buried in an otherwise simple file."
+message = "function is high-complexity"
+remediation = "extract branches into smaller helper functions, or simplify the control flow"
+query = "SELECT f.path AS file, fn.start_line AS line, fn.name, 1 + COUNT(cf.id) AS complexity FROM entities fn JOIN files f ON f.id = fn.file_id LEFT JOIN entities cf ON cf.file_id = fn.file_id AND cf.enclosing_function = fn.name AND cf.kind = 12 AND cf.owner_type IS fn.owner_type WHERE fn.kind = 0 GROUP BY fn.id HAVING 1 + COUNT(cf.id) > :max_function_complexity"
+thresholds = { max_function_complexity = 15.0 }
