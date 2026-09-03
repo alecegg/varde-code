@@ -992,24 +992,15 @@ query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files 
         std::fs::write(path, contents).expect("fixture writes");
     }
 
-    /// Point HOME at `home`, then build a fresh index for `repo` at the
-    /// conventional (HOME-derived) DB path.
-    fn with_fresh_db(home: &std::path::Path, repo: &std::path::Path) {
-        unsafe { std::env::set_var("HOME", home) };
+    /// Build a fresh index using `home` as the conventional DB root.
+    fn with_fresh_db(
+        home: &std::path::Path,
+        repo: &std::path::Path,
+    ) -> crate::test_support::HomeOverride {
+        let home_override = crate::test_support::HomeOverride::while_locked(home);
         crate::build::run_with_force(repo.to_str().expect("repo is utf8"), true)
             .expect("fresh build succeeds");
-    }
-
-    /// Restore the previous HOME (captured before the test redirected it).
-    fn restore_home(original: Option<std::ffi::OsString>) {
-        match original {
-            Some(home) => unsafe { std::env::set_var("HOME", home) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-    }
-
-    fn capture_home() -> Option<std::ffi::OsString> {
-        std::env::var_os("HOME")
+        home_override
     }
 
     /// Run `git <args>` inside `repo`, asserting success.
@@ -1061,21 +1052,23 @@ pattern = "console.trace($MSG)"
 rewrite = "console.info($MSG)"
 "#;
 
-    fn setup_apply_repo(tag: &str, home: &std::path::Path, fixture: &str) -> std::path::PathBuf {
+    fn setup_apply_repo(
+        tag: &str,
+        home: &std::path::Path,
+        fixture: &str,
+    ) -> (std::path::PathBuf, crate::test_support::HomeOverride) {
         let repo = tempdir(tag);
         write(&repo.join("main.ts"), fixture);
         write(&repo.join(".varde-code/rules/pack.toml"), REWRITE_RULE_PACK);
-        let original_home = capture_home();
-        with_fresh_db(home, &repo);
-        restore_home(original_home);
-        repo
+        let home_override = with_fresh_db(home, &repo);
+        (repo, home_override)
     }
 
     #[test]
     fn scan_without_apply_writes_nothing() {
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-noapply");
-        let repo = setup_apply_repo("repo-noapply", &home, TS_WITH_TRACE);
+        let (repo, _home_override) = setup_apply_repo("repo-noapply", &home, TS_WITH_TRACE);
         git_init_and_commit(&repo);
         let before = std::fs::read_to_string(repo.join("main.ts")).expect("fixture reads");
 
@@ -1094,9 +1087,9 @@ rewrite = "console.info($MSG)"
 
     #[test]
     fn scan_with_apply_rewrites_clean_git_file_atomically() {
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-apply-clean");
-        let repo = setup_apply_repo("repo-apply-clean", &home, TS_WITH_TRACE);
+        let (repo, _home_override) = setup_apply_repo("repo-apply-clean", &home, TS_WITH_TRACE);
         git_init_and_commit(&repo);
 
         let input = serde_json::json!({
@@ -1142,15 +1135,13 @@ rewrite = "console.info($MSG)"
 
     #[test]
     fn scan_with_apply_skips_dirty_file_and_applies_clean_sibling() {
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-apply-dirty");
         let repo = tempdir("repo-apply-dirty");
         write(&repo.join("clean.ts"), TS_WITH_TRACE);
         write(&repo.join("dirty.ts"), TS_WITH_TRACE);
         write(&repo.join(".varde-code/rules/pack.toml"), REWRITE_RULE_PACK);
-        let original_home = capture_home();
-        with_fresh_db(&home, &repo);
-        restore_home(original_home);
+        let _home_override = with_fresh_db(&home, &repo);
         git_init_and_commit(&repo);
 
         // Make dirty.ts dirty after the commit (uncommitted change).
@@ -1216,9 +1207,9 @@ rewrite = "console.info($MSG)"
     /// even though its byte offsets still land in range on the new content.
     #[test]
     fn apply_skips_finding_whose_file_changed_since_it_was_matched() {
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-apply-stale");
-        let repo = setup_apply_repo("repo-apply-stale", &home, TS_WITH_TRACE);
+        let (repo, _home_override) = setup_apply_repo("repo-apply-stale", &home, TS_WITH_TRACE);
         git_init_and_commit(&repo);
 
         let (rules, _diags) = crate::rules::load_rules(&repo);
@@ -1316,7 +1307,7 @@ rewrite = "console.info($MSG)"
 
     #[test]
     fn apply_exit_gate_applied_error_is_resolved_skipped_is_not() {
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
 
         // Applied: error-severity finding fixed in place → gate passes.
         let home = tempdir("home-gate-applied");
@@ -1326,9 +1317,7 @@ rewrite = "console.info($MSG)"
             &repo.join(".varde-code/rules/pack.toml"),
             REWRITE_RULE_PACK_ERROR,
         );
-        let original_home = capture_home();
-        with_fresh_db(&home, &repo);
-        restore_home(original_home);
+        let _home_override = with_fresh_db(&home, &repo);
         git_init_and_commit(&repo);
         let payload = scan_repo(&serde_json::json!({
             "repoRoot": repo.display().to_string(),
@@ -1349,9 +1338,7 @@ rewrite = "console.info($MSG)"
             &repo.join(".varde-code/rules/pack.toml"),
             REWRITE_RULE_PACK_ERROR,
         );
-        let original_home = capture_home();
-        with_fresh_db(&home, &repo);
-        restore_home(original_home);
+        let _home_override = with_fresh_db(&home, &repo);
         git_init_and_commit(&repo);
         write(
             &repo.join("main.ts"),
@@ -1372,7 +1359,7 @@ rewrite = "console.info($MSG)"
     fn scan_output_omits_rewrite_status_for_findings_without_rewrite() {
         // SQL-rule findings and rewrite-less pattern findings keep their old
         // shape: no `rewrite_status` key (not `null`) even in an apply run.
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-no-status");
         let repo = tempdir("repo-no-status");
         write(&repo.join("main.ts"), TS_WITH_TRACE);
@@ -1394,9 +1381,7 @@ message = "function present"
 query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files f ON f.id = e.file_id WHERE e.kind = 0"
 "#,
         );
-        let original_home = capture_home();
-        with_fresh_db(&home, &repo);
-        restore_home(original_home);
+        let _home_override = with_fresh_db(&home, &repo);
 
         let payload = scan_repo(&serde_json::json!({
             "repoRoot": repo.display().to_string(),
@@ -1422,9 +1407,9 @@ query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files 
 
     #[test]
     fn scan_with_apply_and_force_writes_dirty_file() {
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-apply-force");
-        let repo = setup_apply_repo("repo-apply-force", &home, TS_WITH_TRACE);
+        let (repo, _home_override) = setup_apply_repo("repo-apply-force", &home, TS_WITH_TRACE);
         git_init_and_commit(&repo);
         // Dirty the file after the commit.
         write(
@@ -1490,15 +1475,13 @@ query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files 
         // (pathspec "sub/a.ts" from cwd "sub" → missing), so every dirty
         // file came back clean and was written without --force. The gate
         // must detect dirty files whether repoRoot is absolute or relative.
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-relroot");
         let repo = tempdir("repo-relroot");
         write(&repo.join("clean.ts"), TS_WITH_TRACE);
         write(&repo.join("dirty.ts"), TS_WITH_TRACE);
         write(&repo.join(".varde-code/rules/pack.toml"), REWRITE_RULE_PACK);
-        let original_home = capture_home();
-        with_fresh_db(&home, &repo);
-        restore_home(original_home);
+        let _home_override = with_fresh_db(&home, &repo);
         git_init_and_commit(&repo);
         // Dirty one file after the commit.
         write(
@@ -1555,9 +1538,9 @@ query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files 
     fn apply_without_git_repo_treats_files_clean_and_writes() {
         // Documented scope (CORRECTNESS-005): outside any git repo there is
         // no git state to be undone against, so files are clean and written.
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-nogit");
-        let repo = setup_apply_repo("repo-nogit", &home, TS_WITH_TRACE);
+        let (repo, _home_override) = setup_apply_repo("repo-nogit", &home, TS_WITH_TRACE);
         // No git_init_and_commit: the repo dir has no .git.
 
         let payload = scan_repo(&serde_json::json!({
@@ -1585,9 +1568,9 @@ query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files 
         // CORRECTNESS-005: a genuine git failure (corrupt index) must fail
         // closed — every file skipped-dirty, nothing written — rather than
         // silently treating the repo as clean.
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-corrupt");
-        let repo = setup_apply_repo("repo-corrupt", &home, TS_WITH_TRACE);
+        let (repo, _home_override) = setup_apply_repo("repo-corrupt", &home, TS_WITH_TRACE);
         git_init_and_commit(&repo);
         // Poison the index: `git rev-parse` still works, `git status` errors.
         std::fs::write(repo.join(".git/index"), b"not an index").expect("index overwritten");
@@ -1621,15 +1604,13 @@ query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files 
         // file's mode — an executable stays executable, a read-only file
         // stays read-only (both rewritten in place).
         use std::os::unix::fs::PermissionsExt;
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-perms");
         let repo = tempdir("repo-perms");
         write(&repo.join("exec.ts"), TS_WITH_TRACE);
         write(&repo.join("ro.ts"), TS_WITH_TRACE);
         write(&repo.join(".varde-code/rules/pack.toml"), REWRITE_RULE_PACK);
-        let original_home = capture_home();
-        with_fresh_db(&home, &repo);
-        restore_home(original_home);
+        let _home_override = with_fresh_db(&home, &repo);
         // Set modes BEFORE the commit so the worktree stays clean (a mode
         // change after the commit would itself be a git change → skipped).
         std::fs::set_permissions(repo.join("exec.ts"), std::fs::Permissions::from_mode(0o755))
@@ -1681,15 +1662,13 @@ query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files 
         // CORRECTNESS-004: a symlinked file's rewrite must land on the real
         // target (canonicalize-then-write) and leave the link itself alone —
         // never silently de-symlink the entry.
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-symlink");
         let repo = tempdir("repo-symlink");
         write(&repo.join("real.ts"), TS_WITH_TRACE);
         std::os::unix::fs::symlink(repo.join("real.ts"), repo.join("link.ts")).expect("symlink");
         write(&repo.join(".varde-code/rules/pack.toml"), REWRITE_RULE_PACK);
-        let original_home = capture_home();
-        with_fresh_db(&home, &repo);
-        restore_home(original_home);
+        let _home_override = with_fresh_db(&home, &repo);
         git_init_and_commit(&repo);
 
         let payload = scan_repo(&serde_json::json!({
@@ -1732,13 +1711,12 @@ query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files 
 
     #[test]
     fn fresh_db_runs_both_rule_kinds_and_merges_output() {
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home");
         let repo = tempdir("repo");
         write(&repo.join("main.ts"), TS_FIXTURE);
         write(&repo.join(".varde-code/rules/pack.toml"), RULE_PACK);
-        let original_home = capture_home();
-        with_fresh_db(&home, &repo);
+        let _home_override = with_fresh_db(&home, &repo);
 
         let input = serde_json::json!({ "repoRoot": repo.display().to_string() });
         let payload = scan_repo(&input).expect("scan succeeds");
@@ -1779,14 +1757,13 @@ query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files 
             "no diagnostics on a clean run: {diagnostics:?}"
         );
 
-        restore_home(original_home);
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn missing_db_builds_on_read_then_scans() {
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-empty");
         let repo = tempdir("repo-empty");
         write(&repo.join(".varde-code/rules/pack.toml"), RULE_PACK);
@@ -1803,13 +1780,12 @@ query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files 
 
     #[test]
     fn stale_db_self_freshens_and_matches_build_scan() {
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-stale");
         let repo = tempdir("repo-stale");
         write(&repo.join("main.ts"), TS_FIXTURE);
         write(&repo.join(".varde-code/rules/pack.toml"), RULE_PACK);
-        let original_home = capture_home();
-        with_fresh_db(&home, &repo);
+        let _home_override = with_fresh_db(&home, &repo);
 
         // Modify the source after the build → the DB is now stale.
         write(
@@ -1821,11 +1797,10 @@ query = "SELECT f.path AS file, e.start_line AS line FROM entities e JOIN files 
         let freshened = scan_repo(&input).expect("stale db self-freshens and scans");
 
         // Parity: a fresh build + scan must produce the identical payload.
-        with_fresh_db(&home, &repo);
+        let _home_override = with_fresh_db(&home, &repo);
         let rebuilt = scan_repo(&input).expect("build+scan succeeds");
         assert_eq!(freshened, rebuilt, "freshen-then-scan matches build+scan");
 
-        restore_home(original_home);
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -1881,19 +1856,17 @@ pattern = "console.log($MSG)"
 
     #[test]
     fn empty_rule_pack_is_a_valid_noop_scan() {
-        let _guard = crate::HOME_TEST_LOCK.lock().expect("home lock");
+        let _guard = crate::test_support::home_lock();
         let home = tempdir("home-norules");
         let repo = tempdir("repo-norules");
         write(&repo.join("main.ts"), TS_FIXTURE);
-        let original_home = capture_home();
-        with_fresh_db(&home, &repo);
+        let _home_override = with_fresh_db(&home, &repo);
 
         let input = serde_json::json!({ "repoRoot": repo.display().to_string() });
         let payload = scan_repo(&input).expect("empty pack scans cleanly");
         assert!(payload["findings"].as_array().expect("array").is_empty());
         assert!(payload["diagnostics"].as_array().expect("array").is_empty());
 
-        restore_home(original_home);
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&repo);
     }

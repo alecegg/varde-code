@@ -25,6 +25,9 @@ pub mod slice;
 pub mod test_cli;
 pub mod watch;
 
+#[cfg(test)]
+mod test_support;
+
 /// Shared guard for tests that mutate the process-global `HOME` (which drives
 /// [`crate::db::path::repo_db_path`]). Every test that redirects `HOME` must
 /// hold this lock so concurrent test threads don't interleave set/restore.

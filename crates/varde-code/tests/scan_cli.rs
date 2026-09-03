@@ -2,14 +2,10 @@
 //! repo and assert process exit codes, stdout, and output-file behavior.
 //!
 //! The DB lives under the conventional `$HOME/.config/varde-code/repos/...`
-//! path, so each test redirects `HOME` to a throwaway tempdir (serialized —
-//! env is process-global).
+//! path, so each child process receives a throwaway tempdir as `HOME`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
-
-static HOME_LOCK: Mutex<()> = Mutex::new(());
 
 const TS_FIXTURE: &str = r#"
 async function fetchData(): Promise<void> {
@@ -53,10 +49,10 @@ pattern = "console.trace($MSG)"
 "#
         ),
     );
-    unsafe { std::env::set_var("HOME", &home) };
     let build = Command::new(bin())
         .args(["build", "--repo-root"])
         .arg(&repo)
+        .env("HOME", &home)
         .output()
         .expect("build runs");
     assert!(build.status.success(), "build fails: {:?}", build.status);
@@ -64,18 +60,17 @@ pattern = "console.trace($MSG)"
 }
 
 fn scan(home: &Path, args: &[&str]) -> std::process::Output {
-    unsafe { std::env::set_var("HOME", home) };
     Command::new(bin())
         .args(["scan"])
         .arg("--json")
         .args(args)
+        .env("HOME", home)
         .output()
         .expect("scan runs")
 }
 
 #[test]
 fn error_finding_exits_nonzero_with_default_threshold() {
-    let _guard = HOME_LOCK.lock().expect("home lock");
     let (home, repo) = build_fixture("err", "error");
     let out = scan(&home, &[&format!(r#"{{"repoRoot":"{}"}}"#, repo.display())]);
     assert!(!out.status.success(), "error finding → non-zero exit");
@@ -91,7 +86,6 @@ fn error_finding_exits_nonzero_with_default_threshold() {
 
 #[test]
 fn info_only_findings_exit_zero_with_default_threshold() {
-    let _guard = HOME_LOCK.lock().expect("home lock");
     let (home, repo) = build_fixture("info", "info");
     let out = scan(&home, &[&format!(r#"{{"repoRoot":"{}"}}"#, repo.display())]);
     assert!(out.status.success(), "info findings → exit 0");
@@ -101,7 +95,6 @@ fn info_only_findings_exit_zero_with_default_threshold() {
 
 #[test]
 fn output_path_writes_envelope_and_stdout_stays_empty() {
-    let _guard = HOME_LOCK.lock().expect("home lock");
     let (home, repo) = build_fixture("out", "warning");
     let out_path = home.join("scan-out.json");
     let out = scan(
@@ -126,7 +119,6 @@ fn output_path_writes_envelope_and_stdout_stays_empty() {
 
 #[test]
 fn omitted_output_prints_envelope_to_stdout() {
-    let _guard = HOME_LOCK.lock().expect("home lock");
     let (home, repo) = build_fixture("stdout", "warning");
     let out = scan(&home, &[&format!(r#"{{"repoRoot":"{}"}}"#, repo.display())]);
     let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("envelope JSON");
@@ -137,7 +129,6 @@ fn omitted_output_prints_envelope_to_stdout() {
 
 #[test]
 fn unwritable_output_emits_error_envelope_and_exits_nonzero() {
-    let _guard = HOME_LOCK.lock().expect("home lock");
     let (home, repo) = build_fixture("unwritable", "warning");
     let missing_dir = home.join("no-such-dir/out.json");
     let out = scan(
