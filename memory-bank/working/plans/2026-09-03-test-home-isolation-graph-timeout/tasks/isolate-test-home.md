@@ -31,3 +31,4 @@ restoration. Replace direct test mutations in each affected module.
 #### Progress
 
 - Centralized test HOME mutation behind an RAII guard; all 506 library tests pass.
+- Recovered poisoned HOME locks and retained each scan test override through assertions; workspace tests pass.
