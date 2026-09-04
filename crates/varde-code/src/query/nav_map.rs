@@ -26,24 +26,35 @@ pub fn nav_map(input: &serde_json::Value) -> Result<serde_json::Value, ApiError>
     super::freshen_for_mode("nav_map", input)?;
     let conn = open_db(input)?;
 
+    // Role-tagged handlers (decorators/base classes) feed the flow trees —
+    // they are the callable roots. Call-based routes (Go/Express/Laravel/...)
+    // are registration sites with no outgoing calls, so they enrich the
+    // entrypoint listing and subsystem role map but are excluded from flows.
     let entrypoints = super::entrypoints::detect(&conn)?;
-    let entrypoints_json: Vec<serde_json::Value> =
-        entrypoints.iter().map(|e| e.to_json()).collect();
+    let routes = super::entrypoints::detect_routes(&conn)?;
+    let listed: Vec<super::entrypoints::Entrypoint> =
+        entrypoints.iter().chain(routes.iter()).cloned().collect();
+    let entrypoints_json: Vec<serde_json::Value> = listed.iter().map(|e| e.to_json()).collect();
 
     let foundational_files = super::foundational_files::leaderboard(&conn, None)?;
 
     let module_layers_json = module_layers_section(&conn)?;
 
-    let subsystems_json = subsystems_section(&conn, &entrypoints)?;
+    let subsystems_json = subsystems_section(&conn, &listed)?;
 
     // Reuse the entrypoint set already computed above — the symbols
     // leaderboard only needs it to dedup entrypoint symbols out, and
     // recomputing `entrypoints::detect` here was doubling nav_map's cost.
     let entrypoint_ids: std::collections::HashSet<i64> =
-        entrypoints.iter().map(|e| e.entity_id).collect();
+        listed.iter().map(|e| e.entity_id).collect();
     let symbols = super::symbols_section::leaderboard(&conn, &entrypoint_ids, None)?;
 
-    let flows = super::flows::build_flows(&conn, &entrypoints)?;
+    // Flow roots: role-tagged handlers plus any call-based route that resolved
+    // to a real handler function (`flow_root`). Path-only routes (no resolvable
+    // handler) are excluded — they have no outgoing call edges.
+    let flow_roots: Vec<super::entrypoints::Entrypoint> =
+        listed.iter().filter(|e| e.flow_root).cloned().collect();
+    let flows = super::flows::build_flows(&conn, &flow_roots)?;
     let flows_json: Vec<serde_json::Value> = flows.iter().map(|t| t.to_json()).collect();
 
     let hotspots = super::mapping::hotspots_on(&conn)?;
@@ -89,12 +100,21 @@ fn module_layers_section(conn: &Connection) -> Result<serde_json::Value, ApiErro
 /// `clusters` mode reads) and hand it to [`super::subsystems::name_clusters`]
 /// with a per-file dominant-role-tag map derived from the already-computed
 /// entrypoints (first role tag seen per file).
+///
+/// Test files are excluded here (via the authoritative `is_test_path`
+/// generated column) so a test directory never forms or pads a subsystem —
+/// matching the entrypoints, foundational-files, symbols and hotspots
+/// sections. Generated/vendored exclusion stays in `name_clusters`.
 fn subsystems_section(
     conn: &Connection,
     entrypoints: &[super::entrypoints::Entrypoint],
 ) -> Result<serde_json::Value, ApiError> {
     let mut stmt = conn
-        .prepare("SELECT cm.community_id, f.path FROM community_members cm JOIN files f ON f.id = cm.file_id")
+        .prepare(
+            "SELECT cm.community_id, f.path FROM community_members cm
+             JOIN files f ON f.id = cm.file_id
+             WHERE f.is_test_path = 0",
+        )
         .map_err(db_err)?;
     let rows: Vec<(i64, String)> = stmt
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
@@ -211,5 +231,51 @@ mod nav_map_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The subsystems section drops test-file community members via the
+    /// `is_test_path` column, so a test directory never pads or forms a
+    /// subsystem. `src/api/helper.test.ts` (a test path) is excluded while
+    /// its sibling production files remain.
+    #[test]
+    fn subsystems_section_excludes_test_file_members() {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(crate::db::schema_ddl()).expect("schema");
+
+        for path in [
+            "src/api/users.rs",
+            "src/api/orders.rs",
+            "src/api/helper.test.ts",
+        ] {
+            conn.execute(
+                "INSERT INTO files (path) VALUES (?1)",
+                rusqlite::params![path],
+            )
+            .expect("insert file");
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO community_members (community_id, file_id) VALUES (1, ?1)",
+                rusqlite::params![file_id],
+            )
+            .expect("insert community member");
+        }
+
+        let result = subsystems_section(&conn, &[]).expect("subsystems computes");
+        let members: Vec<String> = result
+            .as_array()
+            .expect("array")
+            .iter()
+            .flat_map(|c| c["members"].as_array().expect("members array").clone())
+            .map(|m| m.as_str().expect("member path").to_string())
+            .collect();
+
+        assert!(
+            !members.iter().any(|m| m == "src/api/helper.test.ts"),
+            "test file must be excluded from subsystem members: {members:?}"
+        );
+        assert!(
+            members.iter().any(|m| m == "src/api/users.rs"),
+            "production file should remain a member: {members:?}"
+        );
     }
 }

@@ -36,7 +36,13 @@ pub mod path;
 /// - v13: `is_test_path` recognizes C#/.NET conventions (`*Test.cs`/
 ///   `*Tests.cs` files and `*.Test`/`*.Tests`/`*.UnitTests`/… project dirs);
 ///   the generated column is STORED, so old DBs must rebuild to recompute it.
-pub const SCHEMA_VERSION: i64 = 13;
+/// - v14: `is_test_path` extends flat-filename test conventions to C++
+///   (`*_test.cc`/`.cpp`/`.cxx`), Solidity (`*.t.sol`), Bash (`*.bats`), and
+///   Ruby (`*_spec.rb`/`*_test.rb`); same STORED-column rebuild requirement.
+/// - v15: extraction emits `EntityKind::TypeRef` rows (a field/param/local's
+///   declared type) that type-directed call resolution reads; force a rebuild
+///   so existing indexes gain them instead of resolving with partial data.
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// All tables in the schema, in a deterministic drop order (junction tables
 /// before the tables they reference, so `DROP TABLE IF EXISTS` never trips a
@@ -61,7 +67,12 @@ pub const TABLES: [&str; 12] = [
 /// Column layout follows the plan's drafted schema (one table per
 /// struct/collection from `ExtractOutput`/`ResolvedGraph`, junction tables
 /// for many-to-many membership, fan-in/fan-out denormalized onto `files`).
-fn schema_ddl() -> &'static str {
+///
+/// `pub(crate)` so query-layer unit tests can stand up the real schema —
+/// including generated columns like `is_test_path` — in an in-memory
+/// connection instead of hand-rolling a partial `files` table that drifts
+/// from production.
+pub(crate) fn schema_ddl() -> &'static str {
     r#"
 CREATE TABLE files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,6 +112,23 @@ CREATE TABLE files (
         OR path LIKE '%.Test/%' OR path LIKE '%.Tests/%'
         OR path LIKE '%.UnitTests/%' OR path LIKE '%.IntegrationTests/%'
         OR path LIKE '%.FunctionalTests/%' OR path LIKE '%.AcceptanceTests/%'
+        -- C++ convention: GoogleTest `foo_test.cc`/`.cpp`/`.cxx` files live
+        -- alongside the code they test (like Go's `_test.go`), not under a
+        -- `test/`-segment directory. The escaped `_` requires a literal
+        -- underscore, so `latest.cpp` is not swept up.
+        OR path LIKE '%\_test.cc' ESCAPE '\' OR path LIKE '%\_test.cpp' ESCAPE '\'
+        OR path LIKE '%\_test.cxx' ESCAPE '\'
+        -- Solidity convention: Foundry test contracts use the `.t.sol` double
+        -- extension (`Counter.t.sol`); this is the runner's discovery signal
+        -- and files may sit outside a `test/` dir. Scripts use `.s.sol` and
+        -- are intentionally left unmatched.
+        OR path LIKE '%.t.sol'
+        -- Bash convention: Bats test files carry the `.bats` extension.
+        OR path LIKE '%.bats'
+        -- Ruby convention: RSpec `foo_spec.rb` / Minitest `foo_test.rb`
+        -- outside the usual `spec/`/`test/` dirs (already caught above). The
+        -- escaped `_` keeps `latest.rb` out.
+        OR path LIKE '%\_spec.rb' ESCAPE '\' OR path LIKE '%\_test.rb' ESCAPE '\'
     ) STORED,
     -- Non-test tooling that legitimately behaves differently from shipped
     -- production code: benchmark harnesses, build/dev scripts, and docs
@@ -423,6 +451,60 @@ mod schema_scaffold {
     }
 
     #[test]
+    fn is_test_path_recognizes_additional_language_conventions() {
+        let dir =
+            std::env::temp_dir().join(format!("varde-schema-{}-testpath2", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir creates");
+        let db_path = dir.join("tp2.db");
+        let _ = std::fs::remove_file(&db_path);
+        let conn = open_or_rebuild(&db_path).expect("open succeeds");
+
+        let cases: &[(&str, bool)] = &[
+            // C++ GoogleTest: tests live alongside the code (not in a `test/`
+            // dir), matching Go's `_test.go` shape.
+            ("/repo/src/widget_test.cc", true),
+            ("/repo/src/widget_test.cpp", true),
+            ("/repo/src/widget_test.cxx", true),
+            // The escaped `_` must not sweep up production files that merely
+            // end in `test.<ext>`.
+            ("/repo/src/latest.cpp", false),
+            ("/repo/src/widget.cc", false),
+            // Solidity Foundry `.t.sol` (scripts use `.s.sol` and stay clean).
+            ("/repo/test/Counter.t.sol", true),
+            ("/repo/src/Counter.t.sol", true),
+            ("/repo/script/Deploy.s.sol", false),
+            ("/repo/src/Counter.sol", false),
+            // Bash Bats.
+            ("/repo/cli/install.bats", true),
+            ("/repo/cli/install.sh", false),
+            // Ruby RSpec/Minitest flat files.
+            ("/repo/lib/user_spec.rb", true),
+            ("/repo/lib/user_test.rb", true),
+            ("/repo/lib/latest.rb", false),
+            ("/repo/lib/user.rb", false),
+        ];
+        let mut insert = conn
+            .prepare("INSERT INTO files (path) VALUES (?1)")
+            .expect("prepare insert");
+        for (path, _) in cases {
+            insert
+                .execute(rusqlite::params![path])
+                .unwrap_or_else(|e| panic!("insert {path}: {e}"));
+        }
+        for (path, expected) in cases {
+            let got: bool = conn
+                .query_row(
+                    "SELECT is_test_path FROM files WHERE path = ?1",
+                    rusqlite::params![path],
+                    |r| r.get(0),
+                )
+                .expect("read is_test_path");
+            assert_eq!(got, *expected, "is_test_path for {path}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn fresh_path_creates_all_tables_and_indexes() {
         let dir = std::env::temp_dir().join(format!("varde-schema-{}-fresh", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir creates");
@@ -510,8 +592,8 @@ mod schema_scaffold {
             SCHEMA_VERSION
         );
         assert_eq!(
-            SCHEMA_VERSION, 13,
-            "schema version bumped for C#/.NET is_test_path recognition"
+            SCHEMA_VERSION, 15,
+            "schema version bumped for TypeRef extraction (type-directed call resolution)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

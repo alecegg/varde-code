@@ -32,14 +32,21 @@ use super::{ApiError, db_err};
 /// Compute the foundational-files fan-in leaderboard.
 ///
 /// Reads `files.path`/`files.fan_in` (already-maintained fan-in counts, see
-/// module docs), drops any path [`is_generated_or_vendored_path`] flags as
+/// module docs), excludes test files (via the authoritative `is_test_path`
+/// generated column, so a heavily-imported test helper never ranks as
+/// foundational — matching [`crate::query::entrypoints`]), drops any path
+/// [`is_generated_or_vendored_path`] flags as
 /// generated/vendored, sorts descending by fan-in (ties broken by path for
 /// determinism), and caps the result at `limit` entries (`None` =
 /// unbounded). Each entry is `{"file", "count", "why"}`; `why` is always a
 /// non-empty one-line string.
 pub fn leaderboard(conn: &Connection, limit: Option<usize>) -> Result<serde_json::Value, ApiError> {
     let mut stmt = conn
-        .prepare("SELECT path, fan_in FROM files WHERE fan_in > 0 ORDER BY fan_in DESC, path ASC")
+        .prepare(
+            "SELECT path, fan_in FROM files
+             WHERE fan_in > 0 AND is_test_path = 0
+             ORDER BY fan_in DESC, path ASC",
+        )
         .map_err(db_err)?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
@@ -145,6 +152,32 @@ mod foundational_files_section_tests {
         assert!(
             !entries.iter().any(|e| e["file"] == "dist/bundle.js"),
             "dist/bundle.js must be excluded as generated noise: {entries:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Test files are excluded even with high fan-in: `src/util_test.go`
+    /// (fan_in 10, a Go test file per the `is_test_path` column) must not
+    /// rank as foundational, while `src/core.rs` (fan_in 5) survives.
+    #[test]
+    fn foundational_files_section_excludes_test_files() {
+        let path = temp_db_path("test-paths");
+        let conn = crate::db::open_or_rebuild(&path).expect("schema creates");
+
+        insert_file(&conn, "src/util_test.go", 10);
+        insert_file(&conn, "src/core.rs", 5);
+
+        let result = leaderboard(&conn, None).expect("leaderboard computes");
+        let entries = result.as_array().expect("leaderboard is an array");
+
+        assert!(
+            !entries.iter().any(|e| e["file"] == "src/util_test.go"),
+            "test file src/util_test.go must be excluded: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e["file"] == "src/core.rs"),
+            "non-test src/core.rs should remain: {entries:?}"
         );
 
         let _ = std::fs::remove_file(&path);

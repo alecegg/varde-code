@@ -231,8 +231,65 @@ pub fn visit(
             ctx.push(EntityKind::ControlFlow, node.kind().into_owned(), node);
         }
 
+        // ---- annotations ----
+        // Any annotation (`@RestController`, `@GetMapping("/x")`, ...) ->
+        // a Decorator entity whose `name` is the annotation's type identifier
+        // and whose `enclosing_function` is the annotated declaration's own
+        // name. This is what lets Kotlin Spring/Micronaut controllers be
+        // role-tagged (the grammar emits no `name` field on `annotation`, so
+        // the type name is recovered by descending to the first
+        // `type_identifier`, which nests under `user_type` for `@Foo` and
+        // under `constructor_invocation` for `@Foo("x")`).
+        "annotation" => {
+            if let (Some(name), Some(owner)) =
+                (annotation_type_name(node), annotation_owner_name(node))
+            {
+                ctx.out.push(Entity {
+                    kind: EntityKind::Decorator,
+                    name,
+                    file_id: ctx.file_id,
+                    span: crate::extract::span_of(node),
+                    enclosing_function: Some(owner),
+                    method: None,
+                    path: None,
+                    status: None,
+                    body_shape: None,
+                    body_minhash: None,
+                    is_async: None,
+                    is_test: false,
+                    owner_type: None,
+                });
+            }
+        }
+
         _ => {}
     }
+}
+
+/// The annotation's type name: the first `type_identifier` in pre-order under
+/// an `annotation` node. Handles both `@Foo` (`annotation > user_type >
+/// type_identifier`) and `@Foo("x")` (`annotation > constructor_invocation >
+/// user_type > type_identifier`).
+fn annotation_type_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    for child in node.children() {
+        if child.kind() == "type_identifier" {
+            return Some(child.text().into_owned());
+        }
+        if let Some(found) = annotation_type_name(&child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Nearest enclosing declaration's own name for an `annotation` node: the
+/// class/interface or function this annotation is attached to (climbing
+/// ancestors past the intervening `modifiers` wrapper).
+fn annotation_owner_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    const OWNER_KINDS: &[&str] = &["class_declaration", "function_declaration"];
+    node.ancestors()
+        .find(|a| OWNER_KINDS.contains(&a.kind().as_ref()))
+        .and_then(|a| first_identifier(&a))
 }
 
 /// The declaration/parameter name: the first `simple_identifier` (functions,
@@ -448,5 +505,31 @@ mod tests {
             .collect();
         assert_eq!(implements.len(), 1, "entities: {entities:?}");
         assert_eq!(implements[0].name, "Comparable");
+    }
+
+    #[test]
+    fn annotations_emit_decorator_entities_named_and_owned() {
+        // Spring-style class + method annotations, both bare (`@RestController`)
+        // and call (`@RequestMapping("/x")` / `@GetMapping("/y")`), must each
+        // yield a Decorator entity named for the annotation type and owned by
+        // the annotated declaration.
+        let src = "@RestController\n@RequestMapping(\"/x\")\nclass Foo {\n  @GetMapping(\"/y\")\n  fun bar() {}\n}\n";
+        let parsed = parse_source(&SupportLang::Kotlin, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        let decorators: Vec<&Entity> = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Decorator)
+            .collect();
+
+        let find = |name: &str, owner: &str| {
+            decorators
+                .iter()
+                .any(|d| d.name == name && d.enclosing_function.as_deref() == Some(owner))
+        };
+        assert!(find("RestController", "Foo"), "decorators: {decorators:?}");
+        assert!(find("RequestMapping", "Foo"), "decorators: {decorators:?}");
+        assert!(find("GetMapping", "bar"), "decorators: {decorators:?}");
     }
 }

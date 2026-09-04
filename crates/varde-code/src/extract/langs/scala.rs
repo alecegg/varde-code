@@ -172,8 +172,35 @@ pub fn visit(
             ctx.push(EntityKind::ControlFlow, node.kind().into_owned(), node);
         }
 
+        // ---- annotations ----
+        // `@Controller` / `@cask.get("/x")` -> a Decorator entity owned by the
+        // annotated definition. The grammar exposes the annotation type as a
+        // `name` field (`type_identifier` for a bare name, or a dotted
+        // `stable_type_identifier` like `cask.get`), so `field_name` recovers
+        // it directly.
+        "annotation" => {
+            if let (Some(name), Some(owner)) = (field_name(node), annotation_owner_name(node)) {
+                push_type_ref(ctx, EntityKind::Decorator, name, &owner, node);
+            }
+        }
+
         _ => {}
     }
+}
+
+/// Nearest enclosing definition's own name for an `annotation` node — the
+/// class/object/trait/function this annotation is attached to.
+fn annotation_owner_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    const OWNER_KINDS: &[&str] = &[
+        "class_definition",
+        "object_definition",
+        "trait_definition",
+        "function_definition",
+        "function_declaration",
+    ];
+    node.ancestors()
+        .find(|a| OWNER_KINDS.contains(&a.kind().as_ref()))
+        .and_then(|a| field_name(&a))
 }
 
 /// Emit Extends (first supertype) + Implements (each mixin after `with`) for a
@@ -352,6 +379,20 @@ mod tests {
             find(&es, EntityKind::Implements, "Trait").is_some(),
             "{es:?}"
         );
+    }
+
+    #[test]
+    fn annotations_emit_decorator_entities_named_and_owned() {
+        // A bare class annotation and a dotted call annotation on a method
+        // (cask-style `@cask.get`) each yield a Decorator owned by the
+        // annotated definition; the dotted form keeps its full `a.b` name so a
+        // `*.get` suffix role-tag rule can match it.
+        let es =
+            entities("@Controller\nclass Foo {\n  @cask.get(\"/y\")\n  def bar(): Int = 1\n}\n");
+        let ctrl = find(&es, EntityKind::Decorator, "Controller").expect("@Controller decorator");
+        assert_eq!(ctrl.enclosing_function.as_deref(), Some("Foo"));
+        let get = find(&es, EntityKind::Decorator, "cask.get").expect("@cask.get decorator");
+        assert_eq!(get.enclosing_function.as_deref(), Some("bar"));
     }
 
     #[test]

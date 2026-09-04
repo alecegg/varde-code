@@ -245,8 +245,43 @@ pub fn visit(
             ctx.push(EntityKind::ControlFlow, node.kind().into_owned(), node);
         }
 
+        // ---- attributes (PHP 8) ----
+        // `#[Route("/x")]` / `#[Get]` on a class or method -> a Decorator
+        // entity named for the attribute, owned by the annotated declaration.
+        // This is what lets Symfony controllers/actions be role-tagged.
+        "attribute" => {
+            if let Some(name_node) = node
+                .children()
+                .find(|c| matches!(c.kind().as_ref(), "name" | "qualified_name"))
+                && let Some(owner) = attribute_owner_name(node)
+            {
+                push_owned(
+                    ctx,
+                    EntityKind::Decorator,
+                    name_node.text().into_owned(),
+                    &owner,
+                    &name_node,
+                );
+            }
+        }
+
         _ => {}
     }
+}
+
+/// Nearest enclosing declaration's own name for an `attribute` node — the
+/// class/interface/trait or function/method the `#[...]` is attached to.
+fn attribute_owner_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    const OWNER_KINDS: &[&str] = &[
+        "class_declaration",
+        "interface_declaration",
+        "trait_declaration",
+        "function_definition",
+        "method_declaration",
+    ];
+    node.ancestors()
+        .find(|a| OWNER_KINDS.contains(&a.kind().as_ref()))
+        .and_then(|a| field_name(&a))
 }
 
 /// Handle a `function_call_expression`: require/include family is matched at
@@ -455,6 +490,19 @@ mod tests {
         assert_eq!(ext.enclosing_function.as_deref(), Some("C"));
         let imp = find(&es, EntityKind::Implements, "I").expect("Implements I");
         assert_eq!(imp.enclosing_function.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn php8_attributes_emit_decorator_entities_named_and_owned() {
+        // Symfony-style `#[Route]` on a class and `#[Get("/x")]` on a method
+        // must each yield a Decorator owned by the annotated declaration.
+        let es = entities(
+            "<?php\n#[Route(\"/api\")]\nclass ApiController extends AbstractController {\n  #[Get(\"/items\")]\n  public function list() {}\n}\n",
+        );
+        let route = find(&es, EntityKind::Decorator, "Route").expect("#[Route] decorator");
+        assert_eq!(route.enclosing_function.as_deref(), Some("ApiController"));
+        let get = find(&es, EntityKind::Decorator, "Get").expect("#[Get] decorator");
+        assert_eq!(get.enclosing_function.as_deref(), Some("list"));
     }
 
     #[test]

@@ -421,6 +421,7 @@ mod flows_reachable_tree_tests {
             file: "app.py".to_string(),
             symbol: "handle_request".to_string(),
             role: RoleTag::RouteHandler,
+            flow_root: true,
         };
 
         let trees =
@@ -480,12 +481,14 @@ mod flows_reachable_tree_tests {
                 file: app_path.clone(),
                 symbol: "A".to_string(),
                 role: RoleTag::RouteHandler,
+                flow_root: true,
             },
             Entrypoint {
                 entity_id: b_id,
                 file: app_path.clone(),
                 symbol: "B".to_string(),
                 role: RoleTag::RouteHandler,
+                flow_root: true,
             },
         ];
 
@@ -569,6 +572,7 @@ mod flows_reachable_tree_tests {
             file: "src/app.py".to_string(),
             symbol: "handle_request".to_string(),
             role: RoleTag::RouteHandler,
+            flow_root: true,
         };
 
         let trees =
@@ -626,6 +630,7 @@ mod flows_reachable_tree_tests {
             file: "src/chain.py".to_string(),
             symbol: "f0".to_string(),
             role: RoleTag::RouteHandler,
+            flow_root: true,
         };
 
         let trees =

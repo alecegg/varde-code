@@ -133,16 +133,20 @@ pub fn visit(
 
         // ---- variables / parameters ----
         "field_declaration" | "local_declaration_statement" => {
+            let ty = declared_type(node);
             for n in declarator_names(node) {
+                if let Some(ty) = &ty {
+                    push_type_ref_for_var(ctx, ty, &n, node);
+                }
                 ctx.push(EntityKind::Variable, n, node);
             }
         }
         "parameter" => {
-            ctx.push(
-                EntityKind::Parameter,
-                field_name(node).unwrap_or_default(),
-                node,
-            );
+            let name = field_name(node).unwrap_or_default();
+            if let Some(ty) = node.field("type") {
+                push_type_ref_for_var(ctx, &strip_generic_args(&ty.text()), &name, node);
+            }
+            ctx.push(EntityKind::Parameter, name, node);
         }
 
         // ---- expression-level ----
@@ -277,6 +281,43 @@ pub fn visit(
 
         _ => {}
     }
+}
+
+/// Emit a `TypeRef` entity linking a variable/parameter to its declared type:
+/// `name` = the type, `enclosing_function` = the variable's own name (so call
+/// resolution can look the receiver's static type up by variable name). Uses
+/// [`entity`] rather than `ctx.push` because `push` would set
+/// `enclosing_function` to the enclosing *method*, not the variable.
+fn push_type_ref_for_var(
+    ctx: &mut ExtractCtx<'_>,
+    ty: &str,
+    var_name: &str,
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+) {
+    if ty.is_empty() || var_name.is_empty() {
+        return;
+    }
+    ctx.out.push(entity(
+        EntityKind::TypeRef,
+        ty.to_owned(),
+        ctx.file_id,
+        node,
+        EntityMeta {
+            enclosing: Some(var_name.to_owned()),
+            owner_type: ctx.type_scope.map(|s| s.to_owned()),
+            ..Default::default()
+        },
+    ));
+}
+
+/// The declared type of a `field_declaration`/`local_declaration_statement`
+/// (the `type` child of its inner `variable_declaration`), generic arguments
+/// stripped to the bare type name (`List<User>` -> `List`).
+fn declared_type(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    node.children()
+        .find(|c| c.kind() == "variable_declaration")
+        .and_then(|decl| decl.field("type"))
+        .map(|ty| strip_generic_args(&ty.text()))
 }
 
 /// Names of a `field_declaration`/`local_declaration_statement`: both wrap a

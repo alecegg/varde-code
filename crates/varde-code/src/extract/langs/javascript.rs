@@ -206,7 +206,9 @@ pub fn visit(
                     body_minhash: None,
                     is_async: None,
                     is_test: false,
-                    owner_type: None,
+                    // Handler function name (final identifier argument) for
+                    // route→handler resolution in `detect_routes`.
+                    owner_type: crate::extract::langs::last_arg_identifier(node),
                 });
             }
             if let Some(resp) = response_of(node) {
@@ -404,5 +406,34 @@ mod tests {
         assert_eq!(decorators.len(), 1, "entities: {entities:?}");
         assert_eq!(decorators[0].name, "Component");
         assert_eq!(decorators[0].enclosing_function.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn express_route_captures_named_handler_on_owner_type() {
+        // `app.get("/users", listUsers)` -> the Route entity carries the
+        // handler name so `detect_routes` can resolve it. An inline arrow
+        // handler leaves it absent.
+        let src = "app.get(\"/users\", listUsers);\napp.post(\"/x\", (req, res) => res.end());\n";
+        let parsed = parse_source(&SupportLang::JavaScript, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+        let routes: Vec<&Entity> = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Route)
+            .collect();
+
+        let named = routes
+            .iter()
+            .find(|r| r.path.as_deref() == Some("/users"))
+            .expect("GET /users route");
+        assert_eq!(named.owner_type.as_deref(), Some("listUsers"));
+        let inline = routes
+            .iter()
+            .find(|r| r.path.as_deref() == Some("/x"))
+            .expect("POST /x route");
+        assert_eq!(
+            inline.owner_type, None,
+            "inline arrow handler names no resolvable function"
+        );
     }
 }

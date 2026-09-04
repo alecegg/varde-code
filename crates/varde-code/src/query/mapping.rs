@@ -402,7 +402,7 @@ pub fn hotspots(input: &serde_json::Value) -> Result<serde_json::Value, ApiError
 /// [`hotspots`] opening (and re-freshening) a second one.
 pub fn hotspots_on(conn: &Connection) -> Result<serde_json::Value, ApiError> {
     let mut stmt = conn
-        .prepare("SELECT f.path, f.complexity, f.churn FROM files f")
+        .prepare("SELECT f.path, f.complexity, f.churn FROM files f WHERE f.is_test_path = 0")
         .map_err(db_err)?;
     let rows = stmt
         .query_map([], |r| {
@@ -799,13 +799,12 @@ mod tests {
         );
     }
 
-    /// Minimal `files` table for exercising [`super::hotspots_on`] directly.
+    /// Real schema in-memory for exercising [`super::hotspots_on`] directly.
+    /// Uses the production DDL (not a hand-rolled partial table) so generated
+    /// columns like `is_test_path` behave exactly as they do in a real db.
     fn files_db(rows: &[(&str, i64, i64)]) -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(
-            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT, complexity INTEGER, churn INTEGER);",
-        )
-        .expect("schema");
+        conn.execute_batch(crate::db::schema_ddl()).expect("schema");
         for (path, complexity, churn) in rows {
             conn.execute(
                 "INSERT INTO files (path, complexity, churn) VALUES (?1, ?2, ?3)",
@@ -861,6 +860,20 @@ mod tests {
         assert_eq!(
             scores,
             vec![("src/b.rs".to_string(), 200), ("src/a.rs".to_string(), 30)]
+        );
+    }
+
+    #[test]
+    fn hotspots_exclude_test_files() {
+        // A complex, churny test file (`src/core.test.ts`) must not surface as
+        // a hotspot — hotspots orient toward production code, matching the
+        // other nav-map surfacing tools' `is_test_path` exclusion.
+        let conn = files_db(&[("src/core.ts", 100, 4), ("src/core.test.ts", 200, 9)]);
+        let scores = hotspot_scores(&super::hotspots_on(&conn).expect("hotspots"));
+        assert_eq!(
+            scores,
+            vec![("src/core.ts".to_string(), 400)],
+            "test file must be excluded from hotspots: {scores:?}"
         );
     }
 }

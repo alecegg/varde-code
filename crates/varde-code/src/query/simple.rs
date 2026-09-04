@@ -553,19 +553,6 @@ fn rows_by_name(
     Ok(out)
 }
 
-/// A file is a test file when its path carries a test/spec marker:
-/// `_test`/`test_` segments, `.spec`/`.test` extensions, a `tests/`
-/// directory, or a `tests_` prefix.
-fn is_test_file(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.contains("_test")
-        || lower.contains("test_")
-        || lower.contains(".spec")
-        || lower.contains(".test")
-        || lower.contains("/tests/")
-        || lower.contains("tests_")
-}
-
 /// tests_for_file — test files that (transitively) import the given file.
 ///
 /// Inputs: `filePath` (required). Output: array of test file paths. A test
@@ -593,12 +580,11 @@ pub(crate) struct TestCoverage {
 
 impl TestCoverage {
     pub(crate) fn load(conn: &Connection) -> std::result::Result<Self, ApiError> {
-        // All test files: path-marked files, with resolved import edges.
+        // All test files, keyed off the authoritative `is_test_path` generated
+        // column (see `db.rs`) so this agrees with every other consumer of
+        // "is this a test file" instead of a weaker ad-hoc heuristic.
         let mut stmt = conn
-            .prepare(
-                "SELECT f.id, f.path FROM files f
-                 WHERE f.path LIKE '%test%' OR f.path LIKE '%spec%'",
-            )
+            .prepare("SELECT f.id, f.path FROM files f WHERE f.is_test_path = 1")
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
@@ -606,9 +592,7 @@ impl TestCoverage {
         let mut candidates: Vec<(i64, String)> = Vec::new();
         for row in rows {
             let (id, path) = row.map_err(db_err)?;
-            if is_test_file(&path) {
-                candidates.push((id, path));
-            }
+            candidates.push((id, path));
         }
 
         // Resolved import graph: from -> set of to.
@@ -1186,5 +1170,76 @@ mod build_on_read_tests {
             let _ = std::fs::remove_file(&db);
             let _ = std::fs::remove_dir_all(&root);
         });
+    }
+}
+
+#[cfg(test)]
+mod covering_tests_tests {
+    use super::*;
+
+    fn temp_db_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "varde-covering-tests-{label}-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ))
+    }
+
+    fn insert_file(conn: &Connection, path: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO files (path) VALUES (?1)",
+            rusqlite::params![path],
+        )
+        .expect("insert file row");
+        conn.last_insert_rowid()
+    }
+
+    fn insert_import(conn: &Connection, from_file_id: i64, to_file_id: i64) {
+        conn.execute(
+            "INSERT INTO resolved_edges (from_file_id, to_file_id, kind, resolved)
+             VALUES (?1, ?2, ?3, 1)",
+            rusqlite::params![
+                from_file_id,
+                to_file_id,
+                crate::resolve::EdgeKind::Import.as_i64()
+            ],
+        )
+        .expect("insert resolved import edge");
+    }
+
+    /// Coverage now keys off the authoritative `is_test_path` generated
+    /// column, so it (a) recognizes test conventions the old ad-hoc
+    /// `is_test_file` substring heuristic missed — e.g. `FooTest.java`, which
+    /// has no `_test`/`test_`/`tests_` marker — and (b) no longer
+    /// false-positives on production files like `latest_config.rs` (the old
+    /// heuristic matched its `test_` substring). Both files import the target;
+    /// only the real test file should be reported as covering it.
+    #[test]
+    fn covering_uses_authoritative_is_test_path_column() {
+        let path = temp_db_path("is-test-path");
+        let conn = crate::db::open_or_rebuild(&path).expect("schema creates");
+
+        let target = insert_file(&conn, "src/main/java/com/acme/Service.java");
+        // Real test the old heuristic missed (no `_test`/`test_` marker).
+        let java_test = insert_file(&conn, "src/test/java/com/acme/ServiceTest.java");
+        // Production file the old heuristic wrongly treated as a test because
+        // its path contains the `test_` substring ("la-test_-config").
+        let false_positive = insert_file(&conn, "src/config/latest_config.rs");
+
+        insert_import(&conn, java_test, target);
+        insert_import(&conn, false_positive, target);
+
+        let covering = covering_tests(&conn, target).expect("covering computes");
+
+        assert_eq!(
+            covering,
+            vec!["src/test/java/com/acme/ServiceTest.java".to_string()],
+            "only the real test file covers the target: {covering:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

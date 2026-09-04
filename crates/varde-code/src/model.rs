@@ -61,6 +61,13 @@ pub enum EntityKind {
     /// A decorator/annotation attached to a declaration (superset addition;
     /// not yet extracted).
     Decorator,
+    /// The declared type of a field/parameter/local variable: `name` is the
+    /// type name, `enclosing_function` is the variable's own name. Lets call
+    /// resolution recover a receiver's static type (`_svc.Do()` where
+    /// `_svc : IFoo`) to disambiguate a method call the plain name-uniqueness
+    /// fallback can't. Emitted only for the namespace-import languages that
+    /// use it (see `resolve::resolves_imports_by_namespace`).
+    TypeRef,
 }
 
 impl EntityKind {
@@ -86,6 +93,7 @@ impl EntityKind {
             EntityKind::Extends => 15,
             EntityKind::Implements => 16,
             EntityKind::Decorator => 17,
+            EntityKind::TypeRef => 18,
         }
     }
 
@@ -109,6 +117,7 @@ impl EntityKind {
             15 => EntityKind::Extends,
             16 => EntityKind::Implements,
             17 => EntityKind::Decorator,
+            18 => EntityKind::TypeRef,
             _ => return None,
         })
     }
@@ -135,6 +144,7 @@ impl EntityKind {
             EntityKind::Extends => "extends",
             EntityKind::Implements => "implements",
             EntityKind::Decorator => "decorator",
+            EntityKind::TypeRef => "type_ref",
         }
     }
 }
@@ -164,6 +174,7 @@ mod entity_kind_tests {
             EntityKind::Extends,
             EntityKind::Implements,
             EntityKind::Decorator,
+            EntityKind::TypeRef,
         ];
         for kind in all {
             assert_eq!(EntityKind::from_i64(kind.as_i64()), Some(kind));

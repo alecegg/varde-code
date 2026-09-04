@@ -201,7 +201,9 @@ pub fn visit(
                     body_minhash: None,
                     is_async: None,
                     is_test: false,
-                    owner_type: None,
+                    // Handler function name (final identifier argument) for
+                    // route→handler resolution in `detect_routes`.
+                    owner_type: crate::extract::langs::last_arg_identifier(node),
                 });
             }
             if let Some(resp) = response_of(node) {

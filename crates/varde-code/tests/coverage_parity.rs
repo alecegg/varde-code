@@ -347,6 +347,44 @@ fn build_query_fixture_db() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
     )
     .expect("persist succeeds");
+
+    // The fixture files physically live under this crate's own `tests/` tree,
+    // so their absolute paths trip the `is_test_path` generated column — every
+    // source file would look like a test, which (correctly) empties the
+    // hotspots/foundational/symbols sections now that those exclude test paths.
+    // Rewrite the persisted paths into a realistic repo-relative layout
+    // (production under `src/`, the covering test under `tests/`) so the parity
+    // checks exercise real behavior. `resolved_edges`/`community_members` key
+    // off `file_id`, not path, so this is safe; `is_test_path` recomputes
+    // automatically as a generated column.
+    {
+        let conn = varde_code::db::open(&db).expect("reopen fixture db");
+        let rows: Vec<(i64, String)> = conn
+            .prepare("SELECT id, path FROM files")
+            .expect("prepare files")
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .expect("query files")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect files");
+        for (id, path) in rows {
+            let base = std::path::Path::new(&path)
+                .file_name()
+                .expect("fixture file has a name")
+                .to_string_lossy()
+                .into_owned();
+            let rebased = if base.contains("_test") {
+                format!("tests/{base}")
+            } else {
+                format!("src/{base}")
+            };
+            conn.execute(
+                "UPDATE files SET path = ?1 WHERE id = ?2",
+                rusqlite::params![rebased, id],
+            )
+            .expect("rewrite fixture path");
+        }
+    }
+
     db
 }
 

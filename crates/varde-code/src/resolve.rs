@@ -16,6 +16,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 use crate::model::{Entity, Symbol};
+use crate::parse::language_for_path;
 
 /// Index of a file node in `ResolvedGraph::nodes` (deterministic order:
 /// sorted by path).
@@ -722,6 +723,189 @@ fn build_call_and_export_indexes<'a>(
     (callables, exports)
 }
 
+/// Languages whose imports name a namespace/package rather than a file: a
+/// `using`/`import`/`package` reference never resolves to a file-import edge,
+/// and a call to a type or method in the same namespace needs no import at
+/// all — so the cross-file [`cross_file_call_target`] pass structurally can't
+/// fire for them and a definition in a sibling file is unreachable by name.
+/// These fall back to the repo-wide single-definition index (Pass 3).
+fn resolves_imports_by_namespace(lang: ast_grep_language::SupportLang) -> bool {
+    use ast_grep_language::SupportLang::*;
+    matches!(lang, CSharp | Java | Kotlin | Scala)
+}
+
+/// Repo-wide "single definition" index for the languages in
+/// [`resolves_imports_by_namespace`]. Maps a normalized callee key to the sole
+/// callable entity of that name across the whole repo, or `None` when the name
+/// is defined more than once — an ambiguous name is left unresolved, exactly
+/// like the cross-file pass's single-candidate rule, so this never invents a
+/// false edge for a common method name (`ToString`, `Get`, overloads, ...).
+///
+/// Constructors (a method whose name equals its `owner_type`) are skipped so
+/// they don't collide with their own class's entry: `new Foo()` normalizes to
+/// `Foo`, which must resolve to the `Foo` *class* entity, not be knocked out
+/// as ambiguous by the same-named constructor method (Finding #2).
+fn build_repo_wide_unique_index(entities: &[Entity]) -> HashMap<&str, Option<u32>> {
+    let mut index: HashMap<&str, Option<u32>> = HashMap::new();
+    for (i, e) in entities.iter().enumerate() {
+        let callable = matches!(
+            e.kind,
+            crate::model::EntityKind::Function
+                | crate::model::EntityKind::Class
+                | crate::model::EntityKind::Interface
+        );
+        if !callable {
+            continue;
+        }
+        // Skip constructors: they duplicate the class name and would otherwise
+        // make every constructed type ambiguous with its own `new` target.
+        if e.kind == crate::model::EntityKind::Function
+            && e.owner_type.as_deref() == Some(e.name.as_str())
+        {
+            continue;
+        }
+        index
+            .entry(callee_key(&e.name))
+            // A second definition of the same name makes it ambiguous.
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(i as u32));
+    }
+    index
+}
+
+/// Type-directed call-resolution context for namespace-import languages
+/// (Pass 4). Recovers the static type of a call's receiver from the `TypeRef`
+/// entities the extractor emits for typed fields/params/locals, then looks the
+/// method up among that type's members — including members declared on a
+/// concrete class reached through an `implements`/`extends` edge, so the DI
+/// idiom `_svc.Do()` where `_svc : IFoo` resolves to `Foo.Do`. Resolves only
+/// when the receiver type yields exactly one matching method, so an ambiguous
+/// hierarchy stays unresolved rather than guessing.
+struct TypeResolveCtx<'a> {
+    /// (file id, variable name) -> declared type name.
+    var_type: HashMap<(u32, &'a str), &'a str>,
+    /// type name -> concrete subtypes (classes that `implements`/`extends` it).
+    subtypes_of: HashMap<&'a str, Vec<&'a str>>,
+    /// (owning type name, normalized method key) -> method entity indices.
+    method_index: HashMap<(&'a str, &'a str), Vec<u32>>,
+    /// All Class/Interface names, for a `Type.StaticMethod()` receiver.
+    type_names: std::collections::HashSet<&'a str>,
+}
+
+impl<'a> TypeResolveCtx<'a> {
+    fn build(entities: &'a [Entity]) -> Self {
+        use crate::model::EntityKind::*;
+        let mut var_type = HashMap::new();
+        let mut subtypes_of: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut type_names = std::collections::HashSet::new();
+        let mut interface_names = std::collections::HashSet::new();
+        for e in entities {
+            match e.kind {
+                TypeRef => {
+                    if let Some(var) = e.enclosing_function.as_deref() {
+                        var_type.insert((e.file_id, var), e.name.as_str());
+                    }
+                }
+                Extends | Implements => {
+                    if let Some(sub) = e.enclosing_function.as_deref() {
+                        subtypes_of.entry(e.name.as_str()).or_default().push(sub);
+                    }
+                }
+                Class => {
+                    type_names.insert(e.name.as_str());
+                }
+                Interface => {
+                    type_names.insert(e.name.as_str());
+                    interface_names.insert(e.name.as_str());
+                }
+                _ => {}
+            }
+        }
+        // Method index is a second pass: a method whose owner is an interface
+        // is an abstract *declaration*, not a call target — the implementing
+        // class's override is. Indexing both would make every interface-typed
+        // receiver with a single implementer look ambiguous. Skip them so the
+        // implementation wins.
+        let mut method_index: HashMap<(&str, &str), Vec<u32>> = HashMap::new();
+        for (i, e) in entities.iter().enumerate() {
+            if e.kind == Function
+                && let Some(owner) = e.owner_type.as_deref()
+                && !interface_names.contains(owner)
+            {
+                method_index
+                    .entry((owner, callee_key(&e.name)))
+                    .or_default()
+                    .push(i as u32);
+            }
+        }
+        TypeResolveCtx {
+            var_type,
+            subtypes_of,
+            method_index,
+            type_names,
+        }
+    }
+
+    /// Resolve a `receiver.method` call from file `from` to a single method
+    /// entity, or `None` if the receiver type is unknown or the match is
+    /// absent/ambiguous.
+    fn resolve(&self, from: u32, call_name: &str) -> Option<u32> {
+        let recv = call_receiver_var(call_name)?;
+        let method_key = callee_key(call_name);
+
+        // Candidate owning types: the receiver's declared type and its
+        // concrete subtypes; or, for a `Type.StaticMethod()` form, the
+        // receiver treated as a type name directly.
+        let mut owners: Vec<&str> = Vec::new();
+        if let Some(&ty) = self.var_type.get(&(from, recv)) {
+            owners.push(ty);
+            if let Some(subs) = self.subtypes_of.get(ty) {
+                owners.extend(subs.iter().copied());
+            }
+        }
+        if self.type_names.contains(recv) {
+            owners.push(recv);
+            if let Some(subs) = self.subtypes_of.get(recv) {
+                owners.extend(subs.iter().copied());
+            }
+        }
+        if owners.is_empty() {
+            return None;
+        }
+
+        // Require exactly one distinct target across all candidate owners.
+        let mut found: Option<u32> = None;
+        for owner in owners {
+            if let Some(cands) = self.method_index.get(&(owner, method_key)) {
+                for &idx in cands {
+                    match found {
+                        Some(seen) if seen != idx => return None,
+                        None => found = Some(idx),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        found
+    }
+}
+
+/// The receiver variable of a member-access call name: the simple identifier
+/// immediately before the final `.method` segment (`this._svc.Do` -> `_svc`,
+/// `_svc.Do` -> `_svc`). `None` when the call has no member-access receiver.
+fn call_receiver_var(name: &str) -> Option<&str> {
+    let t = name.trim();
+    let t = t.strip_suffix("()").map(str::trim).unwrap_or(t);
+    let dot = t.rfind('.')?;
+    let recv = t[..dot].trim_end();
+    Some(
+        recv.rsplit(['.', ' ', '(', ')'])
+            .next()
+            .unwrap_or(recv)
+            .trim(),
+    )
+}
+
 /// Build from file id -> target file ids of resolved import edges.
 fn build_import_targets(import_edges: &[ResolvedEdge]) -> std::collections::HashMap<u32, Vec<u32>> {
     use std::collections::HashMap;
@@ -748,6 +932,20 @@ fn resolve_calls(
 
     let (callables, exports) = build_call_and_export_indexes(entities);
     let imports_by = build_import_targets(import_edges);
+    let repo_wide = build_repo_wide_unique_index(entities);
+    let type_ctx = TypeResolveCtx::build(entities);
+
+    // Files whose language resolves imports by namespace, not by file path
+    // (C#/Java/Kotlin/Scala): the cross-file import pass can't fire for these,
+    // so they fall back to the repo-wide single-definition index (Pass 3
+    // below). Precomputed per file id so the per-call closure is a cheap
+    // lookup, not a path re-parse.
+    let namespace_import_file: Vec<bool> = files
+        .iter()
+        .map(|p| {
+            language_for_path(std::path::Path::new(p)).is_some_and(resolves_imports_by_namespace)
+        })
+        .collect();
 
     // Call entity indices, in entity order. Parallelizing over these and
     // collecting via indexed `map` preserves the deterministic edge order.
@@ -783,7 +981,31 @@ fn resolve_calls(
                 None
             };
 
-            let target = same.or(cross);
+            // Pass 3: repo-wide single-definition fallback, only for files
+            // whose imports name namespaces rather than files (C#), where
+            // Pass 2 cannot fire. Resolves only when the callee name has
+            // exactly one definition in the whole repo — ambiguous names stay
+            // unresolved, so no false edge is invented.
+            let namespace_import = namespace_import_file
+                .get(from as usize)
+                .copied()
+                .unwrap_or(false);
+            let repo = if same.is_none() && cross.is_none() && namespace_import {
+                repo_wide.get(key).copied().flatten()
+            } else {
+                None
+            };
+
+            // Pass 4: type-directed resolution. When the name-uniqueness
+            // fallback can't decide (an ambiguous method name), use the
+            // receiver's declared type to pick the one matching method.
+            let typed = if same.is_none() && cross.is_none() && repo.is_none() && namespace_import {
+                type_ctx.resolve(from, &e.name)
+            } else {
+                None
+            };
+
+            let target = same.or(cross).or(repo).or(typed);
             if target.is_none() {
                 // debug, not warn — see the import-resolution
                 // unresolved-reference comment above; calls are the
@@ -1036,6 +1258,213 @@ mod call_resolution_cross_file {
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0].from, app);
         assert_eq!(unresolved[0].to, EdgeTarget::Unknown);
+    }
+
+    /// Pass 3 (C# repo-wide fallback): `using` directives name namespaces, not
+    /// files, so a call to a method defined in a sibling file has no import
+    /// edge to resolve through. When the method name is defined exactly once
+    /// across the repo it must resolve to that single definition; when it is
+    /// defined more than once it must stay unresolved (no invented edge).
+    #[test]
+    fn csharp_call_resolves_via_repo_wide_unique_definition() {
+        let (entities, symbols, files) = load_project("csharp/calls");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+
+        let do_unique = entities
+            .iter()
+            .position(|e| e.kind == crate::model::EntityKind::Function && e.name == "DoUnique")
+            .expect("DoUnique defined") as u32;
+
+        let call_edge = |callee: &str| -> ResolvedEdge {
+            graph
+                .edges
+                .iter()
+                .find(|e| {
+                    e.kind == EdgeKind::Call
+                        && e.from_entity
+                            .is_some_and(|fi| entities[fi as usize].name == callee)
+                })
+                .cloned()
+                .unwrap_or_else(|| panic!("call site `{callee}` present"))
+        };
+
+        // Unique across the repo → resolves to the sole definition.
+        let unique = call_edge("_svc.DoUnique");
+        assert!(unique.resolved, "unique cross-file C# call must resolve");
+        assert_eq!(unique.to, EdgeTarget::Entity(do_unique));
+
+        // Defined in both Service.cs and Other.cs, so the repo-wide fallback
+        // (Pass 3) can't decide — but `_svc` is a `WidgetService`, so the
+        // type-directed pass (Pass 4) resolves it to `WidgetService.DoAmbiguous`,
+        // not `OtherService`'s.
+        let widget_do_ambiguous = entities
+            .iter()
+            .position(|e| {
+                e.kind == crate::model::EntityKind::Function
+                    && e.name == "DoAmbiguous"
+                    && e.owner_type.as_deref() == Some("WidgetService")
+            })
+            .expect("WidgetService.DoAmbiguous") as u32;
+        let ambiguous = call_edge("_svc.DoAmbiguous");
+        assert!(
+            ambiguous.resolved,
+            "receiver type must disambiguate the call: {ambiguous:?}"
+        );
+        assert_eq!(ambiguous.to, EdgeTarget::Entity(widget_do_ambiguous));
+
+        // `new WidgetService()` must resolve to the WidgetService *class*
+        // entity, even though the class declares an explicit constructor of
+        // the same name (Finding #2: constructors are skipped in the repo-wide
+        // index so they don't make the type ambiguous with its own `new`).
+        let widget_class = entities
+            .iter()
+            .position(|e| e.kind == crate::model::EntityKind::Class && e.name == "WidgetService")
+            .expect("WidgetService class") as u32;
+        let ctor_call = call_edge("WidgetService");
+        assert!(
+            ctor_call.resolved,
+            "constructor call must resolve to the class: {ctor_call:?}"
+        );
+        assert_eq!(ctor_call.to, EdgeTarget::Entity(widget_class));
+    }
+
+    /// Pass 4 (type-directed): an *ambiguous* method name (`Process` defined on
+    /// both `AirShipping` and `SeaShipping`) that the repo-wide uniqueness
+    /// fallback can't decide is resolved by the receiver's declared type —
+    /// `_air : AirShipping` picks `AirShipping.Process`.
+    #[test]
+    fn csharp_ambiguous_method_resolves_by_concrete_receiver_type() {
+        let (entities, symbols, files) = load_project("csharp/typed_dispatch");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+
+        let air_process = entities
+            .iter()
+            .position(|e| {
+                e.kind == crate::model::EntityKind::Function
+                    && e.name == "Process"
+                    && e.owner_type.as_deref() == Some("AirShipping")
+            })
+            .expect("AirShipping.Process") as u32;
+
+        let call = graph
+            .edges
+            .iter()
+            .find(|e| {
+                e.kind == EdgeKind::Call
+                    && e.from_entity
+                        .is_some_and(|fi| entities[fi as usize].name == "_air.Process")
+            })
+            .expect("_air.Process call site");
+        assert!(
+            call.resolved,
+            "ambiguous method must resolve via receiver type"
+        );
+        assert_eq!(
+            call.to,
+            EdgeTarget::Entity(air_process),
+            "must resolve to AirShipping.Process, not SeaShipping.Process"
+        );
+
+        // Safety: an interface-typed receiver with *two* implementers is
+        // genuinely ambiguous — `_ship.Process()` (`_ship : IShipping`) must
+        // stay unresolved rather than guess Air vs Sea.
+        let iface_call = graph
+            .edges
+            .iter()
+            .find(|e| {
+                e.kind == EdgeKind::Call
+                    && e.from_entity
+                        .is_some_and(|fi| entities[fi as usize].name == "_ship.Process")
+            })
+            .expect("_ship.Process call site");
+        assert!(
+            !iface_call.resolved,
+            "multi-implementer interface dispatch must stay unresolved: {iface_call:?}"
+        );
+    }
+
+    /// Pass 4 (interface DI): a field typed as an interface with a single
+    /// implementer resolves to the implementer's method — the interface's own
+    /// abstract declaration is not a call target.
+    #[test]
+    fn csharp_interface_field_resolves_to_single_implementer() {
+        let (entities, symbols, files) = load_project("csharp/interface_di");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+
+        let impl_method = entities
+            .iter()
+            .position(|e| {
+                e.kind == crate::model::EntityKind::Function
+                    && e.name == "ListUsers"
+                    && e.owner_type.as_deref() == Some("UserService")
+            })
+            .expect("UserService.ListUsers") as u32;
+
+        let call = graph
+            .edges
+            .iter()
+            .find(|e| {
+                e.kind == EdgeKind::Call
+                    && e.from_entity
+                        .is_some_and(|fi| entities[fi as usize].name == "_svc.ListUsers")
+            })
+            .expect("_svc.ListUsers call site");
+        assert!(
+            call.resolved,
+            "interface-typed receiver must resolve to impl"
+        );
+        assert_eq!(call.to, EdgeTarget::Entity(impl_method));
+    }
+
+    /// Pass 3 extends to Java (same namespace-not-file import model as C#): a
+    /// same-package method call needs no `import`, so it has no import edge to
+    /// resolve through and must fall back to the repo-wide unique definition.
+    #[test]
+    fn java_same_package_call_resolves_via_repo_wide_unique_definition() {
+        let (entities, symbols, files) = load_project("java/calls");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+
+        let place_order = entities
+            .iter()
+            .position(|e| e.kind == crate::model::EntityKind::Function && e.name == "placeOrder")
+            .expect("placeOrder defined") as u32;
+
+        let resolved_to_place_order = graph.edges.iter().any(|e| {
+            e.kind == EdgeKind::Call && e.resolved && e.to == EdgeTarget::Entity(place_order)
+        });
+        assert!(
+            resolved_to_place_order,
+            "svc.placeOrder() must resolve cross-file via the repo-wide fallback: {:?}",
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Call)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Gate check: the repo-wide fallback is C#-only. A Rust call to a
+    /// repo-unique function that the caller never `use`s must stay unresolved —
+    /// Rust resolves cross-file through import edges, and applying the fallback
+    /// to it would invent edges the language's own visibility rules forbid.
+    #[test]
+    fn non_csharp_language_does_not_use_repo_wide_fallback() {
+        let (entities, symbols, files) = load_project("rust/unimported_unique");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+
+        let helper_call = graph
+            .edges
+            .iter()
+            .find(|e| {
+                e.kind == EdgeKind::Call
+                    && e.from_entity
+                        .is_some_and(|fi| entities[fi as usize].name == "unique_helper")
+            })
+            .expect("unique_helper call site present");
+        assert!(
+            !helper_call.resolved,
+            "Rust call must stay unresolved without an import (fallback is C#-only): {helper_call:?}"
+        );
     }
 }
 

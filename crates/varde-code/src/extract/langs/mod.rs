@@ -336,6 +336,25 @@ pub(super) fn first_arg_text(
         .map(|c| c.text().into_owned())
 }
 
+/// Text of the last positional argument of a call `node` when that argument
+/// is a bare identifier. Used to recover a route's handler function name from
+/// a registration call — `app.get("/x", handler)` / `r.GET("/x", handler)` /
+/// `mux.HandleFunc("/x", handler)` all pass the handler as the final argument
+/// (any middleware precedes it). Returns `None` for an inline closure/arrow
+/// handler or a member expression (`h.List`), which name no single resolvable
+/// function. Relies on the shared `arguments` field + `identifier` node kind
+/// that both the Go and JS/TS grammars use.
+pub(super) fn last_arg_identifier(
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+) -> Option<String> {
+    let args = node.field("arguments")?;
+    args.children()
+        .filter(|c| c.is_named())
+        .last()
+        .filter(|c| c.kind() == "identifier")
+        .map(|c| c.text().into_owned())
+}
+
 /// Name of a JS/TS decorator `node` (`@Foo` -> `"Foo"`, `@Foo(...)` -> `"Foo"`).
 pub(super) fn decorator_name(
     node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,

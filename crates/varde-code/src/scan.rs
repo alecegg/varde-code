@@ -197,7 +197,9 @@ pub fn run(path: &str) -> Result<ExtractOutput> {
     // of entities) the last few doublings each copy a multi-million-element
     // Vec of non-trivial structs — real, measured cost (see BENCHMARK.md).
     let (entity_total, symbol_total) = processed.iter().fold((0, 0), |(e, s), p| match &p.result {
-        FileResult::Extracted { entities, symbols } => (e + entities.len(), s + symbols.len()),
+        FileResult::Extracted {
+            entities, symbols, ..
+        } => (e + entities.len(), s + symbols.len()),
         FileResult::Diagnostic(_) => (e, s),
     });
     output.entities.reserve_exact(entity_total);
@@ -237,6 +239,14 @@ enum FileResult {
     Extracted {
         entities: Vec<crate::model::Entity>,
         symbols: Vec<crate::model::Symbol>,
+        /// Set when the parse hit a syntax error (or the walk-depth guard)
+        /// but tree-sitter's error recovery still yielded usable entities:
+        /// we keep the partial extract *and* record the diagnostic, rather
+        /// than discarding every entity in the file. Dropping the whole file
+        /// on one localized error erased thousands of valid entities from
+        /// real .NET code (Newtonsoft's `#if`/`#endif`-in-initializer files),
+        /// blanking them from the nav map, edges, and every SQL rule.
+        diagnostic: Option<Diagnostic>,
     },
 }
 
@@ -250,9 +260,16 @@ struct ProcessedFile {
 fn merge(out: &mut ExtractOutput, result: FileResult) {
     match result {
         FileResult::Diagnostic(d) => out.diagnostics.push(d),
-        FileResult::Extracted { entities, symbols } => {
+        FileResult::Extracted {
+            entities,
+            symbols,
+            diagnostic,
+        } => {
             out.entities.extend(entities);
             out.symbols.extend(symbols);
+            if let Some(d) = diagnostic {
+                out.diagnostics.push(d);
+            }
         }
     }
 }
@@ -296,9 +313,16 @@ pub(crate) fn parse_chunk(files: &[SourceFile], start_index: usize) -> ChunkPars
         parsed.content_hashes.push(p.content_hash);
         match p.result {
             FileResult::Diagnostic(d) => parsed.diagnostics.push(d),
-            FileResult::Extracted { entities, symbols } => {
+            FileResult::Extracted {
+                entities,
+                symbols,
+                diagnostic,
+            } => {
                 parsed.entities.extend(entities);
                 parsed.symbols.extend(symbols);
+                if let Some(d) = diagnostic {
+                    parsed.diagnostics.push(d);
+                }
             }
         }
     }
@@ -367,35 +391,111 @@ fn process_file(path: &Path, file_id: u32) -> ProcessedFile {
     };
     let parsed = parse_source(&lang, source);
     let result = extract::extract(&parsed, file_id);
-    if result.has_error {
-        let msg = "syntax error — skipped";
-        tracing::warn!(file = %path.display(), "{msg}");
-        return ProcessedFile {
-            content_hash,
-            result: FileResult::Diagnostic(Diagnostic {
-                file_id,
-                message: msg.to_string(),
-                severity: "error".to_string(),
-            }),
-        };
+    // A syntax error is localized: tree-sitter's error recovery still parses
+    // the rest of the file, so `result.entities`/`result.symbols` hold the
+    // valid constructs outside the error region. Keep them and record a
+    // diagnostic, rather than discarding the whole file — dropping it erased
+    // thousands of real entities from `#if`/`#endif`-heavy .NET code.
+    let diagnostic = result.has_error.then(|| {
+        let msg = "syntax error — partial extract kept";
+        tracing::warn!(
+            file = %path.display(),
+            entities = result.entities.len(),
+            symbols = result.symbols.len(),
+            "{msg}"
+        );
+        Diagnostic {
+            file_id,
+            message: msg.to_string(),
+            severity: "warning".to_string(),
+        }
+    });
+    if diagnostic.is_none() {
+        tracing::debug!(
+            file = %path.display(),
+            entities = result.entities.len(),
+            symbols = result.symbols.len(),
+            "parsed file"
+        );
     }
-    tracing::debug!(
-        file = %path.display(),
-        entities = result.entities.len(),
-        symbols = result.symbols.len(),
-        "parsed file"
-    );
     ProcessedFile {
         content_hash,
         result: FileResult::Extracted {
             entities: result.entities,
             symbols: result.symbols,
+            diagnostic,
         },
     }
 }
 #[cfg(test)]
 mod tests {
-    use super::{UNKNOWN_METADATA, list_source_files, source_file_with_metadata};
+    use super::{
+        FileResult, UNKNOWN_METADATA, list_source_files, process_file, source_file_with_metadata,
+    };
+    use std::path::Path;
+
+    /// Regression: a localized syntax error must NOT discard the whole file.
+    /// C# conditional-compilation directives (`#if`/`#endif`) inside a
+    /// collection initializer trip tree-sitter-c-sharp into an ERROR node —
+    /// pervasive in cross-framework .NET code (Newtonsoft) — yet the class and
+    /// its methods parse fine. We keep the recovered entities and record a
+    /// `warning` diagnostic, rather than blanking the file from the index.
+    #[test]
+    fn syntax_error_keeps_partial_extract_and_records_diagnostic() {
+        let dir = std::env::temp_dir().join(format!("varde-scan-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("Widget.cs");
+        std::fs::write(
+            &path,
+            "using System;\n\
+             using System.Collections.Generic;\n\n\
+             class Widget\n\
+             {\n\
+             \x20\x20\x20\x20static readonly Dictionary<Type, int> Map = new Dictionary<Type, int>\n\
+             \x20\x20\x20\x20{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20{ typeof(int), 1 },\n\
+             #if HAVE_BIG\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20{ typeof(long), 2 },\n\
+             #endif\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20{ typeof(string), 3 },\n\
+             \x20\x20\x20\x20};\n\n\
+             \x20\x20\x20\x20public int Compute() => 42;\n\
+             }\n",
+        )
+        .expect("write cs");
+
+        let processed = process_file(Path::new(path.to_str().unwrap()), 0);
+        match processed.result {
+            FileResult::Extracted {
+                entities,
+                diagnostic,
+                ..
+            } => {
+                assert!(
+                    !entities.is_empty(),
+                    "error-recovery must retain entities, got none"
+                );
+                assert!(
+                    entities.iter().any(|e| e.name == "Widget"),
+                    "the class outside the error region must survive: {:?}",
+                    entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+                );
+                assert!(
+                    entities.iter().any(|e| e.name == "Compute"),
+                    "the method outside the error region must survive"
+                );
+                let d = diagnostic.expect("a syntax-error file must still carry a diagnostic");
+                assert_eq!(d.message, "syntax error — partial extract kept");
+                assert_eq!(d.severity, "warning");
+            }
+            FileResult::Diagnostic(d) => {
+                panic!("file wrongly discarded on syntax error: {d:?}");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn source_file_hashes_content_when_metadata_is_unknown() {

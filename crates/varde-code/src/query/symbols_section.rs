@@ -44,7 +44,10 @@ use super::{ApiError, db_err};
 ///
 /// Reads `Function`/`Class` entities and their cross-file resolved
 /// `Call`-edge fan-in count (see module docs for the exact reused join),
-/// drops any path [`is_generated_or_vendored_path`] flags as
+/// excludes symbols defined in test files (via the authoritative
+/// `is_test_path` generated column, matching [`entrypoints::detect`] and the
+/// foundational-files leaderboard), drops any path
+/// [`is_generated_or_vendored_path`] flags as
 /// generated/vendored, drops any entity also present in
 /// [`entrypoints::detect`]'s output, sorts descending by fan-in (ties broken
 /// by path then symbol name for determinism), and caps the result at
@@ -66,7 +69,7 @@ pub fn leaderboard(
                 AND re.resolved = 1
                 AND re.kind = ?1
                 AND re.from_file_id != e.file_id
-             WHERE e.kind IN (?2, ?3)
+             WHERE e.kind IN (?2, ?3) AND f.is_test_path = 0
              GROUP BY e.id
              HAVING COUNT(re.id) > 0
              ORDER BY fan_in DESC, f.path ASC, e.name ASC",
@@ -237,6 +240,41 @@ mod symbols_section_tests {
         assert!(
             entries.iter().any(|e| e["symbol"] == "core"),
             "symbol defined in src/core.ts should remain: {entries:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A symbol defined in a test file is excluded from the leaderboard even
+    /// with cross-file fan-in, via the `is_test_path` column — a test helper
+    /// called from many other tests should not rank as a top production
+    /// symbol.
+    #[test]
+    fn symbols_section_excludes_test_file_symbols() {
+        let path = temp_db_path("test-paths");
+        let conn = crate::db::open_or_rebuild(&path).expect("schema creates");
+
+        let test_file = insert_file(&conn, "src/util.test.ts");
+        let real_file = insert_file(&conn, "src/core.ts");
+        let caller_file = insert_file(&conn, "src/main.ts");
+
+        let helper_id = insert_function(&conn, test_file, "testHelper");
+        let core_id = insert_function(&conn, real_file, "core");
+        let caller_id = insert_function(&conn, caller_file, "main");
+
+        insert_call_edge(&conn, caller_file, test_file, caller_id, helper_id);
+        insert_call_edge(&conn, caller_file, real_file, caller_id, core_id);
+
+        let result = leaderboard(&conn, &HashSet::new(), None).expect("leaderboard computes");
+        let entries = result.as_array().expect("leaderboard is an array");
+
+        assert!(
+            !entries.iter().any(|e| e["symbol"] == "testHelper"),
+            "symbol defined in src/util.test.ts must be excluded: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e["symbol"] == "core"),
+            "non-test symbol core should remain: {entries:?}"
         );
 
         let _ = std::fs::remove_file(&path);

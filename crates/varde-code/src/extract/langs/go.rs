@@ -146,22 +146,25 @@ pub fn visit(
                 "recover" => ctx.push(EntityKind::Catch, "recover".to_string(), node),
                 _ => {}
             }
-            // net/http routes and responses.
-            if let Some(route) = route_of(node) {
+            // net/http + gin/echo/chi/fiber routes and responses.
+            if let Some((method, path)) = route_of(node) {
                 ctx.out.push(Entity {
                     kind: EntityKind::Route,
                     name: name.clone(),
                     file_id: ctx.file_id,
                     span: crate::extract::span_of(node),
                     enclosing_function: ctx.enclosing.map(|s| s.to_owned()),
-                    method: None,
-                    path: Some(route),
+                    method: Some(method),
+                    path: Some(path),
                     status: None,
                     body_shape: None,
                     body_minhash: None,
                     is_async: None,
                     is_test: false,
-                    owner_type: None,
+                    // The handler's function name (final identifier argument),
+                    // stashed on `owner_type` so `detect_routes` can resolve
+                    // the route to its handler for flow-tree rooting.
+                    owner_type: crate::extract::langs::last_arg_identifier(node),
                 });
             }
             if let Some(resp) = response_of(node) {
@@ -299,22 +302,40 @@ fn maybe_export(
     }
 }
 
-/// net/http route: `mux.HandleFunc("/path", handler)` — selector call whose
-/// field is HandleFunc/Handle with a string-literal first argument.
-fn route_of(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+/// HTTP verb methods shared by the common Go router frameworks (gin, echo,
+/// chi, fiber). Matched case-insensitively against the selector field so
+/// gin's `.GET` and chi's `.Get` both resolve.
+const GO_ROUTE_VERBS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+
+/// A route-registration call -> `(method, path)`.
+///
+/// Recognizes net/http's `mux.HandleFunc("/p", h)` / `mux.Handle("/p", h)`
+/// (verb not in the call -> `"*"`) and the verb-method form shared by
+/// gin/echo/chi/fiber (`r.GET("/p", h)` / `r.Get("/p", h)`). Guarded by
+/// requiring the first argument to be a string literal beginning with `/`, so
+/// ordinary member calls like `cache.Get("key")` are not mistaken for routes.
+fn route_of(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<(String, String)> {
     let fn_node = node.field("function")?;
     if fn_node.kind() != "selector_expression" {
         return None;
     }
-    let field = fn_node.field("field")?.text();
-    if field != "HandleFunc" && field != "Handle" {
+    let field = fn_node.field("field")?.text().into_owned();
+    let raw = first_arg_text(node)?;
+    if !raw.starts_with('"') && !raw.starts_with('`') {
         return None;
     }
-    let path = first_arg_text(node)?;
-    if !path.starts_with('"') && !path.starts_with('`') {
+    let path = super::unquote(&raw, true);
+    if !path.starts_with('/') {
         return None;
     }
-    Some(super::unquote(&path, true))
+    if field == "HandleFunc" || field == "Handle" {
+        return Some(("*".to_string(), path));
+    }
+    let method = field.to_ascii_uppercase();
+    if GO_ROUTE_VERBS.contains(&method.as_str()) {
+        return Some((method, path));
+    }
+    None
 }
 
 /// net/http response: `w.WriteHeader(n)` -> (status, None);
@@ -335,5 +356,51 @@ fn response_of(
         "WriteHeader" => Some((first_arg_text(node), None)),
         "Write" | "WriteString" => Some((None, Some(field))),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::extract;
+    use crate::model::{Entity, EntityKind};
+    use crate::parse::parse_source;
+    use ast_grep_language::SupportLang;
+
+    fn routes(src: &str) -> Vec<(Option<String>, Option<String>)> {
+        let parsed = parse_source(&SupportLang::Go, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        extract::extract(&parsed, 0)
+            .entities
+            .into_iter()
+            .filter(|e: &Entity| e.kind == EntityKind::Route)
+            .map(|e| (e.method, e.path))
+            .collect()
+    }
+
+    #[test]
+    fn gin_echo_chi_verb_routes_capture_method_and_path() {
+        // gin/echo `.GET`, chi `.Get`, and net/http `.HandleFunc` (verb `*`).
+        let src = "package main\nfunc setup(r Router) {\n\tr.GET(\"/users\", list)\n\tr.Get(\"/health\", ok)\n\tr.HandleFunc(\"/legacy\", h)\n}\n";
+        let got = routes(src);
+        let has = |m: &str, p: &str| {
+            got.iter()
+                .any(|(gm, gp)| gm.as_deref() == Some(m) && gp.as_deref() == Some(p))
+        };
+        assert!(has("GET", "/users"), "routes: {got:?}");
+        assert!(has("GET", "/health"), "routes: {got:?}");
+        assert!(has("*", "/legacy"), "routes: {got:?}");
+    }
+
+    #[test]
+    fn non_route_member_calls_are_not_routes() {
+        // `cache.Get("key")` shares the verb-method name but its argument is
+        // not a `/`-path, so it must not be mistaken for a route.
+        let src =
+            "package main\nfunc f(cache C) {\n\tcache.Get(\"key\")\n\tdb.Delete(\"row-1\")\n}\n";
+        assert!(
+            routes(src).is_empty(),
+            "unexpected routes: {:?}",
+            routes(src)
+        );
     }
 }
