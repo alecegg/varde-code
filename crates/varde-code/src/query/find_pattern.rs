@@ -379,8 +379,14 @@ mod tests {
 
         let calls = run_pattern_cs("Foo($$$A)", src);
         let texts: Vec<&str> = calls.iter().map(|m| m["text"].as_str().unwrap()).collect();
-        assert!(texts.contains(&"Foo()"), "empty-arg call matched: {texts:?}");
-        assert!(texts.contains(&"Foo(1)"), "single-arg call matched: {texts:?}");
+        assert!(
+            texts.contains(&"Foo()"),
+            "empty-arg call matched: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Foo(1)"),
+            "single-arg call matched: {texts:?}"
+        );
         assert!(
             texts.contains(&"Foo(1, 2, 3)"),
             "multi-arg call matched: {texts:?}"
@@ -414,9 +420,7 @@ mod tests {
             "no-semicolon throw pattern matches both throw statements: {matches:?}"
         );
         assert!(
-            matches
-                .iter()
-                .all(|m| m["kind"] == "throw_statement"),
+            matches.iter().all(|m| m["kind"] == "throw_statement"),
             "located root is the throw statement: {matches:?}"
         );
     }
@@ -681,9 +685,7 @@ fn match_node_capture<'p>(
         pchildren
             .iter()
             .map(|c| match lift_variadic_marker(c) {
-                Some(marker)
-                    if schildren.iter().filter(|s| s.kind() == c.kind()).count() != 1 =>
-                {
+                Some(marker) if schildren.iter().filter(|s| s.kind() == c.kind()).count() != 1 => {
                     marker
                 }
                 _ => c.clone(),

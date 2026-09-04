@@ -2184,9 +2184,13 @@ fn blob_to_minhash(blob: &[u8]) -> Option<Vec<u64>> {
     if !blob.len().is_multiple_of(8) {
         return None;
     }
+    // `as_chunks::<8>()` yields `&[u8; 8]` directly (no fallible `try_into`);
+    // the remainder is provably empty given the `is_multiple_of(8)` guard above.
     Some(
-        blob.chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().expect("8-byte chunk")))
+        blob.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect(),
     )
 }

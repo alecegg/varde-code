@@ -266,8 +266,7 @@ mod git_log_known_history_matches_expected {
     /// `café.rs` path.
     #[test]
     fn non_ascii_path_is_counted_unquoted() {
-        let dir =
-            std::env::temp_dir().join(format!("varde-churn-unicode-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("varde-churn-unicode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir creates");
         run(&dir, &["init", "-q"]);
