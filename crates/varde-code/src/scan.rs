@@ -43,6 +43,7 @@ pub fn list_source_files(path: &str) -> Result<Vec<SourceFile>> {
     let collected = std::sync::Mutex::new(Vec::<SourceFile>::new());
     ignore::WalkBuilder::new(root)
         .hidden(false)
+        .filter_entry(|entry| !is_vcs_internal(entry))
         .build_parallel()
         .run(|| {
             Box::new(|result| {
@@ -63,6 +64,20 @@ pub fn list_source_files(path: &str) -> Result<Vec<SourceFile>> {
         .expect("walk collector lock poisoned");
     files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+/// Prune VCS-internal directories from the walk. `.hidden(false)` (set on the
+/// walkers so legitimate dotfiles like `.github/` and `.eslintrc` are indexed)
+/// otherwise descends into `.git/`, which holds machine internals — refs,
+/// hooks, logs, and potentially thousands of loose objects plus multi-megabyte
+/// packfiles. Indexing those pollutes the `files` table (observed: ~8% of rows
+/// on a real repo, >90% on a freshly-committed one), inflates file counts that
+/// feed nav_map/clusters, and wastes the walk. A submodule's `.git` is a
+/// gitlink *file*, also named `.git`, so matching the name (not just dirs)
+/// prunes both. This is deliberately narrow — only `.git`, the one dotdir that
+/// is never source — to preserve the dotfile-including policy above.
+pub(crate) fn is_vcs_internal(entry: &ignore::DirEntry) -> bool {
+    entry.file_name() == std::ffi::OsStr::new(".git")
 }
 
 /// Extract `(mtime, size)` from a `Metadata`, with `UNKNOWN_METADATA` sentinels
@@ -380,7 +395,7 @@ fn process_file(path: &Path, file_id: u32) -> ProcessedFile {
 }
 #[cfg(test)]
 mod tests {
-    use super::{UNKNOWN_METADATA, source_file_with_metadata};
+    use super::{UNKNOWN_METADATA, list_source_files, source_file_with_metadata};
 
     #[test]
     fn source_file_hashes_content_when_metadata_is_unknown() {
@@ -394,5 +409,44 @@ mod tests {
         assert_eq!(source.content_hash.as_deref(), Some("355463d2db8c9b7f"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression: `.hidden(false)` (set so legit dotfiles like `.github/` are
+    /// indexed) otherwise lets the walker descend into `.git/`, persisting refs,
+    /// hooks, logs, and loose objects as bogus source rows. The walk must prune
+    /// `.git/` while still returning the real source file and other dotfiles.
+    #[test]
+    fn walk_excludes_dot_git_but_keeps_other_dotfiles() {
+        let dir = std::env::temp_dir().join(format!("varde-scan-gitwalk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A realistic `.git/` skeleton: nested subdirs and files, like a real repo.
+        std::fs::create_dir_all(dir.join(".git/hooks")).expect("git dir");
+        std::fs::create_dir_all(dir.join(".git/objects/ab")).expect("obj dir");
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").expect("head");
+        std::fs::write(dir.join(".git/hooks/pre-commit.sample"), "#!/bin/sh\n").expect("hook");
+        std::fs::write(dir.join(".git/objects/ab/cdef"), b"\x00binary").expect("obj");
+        // A legit dotfile that MUST still be indexed (the reason for hidden(false)).
+        std::fs::create_dir_all(dir.join(".github")).expect("gh dir");
+        std::fs::write(dir.join(".github/ci.yml"), "on: push\n").expect("ci");
+        // The real source file.
+        std::fs::write(dir.join("main.rs"), "fn main() {}\n").expect("src");
+
+        let files = list_source_files(dir.to_str().unwrap()).expect("walks");
+        let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+
+        assert!(
+            paths.iter().all(|p| !p.contains("/.git/")),
+            ".git internals must be pruned: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("main.rs")),
+            "real source must be indexed: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with(".github/ci.yml")),
+            "non-.git dotfiles must still be indexed: {paths:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

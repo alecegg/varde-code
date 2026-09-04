@@ -213,6 +213,32 @@ fn cached_pattern_children<'p>(cache: &PatternChildCache<'p>, node: &PNode<'p>) 
     children
 }
 
+/// If `node` is a single-level grammar wrapper whose sole named child is a
+/// *variadic* marker, return that marker. Some grammars wrap each element of a
+/// list in an extra node — e.g. C# wraps every call/constructor argument in an
+/// `argument` node, so the pattern `foo($$$A)` parses its argument list as
+/// `argument_list → argument → identifier("__varde_meta_v_A__")`. Buried under
+/// that lone `argument`, the variadic is never seen at the `argument_list`
+/// sequence level, so it fails to match empty or multi-element argument lists.
+///
+/// This only *detects* a liftable wrapper; the caller
+/// ([`match_node_capture`]) decides whether to apply it, using the source
+/// side to tell a per-element wrapper (lift) from a singleton list container
+/// (keep). Only variadic markers are considered: single markers already match
+/// through ordinary recursive descent, and lifting them would change which node
+/// their capture binds.
+fn lift_variadic_marker<'p>(node: &PNode<'p>) -> Option<PNode<'p>> {
+    // A node that is itself a bare marker has no wrapper to lift.
+    if meta_of(node).is_some() {
+        return None;
+    }
+    let named: Vec<PNode<'p>> = node.children().filter(|c| c.is_named()).collect();
+    let [only] = named.as_slice() else {
+        return None;
+    };
+    matches!(meta_of(only), Some(MetaKind::Variadic(_))).then(|| only.clone())
+}
+
 /// Detect whether a node is a meta-variable marker.
 ///
 /// Markers are single identifier tokens, so only leaf nodes (no children)
@@ -312,6 +338,87 @@ mod tests {
         let matches = out.as_array().expect("matches array");
         assert_eq!(matches.len(), 1, "only the all-numeric call matches: {out}");
         assert_eq!(matches[0]["text"], "foo(1, 2, 3)");
+    }
+
+    /// Run a pattern over a C# source fixture (`sample.cs`), returning the match
+    /// array directly. C# wraps each argument in an `argument` node, so this
+    /// exercises the buried-variadic lift that the TS fixtures cannot.
+    fn run_pattern_cs(pattern: &str, source: &str) -> Vec<serde_json::Value> {
+        let dir = std::env::temp_dir().join(format!(
+            "fp-cs-test-{}-{}",
+            std::process::id(),
+            pattern.len()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir creates");
+        let file = dir.join("sample.cs");
+        std::fs::write(&file, source).expect("fixture writes");
+        let out = find_pattern(&serde_json::json!({
+            "filePath": file.display().to_string(),
+            "pattern": pattern,
+            "language": "csharp",
+        }))
+        .expect("pattern runs");
+        let _ = std::fs::remove_dir_all(&dir);
+        out.as_array().cloned().expect("matches array")
+    }
+
+    #[test]
+    fn variadic_matches_empty_and_multi_arg_through_csharp_wrapper() {
+        // Regression: in C# `$$$A` sits under an `argument` wrapper inside
+        // `argument_list`. Before the lift, the variadic could only match a
+        // single-argument call (varde 6 vs ast-grep 7 on real code); empty and
+        // multi-argument calls were missed. `$$$A` must match 0, 1, and N args.
+        let src = "class C { void M() {\n\
+            Foo();\n\
+            Foo(1);\n\
+            Foo(1, 2, 3);\n\
+            var a = new Thing();\n\
+            var b = new Thing(x, y);\n\
+        } }\n";
+
+        let calls = run_pattern_cs("Foo($$$A)", src);
+        let texts: Vec<&str> = calls.iter().map(|m| m["text"].as_str().unwrap()).collect();
+        assert!(texts.contains(&"Foo()"), "empty-arg call matched: {texts:?}");
+        assert!(texts.contains(&"Foo(1)"), "single-arg call matched: {texts:?}");
+        assert!(
+            texts.contains(&"Foo(1, 2, 3)"),
+            "multi-arg call matched: {texts:?}"
+        );
+        assert_eq!(calls.len(), 3, "exactly the three Foo calls: {texts:?}");
+
+        let news = run_pattern_cs("new Thing($$$A)", src);
+        assert_eq!(
+            news.len(),
+            2,
+            "both empty and multi-arg constructor calls match: {news:?}"
+        );
+    }
+
+    #[test]
+    fn expression_form_throw_pattern_locates_statement_root() {
+        // Regression: `throw new $E($$$A)` with no trailing `;` used to fail
+        // with "cannot locate pattern root in wrapper". C# has no throw
+        // *expression*, so the fragment only parses inside the wrapper, which
+        // appends a `;` — the located node is the `throw_statement`. The pattern
+        // must resolve and match statement-form throws (parity with ast-grep,
+        // which matches the no-`;` form).
+        let src = "class C { void M() {\n\
+            throw new System.Exception();\n\
+            throw new System.Exception(\"msg\");\n\
+        } }\n";
+        let matches = run_pattern_cs("throw new $E($$$A)", src);
+        assert_eq!(
+            matches.len(),
+            2,
+            "no-semicolon throw pattern matches both throw statements: {matches:?}"
+        );
+        assert!(
+            matches
+                .iter()
+                .all(|m| m["kind"] == "throw_statement"),
+            "located root is the throw statement: {matches:?}"
+        );
     }
 
     #[test]
@@ -560,7 +667,32 @@ fn match_node_capture<'p>(
         };
     }
     let schildren: Vec<PNode<'_>> = strip_trivia(source.children().collect());
-    match_sequence_capture(&pchildren, &schildren, cache, constraints)
+    // Lift per-element wrappers that bury a variadic marker (e.g. C#'s
+    // `argument` node) up to this sequence level, but only when the wrapper's
+    // kind is a *per-element* wrapper here — i.e. the source has some number
+    // other than exactly one child of that kind. A singleton list container
+    // (`arguments` in TS/JS holds the marker directly and appears once) has
+    // exactly one same-kind source child and is left intact for ordinary
+    // recursive descent, which handles the variadic one level down. Without the
+    // count gate, that container would be collapsed and the variadic would
+    // wrongly swallow sibling slots. Most patterns have no liftable child, so
+    // the common path returns the cached `pchildren` untouched.
+    let plifted: Vec<PNode<'_>> = if pchildren.iter().any(|c| lift_variadic_marker(c).is_some()) {
+        pchildren
+            .iter()
+            .map(|c| match lift_variadic_marker(c) {
+                Some(marker)
+                    if schildren.iter().filter(|s| s.kind() == c.kind()).count() != 1 =>
+                {
+                    marker
+                }
+                _ => c.clone(),
+            })
+            .collect()
+    } else {
+        pchildren
+    };
+    match_sequence_capture(&plifted, &schildren, cache, constraints)
 }
 
 /// Match a pattern-child sequence against a source-child sequence, allowing
@@ -885,7 +1017,16 @@ fn locate_pattern_root<'a>(
         ));
     }
     let root = wrapped_parsed.root.root();
+    // Try the pattern text verbatim first. If that fails, retry with a trailing
+    // `;`: several wrappers (C/C++/Dart/Java/C#/PHP/Solidity — see
+    // `wrap_for_lang`) append a statement terminator, so an *expression*-form
+    // fragment like `throw new $E($$$A)` (no `;`) becomes a `throw_statement`
+    // whose text carries the appended `;` and never equals the semicolon-less
+    // pattern. Retrying with the terminator locates that statement node — giving
+    // parity with `ast-grep run`, which matches the no-`;` form fine. A fragment
+    // that already ended in `;` matched on the first attempt.
     find_text_node(&root, trimmed)
+        .or_else(|| find_text_node(&root, &format!("{trimmed};")))
         .ok_or_else(|| ApiError::new("invalid_pattern", "cannot locate pattern root in wrapper"))
 }
 
@@ -942,18 +1083,19 @@ fn mandatory_atoms(pattern: &str) -> Vec<String> {
 fn match_source(
     pattern_root: &PNode<'_>,
     lang: &ast_grep_language::SupportLang,
-    file_path: &std::path::Path,
     source: &str,
     constraints: &HashMap<String, String>,
     relations: &Relations,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
+    // Match on tree-sitter's error-recovered tree rather than rejecting the
+    // whole file on the first syntax error. A single unparseable construct
+    // (often just modern-syntax the pinned grammar version doesn't know)
+    // otherwise discards *every* match in the file — a large recall loss and a
+    // parity gap vs. `ast-grep run`, which matches recovered trees. ERROR and
+    // MISSING nodes carry their own kinds, so they never match a real pattern's
+    // node kind; tolerating them only recovers the well-formed regions and
+    // never invents spurious matches.
     let source_parsed = crate::parse::parse_source(lang, source);
-    if source_parsed.has_error() {
-        return Err(ApiError::new(
-            "parse_error",
-            format!("{} contains syntax errors", file_path.display()),
-        ));
-    }
     let source_root = source_parsed.root.root();
 
     reset_budget();
@@ -999,9 +1141,10 @@ fn match_source(
 ///
 /// Inputs: `pattern` (required); either `filePath`/`file` (search one file)
 /// or `path` (search a directory tree — requires `language` since a tree may
-/// mix extensions). Per-file parse/pattern-too-complex errors are recorded as
-/// skip diagnostics rather than failing the whole call when searching a
-/// directory; a single-file call still surfaces them as a hard error.
+/// mix extensions). Files with syntax errors are matched on tree-sitter's
+/// error-recovered tree (matching `ast-grep run`), not skipped. A
+/// `pattern_too_complex` error still fails a single-file call; in a directory
+/// search it drops that one file rather than failing the whole call.
 ///
 /// Output: array of matches `{kind, text, span, captures, file}` where
 /// `captures` maps each meta-variable name to its matched node(s) — a single
@@ -1052,14 +1195,7 @@ pub fn find_pattern(input: &serde_json::Value) -> Result<serde_json::Value, ApiE
     if !is_dir {
         let source = std::fs::read_to_string(target_path)
             .map_err(|e| ApiError::new("file_error", format!("{}: {e}", target_path.display())))?;
-        let matches = match_source(
-            pattern_root,
-            &lang,
-            target_path,
-            &source,
-            &constraints,
-            &relations,
-        )?;
+        let matches = match_source(pattern_root, &lang, &source, &constraints, &relations)?;
         let out: Vec<_> = matches
             .into_iter()
             .map(|mut m| {
@@ -1104,6 +1240,7 @@ pub fn find_pattern(input: &serde_json::Value) -> Result<serde_json::Value, ApiE
     let parsed = AtomicUsize::new(0);
     ignore::WalkBuilder::new(target_path)
         .hidden(false)
+        .filter_entry(|entry| !crate::scan::is_vcs_internal(entry))
         .build_parallel()
         .run(|| {
             Box::new(|entry| {
@@ -1131,7 +1268,7 @@ pub fn find_pattern(input: &serde_json::Value) -> Result<serde_json::Value, ApiE
                 // Skip-and-report: a single unparseable/pathological file in a
                 // tree search doesn't fail the whole call.
                 if let Ok(matches) =
-                    match_source(pattern_root, &lang, path, &source, &constraints, &relations)
+                    match_source(pattern_root, &lang, &source, &constraints, &relations)
                 {
                     let mut local: Vec<serde_json::Value> = matches
                         .into_iter()

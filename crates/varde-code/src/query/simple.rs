@@ -30,6 +30,61 @@ fn symbol_kind_to_i64(s: &str) -> Option<i64> {
     }
 }
 
+/// Render a persisted `entities.kind` integer back to its snake_case string.
+fn entity_kind_of(v: i64) -> String {
+    crate::model::EntityKind::from_i64(v)
+        .map(crate::model::EntityKind::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// The `EntityKind` discriminants that represent a *named declaration* a caller
+/// would look up as a "symbol" — class/method/interface/field/parameter.
+/// Declarations live in the `entities` table, not `symbols` (which holds only
+/// bindings/references), so the symbol query modes union these in. The
+/// occurrence/relationship kinds (call, throw, import, extends, …) are excluded,
+/// as is `Export`: an `export class Foo` already yields a `Class` entity, so
+/// including `Export` would only add a duplicate `Foo` row.
+fn declaration_kinds() -> [i64; 5] {
+    use crate::model::EntityKind::{Class, Function, Interface, Parameter, Variable};
+    [
+        Function.as_i64(),
+        Class.as_i64(),
+        Interface.as_i64(),
+        Variable.as_i64(),
+        Parameter.as_i64(),
+    ]
+}
+
+/// Comma-joined `declaration_kinds()` for inlining into a SQL `IN (...)` list.
+/// The values are trusted enum discriminants (integers), so inlining them is
+/// injection-safe and avoids threading a variable-length placeholder list.
+fn declaration_kinds_sql() -> String {
+    declaration_kinds()
+        .iter()
+        .map(|k| k.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Map a `kind` query param to an entity declaration discriminant, mirroring
+/// the set exposed by [`declaration_kinds`]. `None` for names that aren't
+/// declaration kinds (callers then fall back to the symbol-kind interpretation).
+fn entity_kind_to_i64(s: &str) -> Option<i64> {
+    use crate::model::EntityKind::{Class, Function, Interface, Parameter, Variable};
+    Some(
+        match s {
+            "function" => Function,
+            "class" => Class,
+            "interface" => Interface,
+            "variable" => Variable,
+            "parameter" => Parameter,
+            _ => return None,
+        }
+        .as_i64(),
+    )
+}
+
 /// Whether a path language matches a `filter_symbols` language predicate.
 ///
 /// TypeScript filters intentionally include TSX files. A TSX filter remains
@@ -197,6 +252,73 @@ fn query_symbols(
     Ok(out)
 }
 
+/// Declaration entities (class/method/interface/field/parameter/export) for a
+/// file, shaped identically to [`query_symbols`] rows but sourced from the
+/// `entities` table with the `entities.kind` rendered via [`entity_kind_of`].
+fn query_entity_declarations(
+    conn: &Connection,
+    file_id: i64,
+    body_root: Option<&std::path::Path>,
+) -> std::result::Result<Vec<serde_json::Value>, ApiError> {
+    let sql = format!(
+        "SELECT e.kind, e.name, f.path,
+                e.start_byte, e.end_byte, e.start_line, e.start_col,
+                e.end_line, e.end_col
+         FROM entities e
+         JOIN files f ON f.id = e.file_id
+         WHERE e.file_id = ?1 AND e.kind IN ({})
+         ORDER BY e.id",
+        declaration_kinds_sql()
+    );
+    let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+    let rows = stmt
+        .query_map([file_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)?,
+            ))
+        })
+        .map_err(db_err)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (k, n, path, sb, eb, sl, sc, el, ec) = row.map_err(db_err)?;
+        let row = SymbolRow {
+            kind: entity_kind_of(k),
+            name: n,
+            path,
+            sb,
+            eb,
+            sl,
+            sc,
+            el,
+            ec,
+        };
+        out.push(symbol_json(&row, body_root)?);
+    }
+    Ok(out)
+}
+
+/// A file's declared symbols: its declaration entities followed by its
+/// binding/reference symbols. This is the "symbols declared in a file" view
+/// callers expect — declarations (from `entities`) first, then the
+/// binding/reference layer (from `symbols`).
+fn query_file_symbols(
+    conn: &Connection,
+    file_id: i64,
+    body_root: Option<&std::path::Path>,
+) -> std::result::Result<Vec<serde_json::Value>, ApiError> {
+    let mut out = query_entity_declarations(conn, file_id, body_root)?;
+    out.extend(query_symbols(conn, file_id, body_root)?);
+    Ok(out)
+}
+
 /// `includeBody=true` needs a filesystem root to resolve the stored
 /// (repo-relative) file path against; `repoRoot` is that root, and also
 /// covers the `dbPath`-only invocation by falling back to the db's parent.
@@ -234,7 +356,7 @@ pub fn symbols_in_file(input: &serde_json::Value) -> Result<serde_json::Value, A
     freshen_for_mode("symbols_in_file", input)?;
     let conn = open_db(input)?;
     let fid = file_id(&conn, file_path)?;
-    let symbols = query_symbols(&conn, fid, body_root(input).as_deref())?;
+    let symbols = query_file_symbols(&conn, fid, body_root(input).as_deref())?;
     Ok(serde_json::json!(symbols))
 }
 
@@ -276,7 +398,7 @@ pub fn symbols_in_files(input: &serde_json::Value) -> Result<serde_json::Value, 
     let mut result = serde_json::Map::new();
     for file_path in file_paths {
         let entry = match file_id(&conn, file_path)
-            .and_then(|fid| query_symbols(&conn, fid, root.as_deref()))
+            .and_then(|fid| query_file_symbols(&conn, fid, root.as_deref()))
         {
             Ok(symbols) => serde_json::json!(symbols),
             Err(e) => serde_json::json!({"error": {"code": e.code, "message": e.message}}),
@@ -298,21 +420,103 @@ pub fn get_symbol(input: &serde_json::Value) -> Result<serde_json::Value, ApiErr
     let name = req_str(input, "name")?;
     let kind = opt_str(input, "kind");
 
-    // -1 never matches a stored kind (0/1), so an absent filter is a no-op —
-    // same effect as the old `?2 = '' OR kind = ?2` string-sentinel pattern.
-    let kind_param = kind.and_then(symbol_kind_to_i64).unwrap_or(-1);
-    let kind_unfiltered = kind.is_none();
+    // A `kind` filter selects the source: a declaration kind (class/function/…)
+    // searches only `entities`; binding/reference searches only `symbols`. With
+    // no `kind`, search both — declarations first, since a bare name lookup
+    // (`get_symbol StringUtils`) wants the declaration, not a use of it.
+    let want_entities = kind.is_none_or(|k| entity_kind_to_i64(k).is_some());
+    let want_symbols = kind.is_none_or(|k| symbol_kind_to_i64(k).is_some());
 
-    let sql = "SELECT s.kind, s.name, f.path,
-                s.start_byte, s.end_byte, s.start_line, s.start_col,
-                s.end_line, s.end_col
-         FROM symbols s
-         JOIN files f ON f.id = s.file_id
-         WHERE s.name = ?1 AND (?2 = 1 OR s.kind = ?3)
-         ORDER BY s.id";
-    let mut stmt = conn.prepare(sql).map_err(db_err)?;
+    let mut candidates: Vec<SymbolRow> = Vec::new();
+    if want_entities {
+        candidates.extend(rows_by_name(
+            &conn,
+            RowSource::Entities,
+            name,
+            kind.and_then(entity_kind_to_i64),
+            file_path,
+        )?);
+    }
+    if want_symbols {
+        candidates.extend(rows_by_name(
+            &conn,
+            RowSource::Symbols,
+            name,
+            kind.and_then(symbol_kind_to_i64),
+            file_path,
+        )?);
+    }
+
+    let Some(row) = candidates.into_iter().next() else {
+        return Err(ApiError::not_found(format!("symbol {name:?}")));
+    };
+    symbol_json(&row, body_root(input).as_deref())
+}
+
+/// Which persisted table a lookup reads from — `entities` (declarations) or
+/// `symbols` (bindings/references). They share the same 9-column span shape and
+/// a `kind`/`name`/`file_id`, differing only in table name and how `kind` is
+/// rendered.
+#[derive(Clone, Copy)]
+enum RowSource {
+    Entities,
+    Symbols,
+}
+
+impl RowSource {
+    fn table(self) -> &'static str {
+        match self {
+            RowSource::Entities => "entities",
+            RowSource::Symbols => "symbols",
+        }
+    }
+
+    fn render_kind(self, k: i64) -> String {
+        match self {
+            RowSource::Entities => entity_kind_of(k),
+            RowSource::Symbols => symbol_kind_of(k),
+        }
+    }
+
+    /// Default `kind IN (...)` restriction when no specific kind is requested.
+    /// `entities` holds many non-declaration kinds, so it restricts to the
+    /// declaration set; `symbols` holds only binding/reference, so it is open.
+    fn default_kind_filter(self) -> String {
+        match self {
+            RowSource::Entities => format!(" AND t.kind IN ({})", declaration_kinds_sql()),
+            RowSource::Symbols => String::new(),
+        }
+    }
+}
+
+/// Rows named `name` from `source`, optionally restricted to a specific `kind`
+/// discriminant and a `file_path` suffix (component-wise, via [`matches_path`]).
+fn rows_by_name(
+    conn: &Connection,
+    source: RowSource,
+    name: &str,
+    kind_int: Option<i64>,
+    file_path: Option<&str>,
+) -> std::result::Result<Vec<SymbolRow>, ApiError> {
+    let kind_clause = match kind_int {
+        Some(_) => " AND t.kind = ?2".to_string(),
+        None => format!("{} AND ?2 = ?2", source.default_kind_filter()),
+    };
+    let sql = format!(
+        "SELECT t.kind, t.name, f.path,
+                t.start_byte, t.end_byte, t.start_line, t.start_col,
+                t.end_line, t.end_col
+         FROM {} t JOIN files f ON f.id = t.file_id
+         WHERE t.name = ?1{kind_clause}
+         ORDER BY t.id",
+        source.table()
+    );
+    // `?2` is the kind discriminant when filtering; when not, the `?2 = ?2`
+    // tautology keeps a stable two-parameter binding (value is irrelevant).
+    let kind_param = kind_int.unwrap_or(0);
+    let mut stmt = conn.prepare(&sql).map_err(db_err)?;
     let rows = stmt
-        .query_map(rusqlite::params![name, kind_unfiltered, kind_param], |r| {
+        .query_map(rusqlite::params![name, kind_param], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -326,7 +530,7 @@ pub fn get_symbol(input: &serde_json::Value) -> Result<serde_json::Value, ApiErr
             ))
         })
         .map_err(db_err)?;
-    let mut candidates = Vec::new();
+    let mut out = Vec::new();
     for row in rows {
         let (k, n, path, sb, eb, sl, sc, el, ec) = row.map_err(db_err)?;
         if let Some(fp) = file_path
@@ -334,23 +538,19 @@ pub fn get_symbol(input: &serde_json::Value) -> Result<serde_json::Value, ApiErr
         {
             continue;
         }
-        candidates.push((k, n, path, sb, eb, sl, sc, el, ec));
+        out.push(SymbolRow {
+            kind: source.render_kind(k),
+            name: n,
+            path,
+            sb,
+            eb,
+            sl,
+            sc,
+            el,
+            ec,
+        });
     }
-    let Some((k, n, path, sb, eb, sl, sc, el, ec)) = candidates.into_iter().next() else {
-        return Err(ApiError::not_found(format!("symbol {name:?}")));
-    };
-    let row = SymbolRow {
-        kind: symbol_kind_of(k),
-        name: n,
-        path,
-        sb,
-        eb,
-        sl,
-        sc,
-        el,
-        ec,
-    };
-    symbol_json(&row, body_root(input).as_deref())
+    Ok(out)
 }
 
 /// A file is a test file when its path carries a test/spec marker:
@@ -548,24 +748,84 @@ pub fn filter_symbols(input: &serde_json::Value) -> Result<serde_json::Value, Ap
         None => None,
     };
 
-    let mut sql = String::from(
-        "SELECT s.kind, s.name, s.start_byte, s.end_byte, s.start_line, s.start_col, s.end_line, s.end_col, f.path, f.complexity
-         FROM symbols s JOIN files f ON f.id = s.file_id WHERE 1=1",
+    // A `kind` filter selects the source(s): a declaration kind reads
+    // `entities`, binding/reference reads `symbols`, and no kind reads both.
+    let entity_kind = kind.and_then(entity_kind_to_i64);
+    let symbol_kind = kind.and_then(symbol_kind_to_i64);
+    let want_entities = kind.is_none() || entity_kind.is_some();
+    let want_symbols = kind.is_none() || symbol_kind.is_some();
+
+    let mut rows: Vec<SymbolRow> = Vec::new();
+    if want_entities {
+        rows.extend(collect_rows(
+            &conn,
+            RowSource::Entities,
+            entity_kind,
+            specific_file_id,
+            min_complexity,
+        )?);
+    }
+    if want_symbols {
+        rows.extend(collect_rows(
+            &conn,
+            RowSource::Symbols,
+            symbol_kind,
+            specific_file_id,
+            min_complexity,
+        )?);
+    }
+
+    let mut out = Vec::new();
+    for row in rows {
+        if let Some(lang) = language {
+            let file_lang = crate::parse::language_for_path(std::path::Path::new(&row.path));
+            if !matches_language_filter(file_lang, lang) {
+                continue;
+            }
+        }
+        out.push(symbol_json(&row, None)?);
+        if let Some(cap) = max_symbols
+            && out.len() as i64 >= cap
+        {
+            break;
+        }
+    }
+    Ok(serde_json::json!(out))
+}
+
+/// Rows from `source` matching the `filter_symbols` predicates: an optional
+/// specific `kind` discriminant (else the source's default kind restriction),
+/// an optional `file_id`, and an optional minimum file complexity. Ordering is
+/// by row id within the source, matching the pre-union behavior.
+fn collect_rows(
+    conn: &Connection,
+    source: RowSource,
+    kind_int: Option<i64>,
+    specific_file_id: Option<i64>,
+    min_complexity: Option<i64>,
+) -> std::result::Result<Vec<SymbolRow>, ApiError> {
+    let mut sql = format!(
+        "SELECT t.kind, t.name, t.start_byte, t.end_byte, t.start_line, t.start_col, t.end_line, t.end_col, f.path
+         FROM {} t JOIN files f ON f.id = t.file_id WHERE 1=1",
+        source.table()
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    if let Some(k) = kind {
-        sql.push_str(" AND s.kind = ?");
-        params.push(Box::new(symbol_kind_to_i64(k).unwrap_or(-1)));
+    match kind_int {
+        Some(k) => {
+            sql.push_str(" AND t.kind = ?");
+            params.push(Box::new(k));
+        }
+        None => sql.push_str(&source.default_kind_filter()),
     }
     if let Some(fid) = specific_file_id {
-        sql.push_str(" AND s.file_id = ?");
+        sql.push_str(" AND t.file_id = ?");
         params.push(Box::new(fid));
     }
     if let Some(mc) = min_complexity {
         sql.push_str(" AND COALESCE(f.complexity, 0) >= ?");
         params.push(Box::new(mc));
     }
-    sql.push_str(" ORDER BY s.id");
+    sql.push_str(" ORDER BY t.id");
 
     let mut stmt = conn.prepare(&sql).map_err(db_err)?;
     let rows = stmt
@@ -582,23 +842,15 @@ pub fn filter_symbols(input: &serde_json::Value) -> Result<serde_json::Value, Ap
                     r.get::<_, i64>(6)?,
                     r.get::<_, i64>(7)?,
                     r.get::<_, String>(8)?,
-                    r.get::<_, Option<i64>>(9)?,
                 ))
             },
         )
         .map_err(db_err)?;
-
     let mut out = Vec::new();
     for row in rows {
-        let (k, n, sb, eb, sl, sc, el, ec, path, _complexity) = row.map_err(db_err)?;
-        if let Some(lang) = language {
-            let file_lang = crate::parse::language_for_path(std::path::Path::new(&path));
-            if !matches_language_filter(file_lang, lang) {
-                continue;
-            }
-        }
-        let symbol_row = SymbolRow {
-            kind: symbol_kind_of(k),
+        let (k, n, sb, eb, sl, sc, el, ec, path) = row.map_err(db_err)?;
+        out.push(SymbolRow {
+            kind: source.render_kind(k),
             name: n,
             path,
             sb,
@@ -607,15 +859,9 @@ pub fn filter_symbols(input: &serde_json::Value) -> Result<serde_json::Value, Ap
             sc,
             el,
             ec,
-        };
-        out.push(symbol_json(&symbol_row, None)?);
-        if let Some(cap) = max_symbols
-            && out.len() as i64 >= cap
-        {
-            break;
-        }
+        });
     }
-    Ok(serde_json::json!(out))
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -647,6 +893,72 @@ mod build_on_read_tests {
             .iter()
             .filter_map(|s| s.get("name").and_then(|n| n.as_str()).map(String::from))
             .collect()
+    }
+
+    /// Declarations (class/method/etc.) live in the `entities` table, not
+    /// `symbols`. Regression test for the bug where `symbols_in_file`,
+    /// `get_symbol`, and `filter_symbols` only read `symbols` and so returned
+    /// zero declarations — only references. All three must now surface the
+    /// declaration a caller expects.
+    #[test]
+    fn symbol_modes_return_declarations_not_just_references() {
+        with_isolated_home("bor", "declarations", || {
+            let root = temp_root("declarations");
+            let file = root.join("a.ts");
+            std::fs::write(
+                &file,
+                "export class Widget {\n  render() { return 1; }\n}\n",
+            )
+            .expect("write a.ts");
+
+            let base = serde_json::json!({
+                "repoRoot": root.to_str().unwrap(),
+                "filePath": file.to_str().unwrap(),
+            });
+
+            // symbols_in_file surfaces the class + method declarations, each
+            // rendered with its entity kind (not "reference").
+            let in_file = symbols_in_file(&base).expect("builds and answers");
+            let arr = in_file.as_array().expect("array");
+            assert!(
+                arr.iter()
+                    .any(|s| s["name"] == "Widget" && s["kind"] == "class"),
+                "Widget class decl present: {in_file}"
+            );
+            assert!(
+                arr.iter()
+                    .any(|s| s["name"] == "render" && s["kind"] == "function"),
+                "render method decl present: {in_file}"
+            );
+
+            // get_symbol returns the declaration for a bare name lookup.
+            let got = get_symbol(&serde_json::json!({
+                "repoRoot": root.to_str().unwrap(),
+                "name": "Widget",
+            }))
+            .expect("get_symbol finds the declaration");
+            assert_eq!(got["kind"], "class");
+            assert_eq!(got["name"], "Widget");
+
+            // filter_symbols kind:"class" now matches the declaration (was 0).
+            let classes = filter_symbols(&serde_json::json!({
+                "repoRoot": root.to_str().unwrap(),
+                "kind": "class",
+            }))
+            .expect("filter_symbols answers");
+            assert!(
+                classes
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .any(|s| s["name"] == "Widget"),
+                "class filter surfaces Widget: {classes}"
+            );
+
+            let db = crate::db::path::repo_db_path(&root);
+            let _ = std::fs::remove_file(&db);
+            let _ = std::fs::remove_dir_all(&root);
+        });
     }
 
     #[test]

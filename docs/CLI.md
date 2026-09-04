@@ -43,7 +43,7 @@ Each takes `--json '<object>'`; fields shown are in addition to
 | `dependencies` | `filePath`, `direction?`, `maxDepth?` | Files a file depends on |
 | `dependents` | `filePath`, `maxDepth?` | Files depending on a file |
 | `tests_for_file` | `filePath` | Test files covering a file |
-| `hotspots` | — | Risk hotspots ranked by complexity + churn |
+| `hotspots` | — | Risk hotspots ranked by complexity × churn (falls back to complexity alone when no file has churn) |
 | `clusters` | `minSize?`, `maxClusters?`, `seedPath?` | Community-detection (Louvain) partition of the resolution graph into densely-interconnected file clusters; each `{id, files, label, cohesion}` (`label` always `null`, `cohesion` is the fraction of touching edges kept inside). `seedPath` returns only the cluster containing that file |
 | `context_pack` | `query` | Keyword-driven context bundle: files/symbols whose paths, directory names, or symbol names match `query` (exact/substring), plus their one-hop dependency neighbors, ranked by complexity+churn, with covering tests and a `readingOrder`. Structural only — no doc corpus, no semantic search |
 | `nav_map` | — (plus `--format json\|text`) | Session-start repo orientation map: entrypoints, foundational files, module layers, subsystems, symbols, flows, and hotspots assembled from the persisted index. JSON is canonical; `--format text` renders the same data as plain text |

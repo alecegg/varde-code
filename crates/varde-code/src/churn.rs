@@ -137,8 +137,19 @@ fn repo_root(dir: &Path) -> Option<PathBuf> {
 /// counting how many commits touched each root-relative path.
 fn commit_counts_for_root(root: &Path) -> HashMap<String, u32> {
     let mut counts = HashMap::new();
+    // `-c core.quotepath=false`: without it git octal-escapes and quotes any
+    // path with non-ASCII/special bytes (e.g. `"src/caf\303\251.rs"`), which
+    // never matches the un-quoted indexed path and silently yields churn=0 for
+    // those files. Disabling quotepath emits the raw UTF-8 path verbatim.
     let Some(text) = crate::git::run_git(
-        &["log", "--name-only", "--pretty=format:", CHURN_WINDOW],
+        &[
+            "-c",
+            "core.quotepath=false",
+            "log",
+            "--name-only",
+            "--pretty=format:",
+            CHURN_WINDOW,
+        ],
         root,
     ) else {
         return counts;
@@ -165,9 +176,18 @@ pub fn commit_count(file: &str) -> u32 {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| Path::new(".").to_path_buf());
 
-    let Some(text) =
-        crate::git::run_git(&["log", "--pretty=oneline", CHURN_WINDOW, "--", file], &dir)
-    else {
+    let Some(text) = crate::git::run_git(
+        &[
+            "-c",
+            "core.quotepath=false",
+            "log",
+            "--pretty=oneline",
+            CHURN_WINDOW,
+            "--",
+            file,
+        ],
+        &dir,
+    ) else {
         // Not a repo, no git, or the command errored: treat as zero churn.
         return 0;
     };
@@ -236,6 +256,36 @@ mod git_log_known_history_matches_expected {
         let file = dir.join("lonely.txt");
         std::fs::write(&file, "no repo here").expect("writes");
         assert_eq!(commit_count(&file.to_string_lossy()), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: without `core.quotepath=false`, git emits a non-ASCII path
+    /// octal-escaped and quoted (`"caf\303\251.rs"`), so the batch counts are
+    /// keyed by that quoted string and never match the real UTF-8 path — the
+    /// file silently gets churn 0. The batch walk must key counts by the raw
+    /// `café.rs` path.
+    #[test]
+    fn non_ascii_path_is_counted_unquoted() {
+        let dir =
+            std::env::temp_dir().join(format!("varde-churn-unicode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir creates");
+        run(&dir, &["init", "-q"]);
+        run(&dir, &["config", "user.email", "test@example.com"]);
+        run(&dir, &["config", "user.name", "Churn Test"]);
+        let name = "café.rs";
+        let file = dir.join(name);
+        for i in 0..2 {
+            std::fs::write(&file, format!("rev {i}\n")).expect("writes");
+            run(&dir, &["add", "--", name]);
+            run(&dir, &["commit", "-q", "-m", &format!("c{i}")]);
+        }
+        let counts = commit_counts_for_root(&dir);
+        assert_eq!(
+            counts.get(name),
+            Some(&2),
+            "unquoted UTF-8 path is the count key: {counts:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

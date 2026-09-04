@@ -453,7 +453,7 @@ mod hotspots_mode {
     use super::*;
 
     #[test]
-    fn orders_by_descending_complexity_plus_churn() {
+    fn orders_by_descending_complexity_times_churn() {
         let repo = temp_dir("hot-repo");
         git_init(&repo);
 
@@ -529,11 +529,11 @@ mod hotspots_mode {
         let b_name = second["file"].as_str().unwrap();
         assert!(a_name.ends_with("hot_a.rs"), "hot_a first: {env}");
         assert!(b_name.ends_with("hot_b.rs"), "hot_b second: {env}");
-        // hot_a: complexity 3 + churn 2 = 5; hot_b: 1 + 1 = 2.
+        // hot_a: complexity 3 * churn 2 = 6; hot_b: 1 * 1 = 1.
         assert_eq!(first["complexity"], 3, "{env}");
         assert_eq!(first["churn"], 2, "{env}");
-        assert_eq!(first["score"], 5, "{env}");
-        assert_eq!(second["score"], 2, "{env}");
+        assert_eq!(first["score"], 6, "{env}");
+        assert_eq!(second["score"], 1, "{env}");
     }
 
     #[test]

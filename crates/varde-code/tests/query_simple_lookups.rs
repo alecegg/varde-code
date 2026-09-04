@@ -145,9 +145,30 @@ mod symbols_in_file {
 
         let result = data("symbols_in_file", &db, &format!(r#""filePath":"{a_rs}""#));
         let arr = result.as_array().expect("data is an array");
-        // Every symbol from a.rs in the loaded project is listed.
-        let expected: Vec<&Symbol> = symbols.iter().filter(|s| s.file_id == a_rs_id).collect();
-        assert_eq!(arr.len(), expected.len(), "result: {result}");
+        // symbols_in_file returns declaration entities (class/function/interface/
+        // variable/parameter) followed by the binding/reference symbols — both
+        // must be present and the count is exactly their sum.
+        use varde_code::model::EntityKind;
+        let expected_decls: Vec<&Entity> = entities
+            .iter()
+            .filter(|e| {
+                e.file_id == a_rs_id
+                    && matches!(
+                        e.kind,
+                        EntityKind::Function
+                            | EntityKind::Class
+                            | EntityKind::Interface
+                            | EntityKind::Variable
+                            | EntityKind::Parameter
+                    )
+            })
+            .collect();
+        let expected_syms: Vec<&Symbol> = symbols.iter().filter(|s| s.file_id == a_rs_id).collect();
+        assert_eq!(
+            arr.len(),
+            expected_decls.len() + expected_syms.len(),
+            "result: {result}"
+        );
         for item in arr {
             assert!(item["name"].is_string());
             assert!(item["kind"].is_string());
@@ -158,8 +179,15 @@ mod symbols_in_file {
             .iter()
             .map(|i| i["name"].as_str().unwrap().to_string())
             .collect();
-        for sym in &expected {
+        for sym in &expected_syms {
             assert!(names.contains(&sym.name), "missing symbol {}", sym.name);
+        }
+        for decl in &expected_decls {
+            assert!(
+                names.contains(&decl.name),
+                "missing declaration {}",
+                decl.name
+            );
         }
     }
 

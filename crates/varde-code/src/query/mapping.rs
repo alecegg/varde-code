@@ -384,11 +384,12 @@ fn repo_root_of(db_path: &std::path::Path) -> Option<std::path::PathBuf> {
     }
 }
 
-/// hotspots — files ranked by descending complexity + churn.
+/// hotspots — files ranked by descending `complexity * churn`.
 ///
 /// Inputs: none (repoRoot/dbPath only). Output: array of
-/// `{file, complexity, churn, score}` sorted by `score` (complexity + churn)
-/// descending, ties broken by path.
+/// `{file, complexity, churn, score}` sorted by `score` (`complexity * churn`,
+/// or `complexity` alone when no file has any churn) descending, ties broken by
+/// path.
 pub fn hotspots(input: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
     freshen_for_mode("hotspots", input)?;
     let conn = open_db(input)?;
@@ -412,16 +413,31 @@ pub fn hotspots_on(conn: &Connection) -> Result<serde_json::Value, ApiError> {
             ))
         })
         .map_err(db_err)?;
-    let mut hotspots: Vec<(String, i64, i64, i64)> = Vec::new();
+    let mut files: Vec<(String, i64, i64)> = Vec::new();
     for row in rows {
         let (path, complexity, churn) = row.map_err(db_err)?;
         if is_generated_or_vendored_path(&path) {
             continue;
         }
-        let c = complexity.unwrap_or(0);
-        let ch = churn.unwrap_or(0);
-        hotspots.push((path, c, ch, c + ch));
+        files.push((path, complexity.unwrap_or(0), churn.unwrap_or(0)));
     }
+    // Multiplicative score (Tornhill): a hotspot is a file that is *both*
+    // complex and frequently changed, so a complex-but-stable file (churn 0)
+    // scores 0 and a churny-but-simple file scores low. An additive
+    // `complexity + churn` is dominated by whichever term is larger — with
+    // complexity in the hundreds and churn a handful, churn barely moved the
+    // ranking, collapsing it to a plain complexity sort. Fallback: when no file
+    // has any churn (non-git repo, or nothing changed in the churn window),
+    // `complexity * 0` would zero every score and sort by path only, so rank by
+    // complexity alone instead — the best signal still available.
+    let any_churn = files.iter().any(|(_, _, ch)| *ch > 0);
+    let mut hotspots: Vec<(String, i64, i64, i64)> = files
+        .into_iter()
+        .map(|(path, c, ch)| {
+            let score = if any_churn { c * ch } else { c };
+            (path, c, ch, score)
+        })
+        .collect();
     hotspots.sort_by(|a, b| {
         b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)) // score desc, path asc
     });
@@ -780,6 +796,71 @@ mod tests {
         assert_eq!(
             pairs(&changes),
             vec![("duplicate".into(), "modified".into())]
+        );
+    }
+
+    /// Minimal `files` table for exercising [`super::hotspots_on`] directly.
+    fn files_db(rows: &[(&str, i64, i64)]) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT, complexity INTEGER, churn INTEGER);",
+        )
+        .expect("schema");
+        for (path, complexity, churn) in rows {
+            conn.execute(
+                "INSERT INTO files (path, complexity, churn) VALUES (?1, ?2, ?3)",
+                rusqlite::params![path, complexity, churn],
+            )
+            .expect("insert");
+        }
+        conn
+    }
+
+    fn hotspot_scores(out: &serde_json::Value) -> Vec<(String, i64)> {
+        out.as_array()
+            .expect("array")
+            .iter()
+            .map(|h| {
+                (
+                    h["file"].as_str().unwrap().to_string(),
+                    h["score"].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hotspots_score_is_multiplicative() {
+        // A complex-but-stable file (churn 0) must NOT outrank a moderately
+        // complex, frequently-changed one — the whole point of a hotspot. Under
+        // the old additive `complexity + churn`, the churn=0 file (300) would
+        // beat the churn=3 file (100+3=103); multiplicatively it scores 0.
+        let conn = files_db(&[
+            ("src/complex_stable.rs", 300, 0),
+            ("src/complex_churny.rs", 100, 3),
+            ("src/simple_churny.rs", 10, 5),
+        ]);
+        let scores = hotspot_scores(&super::hotspots_on(&conn).expect("hotspots"));
+        assert_eq!(
+            scores,
+            vec![
+                ("src/complex_churny.rs".to_string(), 300), // 100 * 3
+                ("src/simple_churny.rs".to_string(), 50),   // 10 * 5
+                ("src/complex_stable.rs".to_string(), 0),   // 300 * 0
+            ]
+        );
+    }
+
+    #[test]
+    fn hotspots_falls_back_to_complexity_when_no_churn() {
+        // Non-git repo / empty churn window: every churn is 0, so a pure
+        // multiplicative score would zero out and collapse to path order.
+        // Fall back to ranking by complexity so the mode stays useful.
+        let conn = files_db(&[("src/a.rs", 30, 0), ("src/b.rs", 200, 0)]);
+        let scores = hotspot_scores(&super::hotspots_on(&conn).expect("hotspots"));
+        assert_eq!(
+            scores,
+            vec![("src/b.rs".to_string(), 200), ("src/a.rs".to_string(), 30)]
         );
     }
 }
