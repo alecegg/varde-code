@@ -128,17 +128,53 @@ fn run_sql_rule(rule: &Rule, conn: &Connection) -> Result<Vec<Finding>, Diagnost
         ));
     };
 
+    // Optional precise-span columns. A rule that selects these (typically its
+    // anchor entity's `start_byte`/`end_col`/…) gets a finding with a real
+    // byte/column span instead of the line-only fallback. They are treated as
+    // location columns — recognized here so they don't leak into `evidence`
+    // (and thus into `{placeholder}` message rendering). Absent, the span
+    // degrades to `start_line == end_line == line` with zero byte/col, exactly
+    // as before this was added.
+    let col_of = |name: &str| column_names.iter().position(|c| c == name);
+    let start_byte_col = col_of("start_byte");
+    let end_byte_col = col_of("end_byte");
+    let start_col_col = col_of("start_col");
+    let end_line_col = col_of("end_line");
+    let end_col_col = col_of("end_col");
+    let is_location = |index: usize| {
+        index == file_col
+            || index == line_col
+            || Some(index) == start_byte_col
+            || Some(index) == end_byte_col
+            || Some(index) == start_col_col
+            || Some(index) == end_line_col
+            || Some(index) == end_col_col
+    };
+
     let rows = match stmt.query_map(bound.as_slice(), |row| {
         let file: String = row.get(file_col)?;
         let line: i64 = row.get(line_col)?;
+        let opt = |c: Option<usize>| -> rusqlite::Result<Option<i64>> {
+            match c {
+                Some(i) => row.get::<_, Option<i64>>(i),
+                None => Ok(None),
+            }
+        };
+        let span_cols = (
+            opt(start_byte_col)?,
+            opt(end_byte_col)?,
+            opt(start_col_col)?,
+            opt(end_line_col)?,
+            opt(end_col_col)?,
+        );
         let mut evidence = serde_json::Map::new();
         for (index, name) in column_names.iter().enumerate() {
-            if index == file_col || index == line_col {
+            if is_location(index) {
                 continue;
             }
             evidence.insert(name.clone(), value_ref_to_json(row.get_ref(index)?));
         }
-        Ok((file, line, evidence))
+        Ok((file, line, span_cols, evidence))
     }) {
         Ok(rows) => rows,
         Err(e) => return Err(diag(format!("SQL execution failed: {e}"))),
@@ -146,17 +182,21 @@ fn run_sql_rule(rule: &Rule, conn: &Connection) -> Result<Vec<Finding>, Diagnost
 
     let mut findings = Vec::new();
     for row in rows {
-        let (file, line, evidence) = match row {
+        let (file, line, span_cols, evidence) = match row {
             Ok(row) => row,
             Err(e) => return Err(diag(format!("SQL row mapping failed: {e}"))),
         };
+        let (start_byte, end_byte, start_col, end_line, end_col) = span_cols;
+        let u32_or =
+            |v: Option<i64>, default: u32| v.map(crate::model::saturating_u32).unwrap_or(default);
+        let line_u32 = crate::model::saturating_u32(line);
         let span = crate::model::Span {
-            start_byte: 0,
-            end_byte: 0,
-            start_line: crate::model::saturating_u32(line),
-            start_col: 0,
-            end_line: crate::model::saturating_u32(line),
-            end_col: 0,
+            start_byte: u32_or(start_byte, 0),
+            end_byte: u32_or(end_byte, 0),
+            start_line: line_u32,
+            start_col: u32_or(start_col, 0),
+            end_line: u32_or(end_line, line_u32),
+            end_col: u32_or(end_col, 0),
         };
         let id = finding_id(&rule.id, &file, &span);
         let message = render_message(&rule.message, &evidence);

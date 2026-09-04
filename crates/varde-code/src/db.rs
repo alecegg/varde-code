@@ -33,7 +33,10 @@ pub mod path;
 ///
 /// - v12: `graph_cache.blob` re-encoded with `postcard` (was `bincode`);
 ///   forces old caches to rebuild rather than be misread by the new decoder.
-pub const SCHEMA_VERSION: i64 = 12;
+/// - v13: `is_test_path` recognizes C#/.NET conventions (`*Test.cs`/
+///   `*Tests.cs` files and `*.Test`/`*.Tests`/`*.UnitTests`/… project dirs);
+///   the generated column is STORED, so old DBs must rebuild to recompute it.
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// All tables in the schema, in a deterministic drop order (junction tables
 /// before the tables they reference, so `DROP TABLE IF EXISTS` never trips a
@@ -88,6 +91,16 @@ CREATE TABLE files (
         -- `test/`-segment directory (e.g. flat single-module layouts).
         OR path LIKE '%Test.java' OR path LIKE '%Tests.java'
         OR path LIKE '%Test.kt' OR path LIKE '%Tests.kt'
+        -- C#/.NET convention: `FooTests.cs` files, plus the dominant .NET
+        -- solution layout of a separate `<Project>.Tests` test project. The
+        -- `.Tests/` directory segment isn't caught by `%/tests/%` above
+        -- (the separator before `Tests` is `.`, not `/`), so match the
+        -- `.<suffix>/` project-dir forms explicitly. Bounding with the `.`
+        -- avoids false hits like `Contests/` that a bare `%Tests/%` would take.
+        OR path LIKE '%Test.cs' OR path LIKE '%Tests.cs'
+        OR path LIKE '%.Test/%' OR path LIKE '%.Tests/%'
+        OR path LIKE '%.UnitTests/%' OR path LIKE '%.IntegrationTests/%'
+        OR path LIKE '%.FunctionalTests/%' OR path LIKE '%.AcceptanceTests/%'
     ) STORED,
     -- Non-test tooling that legitimately behaves differently from shipped
     -- production code: benchmark harnesses, build/dev scripts, and docs
@@ -367,6 +380,49 @@ mod schema_scaffold {
     }
 
     #[test]
+    fn is_test_path_recognizes_csharp_and_dotnet_conventions() {
+        let dir =
+            std::env::temp_dir().join(format!("varde-schema-{}-testpath", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir creates");
+        let db_path = dir.join("tp.db");
+        let _ = std::fs::remove_file(&db_path);
+        let conn = open_or_rebuild(&db_path).expect("open succeeds");
+
+        let cases: &[(&str, bool)] = &[
+            // .NET test-project layout + `*Tests.cs` suffix (the Newtonsoft
+            // shape that was slipping through and getting smell-flagged).
+            ("/repo/Src/Newtonsoft.Json.Tests/BsonReaderTests.cs", true),
+            ("/repo/src/App.UnitTests/Helpers.cs", true),
+            ("/repo/src/Foo.IntegrationTests/Bar.cs", true),
+            ("/repo/src/Widget.Test/WidgetTest.cs", true),
+            // Production C# must NOT be flagged, including tricky near-misses
+            // a bare `%Tests/%` would wrongly catch.
+            ("/repo/Src/Newtonsoft.Json/JsonReader.cs", false),
+            ("/repo/src/Contests/Leaderboard.cs", false),
+            ("/repo/src/GreatestHits.cs", false),
+        ];
+        let mut insert = conn
+            .prepare("INSERT INTO files (path) VALUES (?1)")
+            .expect("prepare insert");
+        for (path, _) in cases {
+            insert
+                .execute(rusqlite::params![path])
+                .unwrap_or_else(|e| panic!("insert {path}: {e}"));
+        }
+        for (path, expected) in cases {
+            let got: bool = conn
+                .query_row(
+                    "SELECT is_test_path FROM files WHERE path = ?1",
+                    rusqlite::params![path],
+                    |r| r.get(0),
+                )
+                .expect("read is_test_path");
+            assert_eq!(got, *expected, "is_test_path for {path}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn fresh_path_creates_all_tables_and_indexes() {
         let dir = std::env::temp_dir().join(format!("varde-schema-{}-fresh", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir creates");
@@ -454,8 +510,8 @@ mod schema_scaffold {
             SCHEMA_VERSION
         );
         assert_eq!(
-            SCHEMA_VERSION, 12,
-            "schema version bumped for the postcard graph_cache blob re-encoding"
+            SCHEMA_VERSION, 13,
+            "schema version bumped for C#/.NET is_test_path recognition"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

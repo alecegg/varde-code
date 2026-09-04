@@ -48,8 +48,11 @@ remediation = "ensure the implementing class fulfills the full contract of the i
 agent_instructions = "Verify whether the class intentionally implements a subset of the interface (e.g. a partial adapter) or inadvertently violates the contract. Required methods are approximated as single-line (no-body) interface method declarations; methods with a default/provided body are excluded."
 thresholds = { coverage_threshold = 0.7 }
 query = """
-SELECT file, line, class_name, interface_name, class_methods, iface_methods, threshold FROM (
+SELECT file, line, start_byte, end_byte, start_col, end_line, end_col,
+  class_name, interface_name, class_methods, iface_methods, threshold FROM (
   SELECT f.path AS file, imp.start_line AS line,
+    imp.start_byte AS start_byte, imp.end_byte AS end_byte, imp.start_col AS start_col,
+    imp.end_line AS end_line, imp.end_col AS end_col,
     imp.enclosing_function AS class_name, imp.name AS interface_name,
     (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.name
        AND m.end_line = m.start_line
@@ -78,13 +81,30 @@ remediation = "consider splitting the fat interface into smaller, focused interf
 agent_instructions = "Confirm whether the empty stub methods represent unused interface members (ISP violation) or intentional no-ops. Check if multiple smaller interfaces would better model the different client needs."
 thresholds = { method_threshold = 7, empty_body_threshold = 0.3 }
 query = """
-SELECT file, line, class_name, interface_name, iface_method_count, class_methods, empty_stubs, threshold FROM (
+SELECT file, line, start_byte, end_byte, start_col, end_line, end_col,
+  class_name, interface_name, iface_method_count, class_methods, empty_stubs, threshold FROM (
   SELECT f.path AS file, imp.start_line AS line,
+    imp.start_byte AS start_byte, imp.end_byte AS end_byte, imp.start_col AS start_col,
+    imp.end_line AS end_line, imp.end_col AS end_col,
     imp.enclosing_function AS class_name, imp.name AS interface_name,
     (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.name) AS iface_method_count,
     (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.enclosing_function) AS class_methods,
+    -- Empty-stub count: short (<=2 line) methods that ALSO contain no call.
+    -- The line-span alone can't tell a genuine no-op (`void Foo() {}`) from a
+    -- one-line *delegation* (`int Foo() => _inner.Foo();`) or a concise
+    -- forwarding body — both are one line, but the delegation does real work.
+    -- A delegation always contains a Call entity (kind 6) within its byte
+    -- span; a true empty stub does not. Requiring "no contained call" excludes
+    -- the delegation false positive (and also `throw new NotImplementedException()`
+    -- stubs, whose `new` is a call — an acceptable, conservative trade that
+    -- only lowers the count).
     (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.enclosing_function
-       AND (m.end_line - m.start_line + 1) <= 2) AS empty_stubs,
+       AND (m.end_line - m.start_line + 1) <= 2
+       AND NOT EXISTS (
+         SELECT 1 FROM entities call
+         WHERE call.kind = 6 AND call.file_id = m.file_id
+           AND call.start_byte >= m.start_byte AND call.end_byte <= m.end_byte
+       )) AS empty_stubs,
     :empty_body_threshold AS threshold
   FROM entities imp
   JOIN files f ON f.id = imp.file_id
@@ -119,14 +139,26 @@ message = "'{class_name}' declares {member_count} methods, exceeding threshold o
 remediation = "consider splitting the class or interface into smaller, focused types"
 thresholds = { max_members = 15 }
 query = """
-SELECT file, line, class_name, member_count, threshold FROM (
-  SELECT f.path AS file, c.start_line AS line, c.name AS class_name,
+SELECT file, line, start_byte, end_byte, start_col, end_line, end_col,
+  class_name, member_count, threshold FROM (
+  SELECT f.path AS file, c.start_line AS line,
+    c.start_byte AS start_byte, c.end_byte AS end_byte, c.start_col AS start_col,
+    c.end_line AS end_line, c.end_col AS end_col,
+    c.name AS class_name,
     (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = c.name) AS member_count,
     :max_members AS threshold
   FROM entities c
   JOIN files f ON f.id = c.file_id
   WHERE c.kind IN (1, 2) AND f.is_test_path = 0
     AND c.name NOT LIKE '%Builder' AND c.name NOT LIKE '%Facade'
+    -- .NET DI-registration classes: a `DependencyInjection` class or an
+    -- `*Extensions` static class (the `IServiceCollection.AddX` idiom), and
+    -- container installers/registrars, earn a high method count by design —
+    -- each method registers one service, not an independent responsibility.
+    -- Same false-positive shape as *Builder/*Facade above.
+    AND c.name NOT LIKE '%Extensions'
+    AND c.name <> 'DependencyInjection'
+    AND c.name NOT LIKE '%Installer' AND c.name NOT LIKE '%Registrar'
 )
 WHERE member_count > threshold
 """
@@ -190,7 +222,10 @@ WITH RECURSIVE ancestry(start_id, start_file_id, current_name, depth, visited) A
   JOIN entities e ON e.kind = 15 AND e.enclosing_function = a.current_name
   WHERE instr(a.visited, '/' || e.name || '/') = 0
 )
-SELECT f.path AS file, c.start_line AS line, c.name AS class_name,
+SELECT f.path AS file, c.start_line AS line,
+  c.start_byte AS start_byte, c.end_byte AS end_byte, c.start_col AS start_col,
+  c.end_line AS end_line, c.end_col AS end_col,
+  c.name AS class_name,
   MAX(a.depth) AS chain_depth, :max_depth AS threshold
 FROM ancestry a
 JOIN entities c ON c.id = a.start_id
