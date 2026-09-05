@@ -42,7 +42,10 @@ pub mod path;
 /// - v15: extraction emits `EntityKind::TypeRef` rows (a field/param/local's
 ///   declared type) that type-directed call resolution reads; force a rebuild
 ///   so existing indexes gain them instead of resolving with partial data.
-pub const SCHEMA_VERSION: i64 = 15;
+/// - v16: `is_test_path` recognizes Rust file-based unit-test submodules
+///   (`test.rs`/`tests.rs` beside the code, not under a `test/` dir); the
+///   generated column is STORED, so old DBs must rebuild to recompute it.
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// All tables in the schema, in a deterministic drop order (junction tables
 /// before the tables they reference, so `DROP TABLE IF EXISTS` never trips a
@@ -129,6 +132,15 @@ CREATE TABLE files (
         -- outside the usual `spec/`/`test/` dirs (already caught above). The
         -- escaped `_` keeps `latest.rb` out.
         OR path LIKE '%\_spec.rb' ESCAPE '\' OR path LIKE '%\_test.rb' ESCAPE '\'
+        -- Rust convention: a unit-test submodule extracted to its own file is
+        -- named `test.rs` / `tests.rs` (declared `mod test;` / `mod tests;`),
+        -- sitting beside the code it tests rather than under a `test/`-segment
+        -- dir. The `/test/%` rule above only catches a *directory* named test,
+        -- so a *file* `.../foo/test.rs` slips through. The `/` anchor before
+        -- `test.rs`/`tests.rs` keeps production files like `latest.rs` /
+        -- `contest.rs` / `test_utils.rs` out.
+        OR path LIKE '%/test.rs' OR path LIKE '%/tests.rs'
+        OR path LIKE 'test.rs' OR path LIKE 'tests.rs'
     ) STORED,
     -- Non-test tooling that legitimately behaves differently from shipped
     -- production code: benchmark harnesses, build/dev scripts, and docs
@@ -550,6 +562,53 @@ mod schema_scaffold {
     }
 
     #[test]
+    fn is_test_path_recognizes_rust_file_module_conventions() {
+        let dir =
+            std::env::temp_dir().join(format!("varde-schema-{}-testpath-rs", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir creates");
+        let db_path = dir.join("tp_rs.db");
+        let _ = std::fs::remove_file(&db_path);
+        let conn = open_or_rebuild(&db_path).expect("open succeeds");
+
+        let cases: &[(&str, bool)] = &[
+            // Rust file-based unit-test submodule: `mod test;` / `mod tests;`
+            // extracted to a sibling `test.rs`/`tests.rs`, beside the code it
+            // tests rather than under a `test/`-segment dir (the `/test/`
+            // rule matches a *directory* named test, not a *file* test.rs).
+            ("/repo/src/print/colored_print/test.rs", true),
+            ("/repo/src/core/matcher/tests.rs", true),
+            // Production Rust files that merely end in "test" must stay clean:
+            // the `/` anchor before `test.rs` keeps these out.
+            ("/repo/src/latest.rs", false),
+            ("/repo/src/fastest.rs", false),
+            ("/repo/src/contest.rs", false),
+            ("/repo/src/matcher.rs", false),
+            // A production module literally named after the "test" domain but
+            // with more suffix is unaffected (only exact test.rs/tests.rs).
+            ("/repo/src/test_utils.rs", false),
+        ];
+        let mut insert = conn
+            .prepare("INSERT INTO files (path) VALUES (?1)")
+            .expect("prepare insert");
+        for (path, _) in cases {
+            insert
+                .execute(rusqlite::params![path])
+                .unwrap_or_else(|e| panic!("insert {path}: {e}"));
+        }
+        for (path, expected) in cases {
+            let got: bool = conn
+                .query_row(
+                    "SELECT is_test_path FROM files WHERE path = ?1",
+                    rusqlite::params![path],
+                    |r| r.get(0),
+                )
+                .expect("read is_test_path");
+            assert_eq!(got, *expected, "is_test_path for {path}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn fresh_path_creates_all_tables_and_indexes() {
         let dir = std::env::temp_dir().join(format!("varde-schema-{}-fresh", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir creates");
@@ -637,8 +696,8 @@ mod schema_scaffold {
             SCHEMA_VERSION
         );
         assert_eq!(
-            SCHEMA_VERSION, 15,
-            "schema version bumped for TypeRef extraction (type-directed call resolution)"
+            SCHEMA_VERSION, 16,
+            "schema version bumped for Rust file-module is_test_path recognition"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
