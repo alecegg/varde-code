@@ -371,6 +371,51 @@ pub(crate) fn schema_version(conn: &rusqlite::Connection) -> Result<i64> {
     Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
 }
 
+/// Fingerprint of the varde-code build that produced (or is about to produce)
+/// an index, stored in `slice_meta` under `build_version`.
+///
+/// [`SCHEMA_VERSION`] only changes when the on-disk *shape* changes, and it is
+/// bumped by hand — so an extractor/resolver change that alters index *content*
+/// without touching the schema (e.g. Python methods gaining `owner_type`)
+/// leaves `SCHEMA_VERSION` untouched and the incremental build serves stale
+/// rows until some source file happens to change. This fingerprint is the
+/// automatic complement: it changes whenever the binary itself changes, so the
+/// incremental gate rebuilds after any upgrade or recompile with no version
+/// discipline required.
+///
+/// Composed from the crate version plus the running executable's size + mtime
+/// (a recompile or reinstall changes at least one). It is deterministic within
+/// a single binary — a build then an incremental build by the *same* binary
+/// hash identically, so no spurious rebuild — and differs across binaries,
+/// which is exactly when a rebuild is wanted. If the executable can't be
+/// resolved, it degrades to the crate version alone (still catches releases).
+/// Hashed with the same FNV-1a as `slice::head_fingerprint` so it fits the
+/// integer-valued `slice_meta` store.
+pub fn build_version_fingerprint() -> i64 {
+    let exe_fp = std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|meta| {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("{mtime}:{}", meta.len())
+        })
+        .unwrap_or_default();
+    let fingerprint = format!("{}:{exe_fp}", env!("CARGO_PKG_VERSION"));
+
+    // FNV-1a, matching `slice::head_fingerprint` (kept local to avoid a
+    // db -> slice layering dependency).
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in fingerprint.bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+    }
+    h as i64
+}
+
 /// Build the `entities`/`symbols`/`resolved_edges` lookup indexes.
 ///
 /// Run this after bulk-inserting `entities`, `symbols`, and `resolved_edges`

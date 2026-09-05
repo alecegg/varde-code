@@ -292,6 +292,18 @@ pub(crate) fn slice_meta_value(conn: &rusqlite::Connection, key: &str) -> Result
         .optional()?)
 }
 
+/// Whether an existing index was built by a varde-code binary compatible with
+/// the one now running, per the `build_version` fingerprint (see
+/// [`crate::db::build_version_fingerprint`]). `false` for an index that predates
+/// the fingerprint (no `build_version` row) or was built by a different binary,
+/// so the incremental build/build-on-read paths force a full rebuild rather
+/// than serving rows the current extractor would produce differently. A read
+/// error is treated as a mismatch (safe: triggers a rebuild).
+pub(crate) fn index_build_version_matches(conn: &rusqlite::Connection) -> bool {
+    slice_meta_value(conn, "build_version").ok().flatten()
+        == Some(crate::db::build_version_fingerprint())
+}
+
 /// The next monotonic revision for a raw-slice write, from the `slice_meta`
 /// counter (seeded from the current `MAX(files.rev)` so a database populated
 /// before the counter existed still continues monotonically).
@@ -1144,6 +1156,9 @@ pub fn persist(
     if profile {
         eprintln!("VARDE_PROFILE persist: write_all done at {:?}", t.elapsed());
     }
+    // Same build fingerprint the streaming full build stamps, so an index this
+    // path writes is recognized as current-binary by the incremental gate.
+    set_slice_meta_value(&tx, "build_version", crate::db::build_version_fingerprint())?;
     {
         let _span = tracing::info_span!("indexes").entered();
         crate::db::create_indexes(&tx)?;
@@ -1327,6 +1342,10 @@ pub(crate) fn persist_full_streaming(
     if let Some(root) = repo_root.to_str() {
         crate::slice::record_git_head(&tx, root)?;
     }
+    // Stamp the binary fingerprint so a later incremental build / build-on-read
+    // by a *different* varde-code binary rebuilds instead of serving rows this
+    // extractor would produce differently (see `index_build_version_matches`).
+    set_slice_meta_value(&tx, "build_version", crate::db::build_version_fingerprint())?;
     rebuild_graph_cache_full(&tx)?;
     if profile {
         eprintln!(

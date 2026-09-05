@@ -25,7 +25,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::extract::langs::role_tags::{self, RoleTag, RoleTagRule};
 use crate::model::EntityKind;
 
-use super::noise_filter::is_generated_or_vendored_path;
+use super::noise_filter::{is_generated_or_vendored_path, is_scaffold_template_path};
 use super::{ApiError, db_err};
 
 /// One detected semantic entrypoint.
@@ -203,7 +203,9 @@ pub fn detect(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
 
     let mut results = Vec::new();
     for mut candidate in candidates {
-        if is_generated_or_vendored_path(&candidate.path) {
+        if is_generated_or_vendored_path(&candidate.path)
+            || is_scaffold_template_path(&candidate.path)
+        {
             continue;
         }
 
@@ -355,7 +357,10 @@ pub fn detect_routes(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
     let mut seen = std::collections::HashSet::new();
     let mut results = Vec::new();
     for (route_id, file_id, file, method, route_path, handler) in rows {
-        if !route_is_call_based(&file) || is_generated_or_vendored_path(&file) {
+        if !route_is_call_based(&file)
+            || is_generated_or_vendored_path(&file)
+            || is_scaffold_template_path(&file)
+        {
             continue;
         }
         // A route with no path carries nothing worth surfacing.
@@ -583,6 +588,49 @@ mod semantic_entrypoint_tests {
                     .iter()
                     .any(|e| e.symbol == "ok" && e.file.ends_with("routes.py")),
                 "the non-bootstrap file's route handler must still be present: {entrypoints:?}"
+            );
+
+            let _ = std::fs::remove_file(&db);
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    /// A role-tagged handler living under a scaffold `templates/` directory is
+    /// boilerplate stamped out by a project generator, not a real entrypoint of
+    /// this repo → it is excluded, while a sibling handler outside `templates/`
+    /// is still present.
+    #[test]
+    fn semantic_entrypoint_excludes_scaffold_template_handlers() {
+        with_isolated_home("entrypoints", "scaffold-template", || {
+            let root = temp_root("scaffold-template");
+            let tmpl_dir = root.join("templates").join("crew");
+            std::fs::create_dir_all(&tmpl_dir).expect("mkdir templates/crew");
+            std::fs::write(
+                tmpl_dir.join("scaffold.py"),
+                "from flask import Flask\napp = Flask(__name__)\n\n@app.route(\"/scaffold\")\ndef scaffold():\n    return \"boilerplate\"\n",
+            )
+            .expect("write templates/crew/scaffold.py");
+            std::fs::write(
+                root.join("routes.py"),
+                "from flask import Flask\napp = Flask(__name__)\n\n@app.route(\"/ok\")\ndef ok():\n    return \"ok\"\n",
+            )
+            .expect("write routes.py");
+
+            crate::build::run_with_force(root.to_str().unwrap(), true).expect("full build");
+            let db = crate::db::path::repo_db_path(&root);
+            let conn = Connection::open(&db).expect("open db");
+
+            let entrypoints = detect(&conn).expect("detect computes");
+
+            assert!(
+                !entrypoints.iter().any(|e| e.file.contains("templates")),
+                "no handler from a scaffold templates/ dir may appear: {entrypoints:?}"
+            );
+            assert!(
+                entrypoints
+                    .iter()
+                    .any(|e| e.symbol == "ok" && e.file.ends_with("routes.py")),
+                "the non-template route handler must still be present: {entrypoints:?}"
             );
 
             let _ = std::fs::remove_file(&db);

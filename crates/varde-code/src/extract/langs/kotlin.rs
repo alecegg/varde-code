@@ -292,6 +292,18 @@ fn annotation_owner_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) ->
         .and_then(|a| first_identifier(&a))
 }
 
+/// Name of the type a `class_declaration` introduces, for `owner_type`
+/// linkage on nested methods. The Kotlin grammar exposes no `name` field on
+/// `class_declaration` (the type name is a bare `type_identifier` child), so
+/// the generic `field_name` path used by [`super::mod::type_scope_name`]
+/// returns None and would stamp an empty owner. Resolve it the same way the
+/// class entity's own name is resolved (`first_identifier`).
+pub(super) fn type_scope_name(
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+) -> Option<String> {
+    first_identifier(node)
+}
+
 /// The declaration/parameter name: the first `simple_identifier` (functions,
 /// variables, parameters) or `type_identifier` (classes/interfaces) child.
 fn first_identifier(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
@@ -481,6 +493,38 @@ mod tests {
         assert_eq!(implements.len(), 1, "entities: {entities:?}");
         assert_eq!(implements[0].name, "IFoo");
         assert_eq!(implements[0].enclosing_function.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn method_in_class_records_owning_type_and_top_level_function_does_not() {
+        // A method nested in a class must carry `owner_type` = the class name;
+        // the Kotlin grammar has no `name` field on `class_declaration` (the
+        // name is a bare `type_identifier` child), so the type-scope name must
+        // be resolved the same way the entity name is (`first_identifier`),
+        // not via the generic `field_name` path (which returned None → "").
+        let src = "class Foo {\n  fun bar() { }\n}\nfun free() { }\n";
+        let parsed = parse_source(&SupportLang::Kotlin, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        let bar = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Function && e.name == "bar")
+            .expect("method bar present");
+        assert_eq!(
+            bar.owner_type.as_deref(),
+            Some("Foo"),
+            "class method must record owning type: {entities:?}"
+        );
+
+        let free = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Function && e.name == "free")
+            .expect("top-level free present");
+        assert_eq!(
+            free.owner_type, None,
+            "top-level function must not carry an owner_type: {entities:?}"
+        );
     }
 
     #[test]

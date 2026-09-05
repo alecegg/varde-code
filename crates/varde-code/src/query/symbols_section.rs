@@ -52,7 +52,8 @@ use super::{ApiError, db_err};
 /// [`entrypoints::detect`]'s output, sorts descending by fan-in (ties broken
 /// by path then symbol name for determinism), and caps the result at
 /// `limit` entries (`None` = unbounded). Each entry is `{"file", "symbol",
-/// "count"}`.
+/// "owner", "count"}`, where `owner` is the method's owning type (from
+/// `entities.owner_type`) or `null` for a module/top-level function.
 pub fn leaderboard(
     conn: &Connection,
     entrypoint_ids: &HashSet<i64>,
@@ -61,7 +62,7 @@ pub fn leaderboard(
     let call_kind = EdgeKind::Call.as_i64();
     let mut stmt = conn
         .prepare(
-            "SELECT e.id, f.path, e.name, COUNT(re.id) AS fan_in
+            "SELECT e.id, f.path, e.name, e.owner_type, COUNT(re.id) AS fan_in
              FROM entities e
              JOIN files f ON f.id = e.file_id
              JOIN resolved_edges re
@@ -87,7 +88,8 @@ pub fn leaderboard(
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
                 ))
             },
         )
@@ -95,16 +97,20 @@ pub fn leaderboard(
 
     let mut entries = Vec::new();
     for row in rows {
-        let (entity_id, path, name, fan_in) = row.map_err(db_err)?;
+        let (entity_id, path, name, owner_type, fan_in) = row.map_err(db_err)?;
         if is_generated_or_vendored_path(&path) {
             continue;
         }
         if entrypoint_ids.contains(&entity_id) {
             continue;
         }
+        // `owner` disambiguates common method names (`on` -> owner `EventBus`);
+        // `null` for module/top-level functions and for languages that do not
+        // yet record `owner_type`.
         entries.push(serde_json::json!({
             "file": path,
             "symbol": name,
+            "owner": owner_type,
             "count": fan_in,
         }));
     }
@@ -275,6 +281,53 @@ mod symbols_section_tests {
         assert!(
             entries.iter().any(|e| e["symbol"] == "core"),
             "non-test symbol core should remain: {entries:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A method carrying `owner_type` reports it as `owner`; a top-level
+    /// function reports `owner: null`.
+    #[test]
+    fn symbols_section_reports_owner_type_when_present() {
+        let path = temp_db_path("owner-type");
+        let conn = crate::db::open_or_rebuild(&path).expect("schema creates");
+
+        let bus_file = insert_file(&conn, "src/event_bus.ts");
+        let util_file = insert_file(&conn, "src/util.ts");
+        let caller_file = insert_file(&conn, "src/main.ts");
+
+        // A method `on` owned by `EventBus`, and a free function `helper`.
+        conn.execute(
+            "INSERT INTO entities (kind, name, file_id, start_byte, end_byte, start_line, start_col, end_line, end_col, owner_type)
+             VALUES (?1, 'on', ?2, 0, 0, 0, 0, 0, 0, 'EventBus')",
+            rusqlite::params![EntityKind::Function.as_i64(), bus_file],
+        )
+        .expect("insert method entity");
+        let on_id = conn.last_insert_rowid();
+        let helper_id = insert_function(&conn, util_file, "helper");
+        let caller_id = insert_function(&conn, caller_file, "main");
+        insert_call_edge(&conn, caller_file, bus_file, caller_id, on_id);
+        insert_call_edge(&conn, caller_file, util_file, caller_id, helper_id);
+
+        let result = leaderboard(&conn, &HashSet::new(), None).expect("leaderboard computes");
+        let entries = result.as_array().expect("leaderboard is an array");
+
+        let on = entries
+            .iter()
+            .find(|e| e["symbol"] == "on")
+            .expect("method on present");
+        assert_eq!(
+            on["owner"], "EventBus",
+            "method owner must be reported: {entries:?}"
+        );
+        let helper = entries
+            .iter()
+            .find(|e| e["symbol"] == "helper")
+            .expect("helper present");
+        assert!(
+            helper["owner"].is_null(),
+            "top-level function owner must be null: {entries:?}"
         );
 
         let _ = std::fs::remove_file(&path);

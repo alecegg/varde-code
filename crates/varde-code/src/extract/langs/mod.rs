@@ -203,10 +203,16 @@ pub fn function_scopes(lang: SupportLang) -> &'static [&'static str] {
 
 /// Node kinds that introduce a named class/interface/impl-target type scope
 /// (for `Entity::owner_type` linkage on methods — see `super::entity`).
-/// Go and Python are intentionally unmapped: Go's interface satisfaction is
-/// structural (no `implements` syntax to key a scope off of) and Python's
-/// extraction doesn't emit Interface/Implements entities, so there is no
-/// class-membership consumer for either yet.
+///
+/// Two languages set `owner_type` outside this brace-nesting mechanism and so
+/// map to `&[]` here:
+/// - Go: methods are declared at file scope (`func (r Foo) Bar()`), not nested
+///   inside the type, so `go.rs` reads the receiver type off the declaration
+///   directly. (Interface satisfaction is also structural — no `implements`
+///   syntax to key a scope off of.)
+/// - Elixir: `def` and `defmodule` are both `call` kind and indistinguishable
+///   by node kind, so `elixir.rs` resolves the enclosing module by walking
+///   ancestors.
 pub fn type_scopes(lang: SupportLang) -> &'static [&'static str] {
     match lang {
         SupportLang::TypeScript => ts::TYPE_SCOPES,
@@ -220,6 +226,7 @@ pub fn type_scopes(lang: SupportLang) -> &'static [&'static str] {
         SupportLang::Kotlin => kotlin::TYPE_SCOPES,
         SupportLang::Swift => swift::TYPE_SCOPES,
         SupportLang::Php => php::TYPE_SCOPES,
+        SupportLang::Python => python::TYPE_SCOPES,
         SupportLang::Ruby => ruby::TYPE_SCOPES,
         SupportLang::Rust => rust::TYPE_SCOPES,
         SupportLang::Scala => scala::TYPE_SCOPES,
@@ -232,13 +239,16 @@ pub fn type_scopes(lang: SupportLang) -> &'static [&'static str] {
 /// Name of the type introduced by a `type_scopes` node. Defaults to the
 /// node's `name` field (covers `class_declaration`/`interface_declaration`/
 /// `protocol_declaration` uniformly); Rust's `impl_item` has no `name` field
-/// so it delegates to `rust::type_scope_name`.
+/// so it delegates to `rust::type_scope_name`, and Kotlin's `class_declaration`
+/// names its type with a bare `type_identifier` child (no `name` field) so it
+/// delegates to `kotlin::type_scope_name`.
 pub fn type_scope_name(
     lang: SupportLang,
     node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
 ) -> Option<String> {
     match lang {
         SupportLang::Rust => rust::type_scope_name(node),
+        SupportLang::Kotlin => kotlin::type_scope_name(node),
         _ => crate::extract::field_name(node),
     }
 }

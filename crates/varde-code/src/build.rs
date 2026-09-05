@@ -237,6 +237,17 @@ fn run_incremental(repo_root: &str, db_path: &Path) -> Result<BuildSummary> {
         }
     }
 
+    // A schema-compatible index built by a *different* varde-code binary can
+    // still hold rows the current extractor/resolver would produce differently
+    // (extractor changes that don't touch the schema — the exact gap
+    // `SCHEMA_VERSION` alone misses). Rebuild in full rather than layering delta
+    // rows onto stale ones. Covers an index built before this fingerprint
+    // existed (no `build_version` row), so it self-heals once on upgrade.
+    if !crate::persist::index_build_version_matches(&conn) {
+        drop(conn);
+        return run_full_while_locked(repo_root, db_path);
+    }
+
     let stored = match crate::persist::load_file_states(&conn) {
         Ok(stored)
             if stored
@@ -1041,6 +1052,57 @@ mod tests {
             )
             .expect("rebuilt hash reads");
         assert_eq!(hash.len(), 16);
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_version_mismatch_falls_back_to_full_rebuild() {
+        // An index whose schema matches but whose `build_version` was written by
+        // a different varde-code binary must be fully rebuilt — the gap
+        // `SCHEMA_VERSION` alone misses (an extractor change that doesn't touch
+        // the schema).
+        let root = temp_fixture_root("build-version-mismatch");
+        let db_path = root.with_extension("build-version-mismatch.db");
+        let source_path = root.join("main.rs");
+        std::fs::write(&source_path, "fn main() {}").expect("source writes");
+        let output =
+            crate::scan::run(root.to_str().expect("root is utf-8")).expect("initial scan succeeds");
+        let graph = crate::resolve::resolve(&output.entities, &output.symbols, &output.files)
+            .expect("initial resolve succeeds");
+        crate::persist::persist(&db_path, &[output], &graph, &root).expect("initial persist");
+
+        // Sanity: the fresh index is stamped with the current fingerprint, and
+        // the schema is current (so this test isolates the build_version gate,
+        // not the schema gate).
+        {
+            let conn = crate::db::open(&db_path).expect("db opens");
+            assert_eq!(
+                crate::db::schema_version(&conn).expect("schema reads"),
+                crate::db::SCHEMA_VERSION
+            );
+            assert!(
+                crate::persist::index_build_version_matches(&conn),
+                "fresh index must carry the current build_version"
+            );
+            // Stamp a fingerprint no running binary would produce.
+            crate::persist::set_slice_meta_value(
+                &conn,
+                "build_version",
+                crate::db::build_version_fingerprint().wrapping_add(1),
+            )
+            .expect("tamper build_version");
+        }
+
+        run_incremental(root.to_str().expect("root is utf-8"), &db_path)
+            .expect("build_version mismatch recovers through full rebuild");
+
+        let conn = crate::db::open(&db_path).expect("rebuilt db opens");
+        assert!(
+            crate::persist::index_build_version_matches(&conn),
+            "full rebuild re-stamps the current build_version"
+        );
 
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_dir_all(root);

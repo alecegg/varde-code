@@ -535,20 +535,25 @@ fn open_or_build(repo_root: &str, scope: &Scope) -> Result<rusqlite::Connection>
     // MEMORY journal: `ensure_fresh` mutates the live index in place, so its
     // transactions must roll back cleanly on error (see `db::open_incremental`).
     let conn = crate::db::open_incremental(&db_path)?;
-    match crate::db::schema_version(&conn) {
-        Ok(v) if v == crate::db::SCHEMA_VERSION => Ok(conn),
-        Ok(_) | Err(_) => {
-            // Schema mismatch on an *existing* DB means other files' rows
-            // are already populated under the old schema. A targeted
-            // per-file build here would rebuild the schema (dropping every
-            // table) and only repopulate the requested file, leaving the
-            // rest of the index falsely marked schema-fresh but empty. Only
-            // a full repo build repopulates every slice, regardless of the
-            // requesting scope.
-            drop(conn);
-            crate::build::run_full_while_locked(repo_root, &db_path)?;
-            crate::db::open_incremental(&db_path)
-        }
+    let schema_ok =
+        matches!(crate::db::schema_version(&conn), Ok(v) if v == crate::db::SCHEMA_VERSION);
+    // Also require the index to have been built by a compatible binary: a
+    // schema-compatible index from a different varde-code build can hold rows
+    // the current extractor would produce differently (see
+    // `index_build_version_matches`). Both checks share the same full-rebuild
+    // recovery below.
+    if schema_ok && crate::persist::index_build_version_matches(&conn) {
+        Ok(conn)
+    } else {
+        // Mismatch on an *existing* DB means other files' rows are already
+        // populated under the old schema / old binary. A targeted per-file
+        // build here would rebuild the schema (dropping every table) and only
+        // repopulate the requested file, leaving the rest of the index falsely
+        // marked fresh but empty. Only a full repo build repopulates every
+        // slice, regardless of the requesting scope.
+        drop(conn);
+        crate::build::run_full_while_locked(repo_root, &db_path)?;
+        crate::db::open_incremental(&db_path)
     }
 }
 
@@ -584,6 +589,14 @@ fn build_file_targeted(conn: &rusqlite::Connection, path: &str) -> Result<()> {
     crate::db::rebuild_schema(conn)?;
     let output = crate::scan::run(path)?;
     crate::persist::refresh_file_slice(conn, &output)?;
+    // Stamp the build fingerprint like a full build does, so a later
+    // build-on-read for a different file doesn't mistake this fresh targeted
+    // index for one left by an older binary and force a needless full rebuild.
+    crate::persist::set_slice_meta_value(
+        conn,
+        "build_version",
+        crate::db::build_version_fingerprint(),
+    )?;
     crate::db::create_indexes(conn)?;
     Ok(())
 }

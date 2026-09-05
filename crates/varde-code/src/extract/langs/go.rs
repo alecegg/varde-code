@@ -49,9 +49,31 @@ pub fn visit(
 ) {
     match kind {
         // ---- structural ----
-        "function_declaration" | "method_declaration" => {
+        "function_declaration" => {
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Function, name.clone(), node);
+            maybe_export(node, &name, ctx);
+        }
+        // A method's receiver type is its owning type. Go methods are declared
+        // at file scope (not nested inside the type), so the generic
+        // type-scope stack can't supply `owner_type` the way it does for
+        // brace-nested languages — read it off the `receiver` field directly
+        // and stamp it via `EntityMeta`, matching what `ctx.push` sets for
+        // is_async/is_test on a Function.
+        "method_declaration" => {
+            let name = field_name(node).unwrap_or_default();
+            ctx.out.push(entity(
+                EntityKind::Function,
+                name.clone(),
+                ctx.file_id,
+                node,
+                EntityMeta {
+                    is_async: Some(crate::extract::langs::node_is_async(node)),
+                    is_test: crate::extract::langs::node_is_test(node),
+                    owner_type: receiver_type_name(node),
+                    ..Default::default()
+                },
+            ));
             maybe_export(node, &name, ctx);
         }
         // ---- imports ----
@@ -267,6 +289,30 @@ fn embedded_field_type_names(
         .collect()
 }
 
+/// The bare type name of a `method_declaration`'s receiver, for `owner_type`
+/// linkage. The `receiver` field is a `parameter_list` holding one
+/// `parameter_declaration` whose `type` field is the receiver type —
+/// `Foo`, `*Foo` (pointer receiver), or a generic `Foo[T]`. Pointer stripping
+/// reuses [`embedded_type_name`]; a generic instantiation's `type_arguments`
+/// suffix is dropped so `Foo[T]` and `*Foo` both yield `Foo`.
+fn receiver_type_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    let receiver = node.field("receiver")?;
+    let param = receiver
+        .children()
+        .find(|c| c.kind() == "parameter_declaration")?;
+    let ty = param.field("type")?;
+    let base = if ty.kind() == "generic_type" {
+        ty.children()
+            .find(|c| c.kind() != "type_arguments")
+            .map(|c| c.text().into_owned())
+            .unwrap_or_else(|| ty.text().into_owned())
+    } else {
+        embedded_type_name(&ty)
+    };
+    let base = base.trim();
+    (!base.is_empty()).then(|| base.to_string())
+}
+
 /// Unwraps a `pointer_type` to its base type text; otherwise the node's own
 /// text (covers `type_identifier` and `qualified_type`, e.g. `pkg.Base`).
 fn embedded_type_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> String {
@@ -389,6 +435,28 @@ mod tests {
         assert!(has("GET", "/users"), "routes: {got:?}");
         assert!(has("GET", "/health"), "routes: {got:?}");
         assert!(has("*", "/legacy"), "routes: {got:?}");
+    }
+
+    #[test]
+    fn method_receiver_type_recorded_as_owner_and_plain_func_has_none() {
+        // A method's receiver type is its owning type: `func (f Foo) Bar()`
+        // -> owner_type "Foo"; a pointer receiver `func (s *Store) Save()`
+        // strips the `*` -> "Store"; a plain `func free()` has no owner.
+        let src = "package m\ntype Foo struct{}\ntype Store struct{}\nfunc (f Foo) Bar() {}\nfunc (s *Store) Save() {}\nfunc free() {}\n";
+        let parsed = parse_source(&SupportLang::Go, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+        let owner = |name: &str| {
+            entities
+                .iter()
+                .find(|e: &&Entity| e.kind == EntityKind::Function && e.name == name)
+                .unwrap_or_else(|| panic!("function {name} present: {entities:?}"))
+                .owner_type
+                .clone()
+        };
+        assert_eq!(owner("Bar").as_deref(), Some("Foo"));
+        assert_eq!(owner("Save").as_deref(), Some("Store"));
+        assert_eq!(owner("free"), None);
     }
 
     #[test]

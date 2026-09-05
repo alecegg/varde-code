@@ -17,6 +17,23 @@ use crate::resolve::Community;
 
 use super::{ApiError, db_err, open_db};
 
+/// Cap for the nav_map `hotspots` section. nav_map is a session-start
+/// orientation summary, so it surfaces the top risk hotspots rather than the
+/// full ranked list (the standalone `hotspots` mode stays unbounded). Without
+/// a cap this section listed every source file — 917 rows on a reference repo.
+const HOTSPOTS_SECTION_LIMIT: usize = 50;
+
+/// Cap for the nav_map `foundational_files` section, same orientation-summary
+/// rationale as [`HOTSPOTS_SECTION_LIMIT`]: surface the most-depended-on files,
+/// not the full fan-in leaderboard (562 rows on a reference repo). The
+/// standalone `foundational_files` computation stays unbounded (`None`).
+const FOUNDATIONAL_FILES_SECTION_LIMIT: usize = 50;
+
+/// Cap for the nav_map `symbols` section. The symbols leaderboard is the
+/// largest section (1333 rows on a reference repo); nav_map surfaces the top
+/// symbols for orientation while the standalone `symbols` mode stays unbounded.
+const SYMBOLS_SECTION_LIMIT: usize = 100;
+
 /// Assemble the full nav_map output: all 7 sections in one JSON object.
 ///
 /// Inputs: `repoRoot`/`dbPath` only (same convention as every other mode).
@@ -36,7 +53,8 @@ pub fn nav_map(input: &serde_json::Value) -> Result<serde_json::Value, ApiError>
         entrypoints.iter().chain(routes.iter()).cloned().collect();
     let entrypoints_json: Vec<serde_json::Value> = listed.iter().map(|e| e.to_json()).collect();
 
-    let foundational_files = super::foundational_files::leaderboard(&conn, None)?;
+    let foundational_files =
+        super::foundational_files::leaderboard(&conn, Some(FOUNDATIONAL_FILES_SECTION_LIMIT))?;
 
     let module_layers_json = module_layers_section(&conn)?;
 
@@ -47,7 +65,8 @@ pub fn nav_map(input: &serde_json::Value) -> Result<serde_json::Value, ApiError>
     // recomputing `entrypoints::detect` here was doubling nav_map's cost.
     let entrypoint_ids: std::collections::HashSet<i64> =
         listed.iter().map(|e| e.entity_id).collect();
-    let symbols = super::symbols_section::leaderboard(&conn, &entrypoint_ids, None)?;
+    let symbols =
+        super::symbols_section::leaderboard(&conn, &entrypoint_ids, Some(SYMBOLS_SECTION_LIMIT))?;
 
     // Flow roots: role-tagged handlers plus any call-based route that resolved
     // to a real handler function (`flow_root`). Path-only routes (no resolvable
@@ -57,7 +76,7 @@ pub fn nav_map(input: &serde_json::Value) -> Result<serde_json::Value, ApiError>
     let flows = super::flows::build_flows(&conn, &flow_roots)?;
     let flows_json: Vec<serde_json::Value> = flows.iter().map(|t| t.to_json()).collect();
 
-    let hotspots = super::mapping::hotspots_on(&conn)?;
+    let hotspots = super::mapping::hotspots_on(&conn, Some(HOTSPOTS_SECTION_LIMIT))?;
 
     Ok(serde_json::json!({
         "entrypoints": entrypoints_json,

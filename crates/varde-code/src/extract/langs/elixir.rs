@@ -15,11 +15,13 @@
 //! `FUNCTION_SCOPES` / `TYPE_SCOPES` and naming the scope via
 //! `field_name(node)`. In Elixir `def` and `defmodule` share the single kind
 //! `call`, so they CANNOT be distinguished by kind, and a `call` node has no
-//! `name` field. Therefore both scope lists are **empty**: Elixir entities
-//! carry `enclosing_function = None` and `owner_type = None`. This is
-//! acceptable and documented (same posture the roadmap allows for call-node
-//! languages); class-membership/enclosing queries simply don't light up for
-//! Elixir, but every entity kind is still extracted.
+//! `name` field. Therefore both scope lists are **empty** and the generic
+//! stack does not light up for Elixir; `enclosing_function` stays `None`.
+//! `owner_type`, however, IS populated for functions: `visit_call` resolves
+//! the enclosing `defmodule` by walking ancestors (see `enclosing_module_name`)
+//! and stamps it on each `def`/`defp`, so `Foo.Bar.bar` records its owning
+//! module even though the kind-keyed stack can't. Every entity kind is still
+//! extracted.
 //!
 //! MAPPING (verified against a grammar dump):
 //! - `def` / `defp` / `defmacro` -> Function. The function head is the first
@@ -181,6 +183,17 @@ fn visit_call(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>, ctx: &mut Ext
     if FUNCTION_DEFS.contains(&callee.as_str()) {
         if let Some((name, head)) = function_head(node) {
             ctx.push(EntityKind::Function, name, node);
+            // The enclosing `defmodule` is this function's owning type. Both
+            // `def` and `defmodule` are `call` kind, so the generic type-scope
+            // stack (keyed on node kind) can't distinguish them — resolve the
+            // module by walking ancestors and stamp it on the just-pushed
+            // Function entity, preserving the is_async/is_test/minhash that
+            // `ctx.push` computed.
+            if let Some(owner) = enclosing_module_name(node)
+                && let Some(last) = ctx.out.last_mut()
+            {
+                last.owner_type = Some(owner);
+            }
             // Parameters live in the function head's argument list.
             if let Some(head) = head {
                 for pname in head_parameter_names(&head) {
@@ -302,6 +315,22 @@ fn push_owned(
         is_test: false,
         owner_type: None,
     });
+}
+
+/// Name of the nearest enclosing `defmodule` (`Foo.Bar`) for a `def`/`defp`
+/// node, or None at file top level. Elixir nests function definitions inside a
+/// module's `do` block, so the owning module is an ancestor `call` whose
+/// callee (`target`) is the `defmodule` macro; its first argument is the
+/// module alias.
+fn enclosing_module_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    node.ancestors()
+        .filter(|a| a.kind() == "call")
+        .find(|a| {
+            a.field("target")
+                .map(|t| t.text() == "defmodule")
+                .unwrap_or(false)
+        })
+        .and_then(|m| first_arg_text(&m))
 }
 
 /// The `arguments` child of a `call` (`(x, y)` or a comma list), if present.
@@ -481,6 +510,32 @@ mod tests {
         assert!(find(&es, EntityKind::Function, "bar").is_some(), "{es:?}");
         assert!(find(&es, EntityKind::Parameter, "x").is_some(), "{es:?}");
         assert!(find(&es, EntityKind::Parameter, "y").is_some(), "{es:?}");
+    }
+
+    #[test]
+    fn function_records_enclosing_module_as_owner_type() {
+        // A `def`/`defp` inside `defmodule Foo.Bar` records that module as its
+        // `owner_type`. Elixir's `def`/`defmodule` are both `call` kind, so the
+        // generic type-scope stack can't supply this — it's resolved by walking
+        // ancestors to the enclosing `defmodule`.
+        let es =
+            entities("defmodule Foo.Bar do\n  def bar(x), do: x\n  defp helper(z), do: z\nend\n");
+        assert_eq!(
+            find(&es, EntityKind::Function, "bar")
+                .expect("bar present")
+                .owner_type
+                .as_deref(),
+            Some("Foo.Bar"),
+            "def must carry its enclosing module: {es:?}"
+        );
+        assert_eq!(
+            find(&es, EntityKind::Function, "helper")
+                .expect("helper present")
+                .owner_type
+                .as_deref(),
+            Some("Foo.Bar"),
+            "defp must carry its enclosing module: {es:?}"
+        );
     }
 
     #[test]

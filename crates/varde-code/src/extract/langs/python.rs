@@ -34,6 +34,13 @@ use ast_grep_language::SupportLang;
 /// Node kinds that introduce a named function scope.
 pub const FUNCTION_SCOPES: &[&str] = &["function_definition"];
 
+/// Node kinds that introduce a named type scope, so a `def` nested inside a
+/// `class` records its owning class on `Entity::owner_type` (see
+/// `crate::extract::langs::type_scopes`). This lets navigation surfaces
+/// disambiguate common method names — `on` in `event_bus.py` becomes
+/// `EventBus.on` — and gives class-membership consumers the owner linkage.
+pub const TYPE_SCOPES: &[&str] = &["class_definition"];
+
 /// Entity kinds the fixtures must produce. Interface and Export are carved
 /// out (see module docs); Route/Response use narrow Flask-style shapes.
 pub const REQUIRED_KINDS: [EntityKind; 12] = [
@@ -528,5 +535,32 @@ mod tests {
         assert_eq!(decorators.len(), 1, "entities: {entities:?}");
         assert_eq!(decorators[0].name, "app.route");
         assert_eq!(decorators[0].enclosing_function.as_deref(), Some("handler"));
+    }
+
+    #[test]
+    fn method_in_class_records_owning_type_and_module_function_does_not() {
+        let src = "class EventBus:\n    def on(self):\n        pass\n\ndef helper():\n    pass\n";
+        let parsed = parse_source(&SupportLang::Python, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        let on = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Function && e.name == "on")
+            .expect("method `on` extracted");
+        assert_eq!(
+            on.owner_type.as_deref(),
+            Some("EventBus"),
+            "class method must record its owning type: {entities:?}"
+        );
+
+        let helper = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Function && e.name == "helper")
+            .expect("module function `helper` extracted");
+        assert_eq!(
+            helper.owner_type, None,
+            "module-level function has no owning type: {entities:?}"
+        );
     }
 }

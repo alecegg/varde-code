@@ -615,4 +615,78 @@ mod hotspots_mode {
             "target/ file leaked into hotspots output: {env}"
         );
     }
+
+    #[test]
+    fn excludes_non_source_files_despite_high_churn() {
+        let repo = temp_dir("hot-nonsource-repo");
+        git_init(&repo);
+
+        // A normal source file, committed once → low churn.
+        let src = repo.join("real_source.rs");
+        std::fs::write(&src, "pub fn real_source() {}\n").expect("writes");
+        git(&repo, &["add", "real_source.rs"]);
+        git(&repo, &["commit", "-q", "-m", "src1"]);
+
+        // A docs file (non-source — the extractor never parses `.md`), churned
+        // many times → deliberately high raw churn, to prove the non-source
+        // filter excludes it rather than the scoring collapsing it.
+        let doc = repo.join("README.md");
+        for i in 0..5 {
+            std::fs::write(&doc, format!("# heading {i}\n")).expect("writes");
+            git(&repo, &["add", "README.md"]);
+            git(&repo, &["commit", "-q", "-m", &format!("doc{i}")]);
+        }
+
+        let db = temp_db("hot-nonsource-db");
+        // The source file carries an entity; the doc file is a bare `files`
+        // row with no entity (exactly how the real build records non-source
+        // files it walked but could not parse).
+        let src_abs = src.to_string_lossy().into_owned();
+        let doc_abs = doc.to_string_lossy().into_owned();
+        let parsed = varde_code::parse::parse_source(
+            &varde_code::parse::language_for_path(&src).expect("supported"),
+            &std::fs::read_to_string(&src).expect("reads"),
+        );
+        let entities = varde_code::extract::extract(&parsed, 0).entities;
+        let output = ExtractOutput {
+            entities,
+            symbols: vec![],
+            diagnostics: vec![],
+            file_meta: vec![
+                FileMeta {
+                    mtime: 0,
+                    size: 0,
+                    content_hash: "0000000000000000".to_string()
+                };
+                2
+            ],
+            files: vec![src_abs, doc_abs],
+        };
+        let graph =
+            resolve::resolve(&output.entities, &output.symbols, &output.files).expect("resolve");
+        persist::persist(
+            &db,
+            std::slice::from_ref(&output),
+            &graph,
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .expect("persist");
+
+        let env = envelope("hotspots", &format!(r#"{{"dbPath":"{}"}}"#, db.display()));
+        assert_eq!(env["ok"], true, "{env}");
+        let arr = env["data"].as_array().expect("array");
+
+        // Only the real source file should be present; README.md is excluded
+        // despite its higher raw churn.
+        assert_eq!(arr.len(), 1, "{env}");
+        assert!(
+            arr[0]["file"].as_str().unwrap().ends_with("real_source.rs"),
+            "expected only real_source.rs, got: {env}"
+        );
+        assert!(
+            !arr.iter()
+                .any(|e| e["file"].as_str().unwrap_or("").ends_with(".md")),
+            "non-source .md file leaked into hotspots output: {env}"
+        );
+    }
 }

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{ApiError, db_err, freshen_for_mode, open_db, opt_str, req_str};
 use crate::query::graph::Graph;
-use crate::query::noise_filter::is_generated_or_vendored_path;
+use crate::query::noise_filter::{is_generated_or_vendored_path, is_non_source_path};
 use crate::query::simple::{file_id, matches_path};
 
 /// map_file — persisted node info for a file.
@@ -388,19 +388,24 @@ fn repo_root_of(db_path: &std::path::Path) -> Option<std::path::PathBuf> {
 ///
 /// Inputs: none (repoRoot/dbPath only). Output: array of
 /// `{file, complexity, churn, score}` sorted by `score` (`complexity * churn`,
-/// or `complexity` alone when no file has any churn) descending, ties broken by
-/// path.
+/// or `complexity` alone when churn does not vary across files) descending,
+/// ties broken by path. The standalone mode is unbounded — the full ranked
+/// list; nav_map's section caps it (see [`hotspots_on`]'s `limit`).
 pub fn hotspots(input: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
     freshen_for_mode("hotspots", input)?;
     let conn = open_db(input)?;
-    hotspots_on(&conn)
+    hotspots_on(&conn, None)
 }
 
 /// Core hotspots computation over an already-open connection — the seam
 /// [`super::nav_map::nav_map`] calls directly so its `hotspots` section
 /// reads the same connection/snapshot as every other section, instead of
 /// [`hotspots`] opening (and re-freshening) a second one.
-pub fn hotspots_on(conn: &Connection) -> Result<serde_json::Value, ApiError> {
+///
+/// `limit` caps the result to the top-N by score (`None` = unbounded). The
+/// standalone `hotspots` mode passes `None`; nav_map passes a cap so its
+/// orientation summary stays bounded on large repos.
+pub fn hotspots_on(conn: &Connection, limit: Option<usize>) -> Result<serde_json::Value, ApiError> {
     let mut stmt = conn
         .prepare("SELECT f.path, f.complexity, f.churn FROM files f WHERE f.is_test_path = 0")
         .map_err(db_err)?;
@@ -416,7 +421,7 @@ pub fn hotspots_on(conn: &Connection) -> Result<serde_json::Value, ApiError> {
     let mut files: Vec<(String, i64, i64)> = Vec::new();
     for row in rows {
         let (path, complexity, churn) = row.map_err(db_err)?;
-        if is_generated_or_vendored_path(&path) {
+        if is_generated_or_vendored_path(&path) || is_non_source_path(&path) {
             continue;
         }
         files.push((path, complexity.unwrap_or(0), churn.unwrap_or(0)));
@@ -426,21 +431,37 @@ pub fn hotspots_on(conn: &Connection) -> Result<serde_json::Value, ApiError> {
     // scores 0 and a churny-but-simple file scores low. An additive
     // `complexity + churn` is dominated by whichever term is larger — with
     // complexity in the hundreds and churn a handful, churn barely moved the
-    // ranking, collapsing it to a plain complexity sort. Fallback: when no file
-    // has any churn (non-git repo, or nothing changed in the churn window),
-    // `complexity * 0` would zero every score and sort by path only, so rank by
-    // complexity alone instead — the best signal still available.
-    let any_churn = files.iter().any(|(_, _, ch)| *ch > 0);
+    // ranking, collapsing it to a plain complexity sort.
+    //
+    // Fallback: churn is only a ranking signal when it *varies* across files.
+    // Two degenerate cases produce a single distinct churn value and make the
+    // multiplicative score misleading: a non-git repo / empty churn window
+    // (every churn 0), and a shallow clone or single-commit window (every
+    // churn 1 — observed as all 917 files scoring `complexity * 1` on a
+    // reference repo). In both, `complexity * k` just rescales complexity (or
+    // zeroes it), so rank by complexity alone — the best signal still
+    // available — rather than presenting a churn-weighted score that carries no
+    // information.
+    let churn_varies = {
+        let mut seen = std::collections::HashSet::new();
+        files.iter().for_each(|(_, _, ch)| {
+            seen.insert(*ch);
+        });
+        seen.len() > 1
+    };
     let mut hotspots: Vec<(String, i64, i64, i64)> = files
         .into_iter()
         .map(|(path, c, ch)| {
-            let score = if any_churn { c * ch } else { c };
+            let score = if churn_varies { c * ch } else { c };
             (path, c, ch, score)
         })
         .collect();
     hotspots.sort_by(|a, b| {
         b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)) // score desc, path asc
     });
+    if let Some(limit) = limit {
+        hotspots.truncate(limit);
+    }
     Ok(serde_json::json!(
         hotspots
             .into_iter()
@@ -839,7 +860,7 @@ mod tests {
             ("src/complex_churny.rs", 100, 3),
             ("src/simple_churny.rs", 10, 5),
         ]);
-        let scores = hotspot_scores(&super::hotspots_on(&conn).expect("hotspots"));
+        let scores = hotspot_scores(&super::hotspots_on(&conn, None).expect("hotspots"));
         assert_eq!(
             scores,
             vec![
@@ -856,7 +877,7 @@ mod tests {
         // multiplicative score would zero out and collapse to path order.
         // Fall back to ranking by complexity so the mode stays useful.
         let conn = files_db(&[("src/a.rs", 30, 0), ("src/b.rs", 200, 0)]);
-        let scores = hotspot_scores(&super::hotspots_on(&conn).expect("hotspots"));
+        let scores = hotspot_scores(&super::hotspots_on(&conn, None).expect("hotspots"));
         assert_eq!(
             scores,
             vec![("src/b.rs".to_string(), 200), ("src/a.rs".to_string(), 30)]
@@ -864,15 +885,65 @@ mod tests {
     }
 
     #[test]
+    fn hotspots_falls_back_to_complexity_when_churn_is_uniform() {
+        // Shallow clone / single-commit window: every file has the same
+        // non-zero churn (here 1), so churn carries no ranking signal. A
+        // multiplicative score would just rescale complexity while presenting
+        // a churn-weighted number; rank by complexity instead.
+        let conn = files_db(&[
+            ("src/a.rs", 30, 1),
+            ("src/b.rs", 200, 1),
+            ("src/c.rs", 90, 1),
+        ]);
+        let scores = hotspot_scores(&super::hotspots_on(&conn, None).expect("hotspots"));
+        assert_eq!(
+            scores,
+            vec![
+                ("src/b.rs".to_string(), 200),
+                ("src/c.rs".to_string(), 90),
+                ("src/a.rs".to_string(), 30),
+            ],
+            "uniform churn must fall back to complexity ranking, not complexity*churn: {scores:?}"
+        );
+    }
+
+    #[test]
+    fn hotspots_respects_limit() {
+        // Varying churn so the multiplicative score is in effect; limit caps
+        // the result to the top-N by score.
+        let conn = files_db(&[
+            ("src/a.rs", 10, 2),  // 20
+            ("src/b.rs", 100, 5), // 500
+            ("src/c.rs", 40, 4),  // 160
+            ("src/d.rs", 5, 1),   // 5
+        ]);
+        let scores = hotspot_scores(&super::hotspots_on(&conn, Some(2)).expect("hotspots"));
+        assert_eq!(
+            scores,
+            vec![("src/b.rs".to_string(), 500), ("src/c.rs".to_string(), 160),],
+            "limit must truncate to the top-2 by score: {scores:?}"
+        );
+    }
+
+    #[test]
     fn hotspots_exclude_test_files() {
         // A complex, churny test file (`src/core.test.ts`) must not surface as
         // a hotspot — hotspots orient toward production code, matching the
-        // other nav-map surfacing tools' `is_test_path` exclusion.
-        let conn = files_db(&[("src/core.ts", 100, 4), ("src/core.test.ts", 200, 9)]);
-        let scores = hotspot_scores(&super::hotspots_on(&conn).expect("hotspots"));
+        // other nav-map surfacing tools' `is_test_path` exclusion. Two
+        // production files with differing churn keep the multiplicative score
+        // in effect (churn varies), so this isolates the exclusion behavior.
+        let conn = files_db(&[
+            ("src/core.ts", 100, 4),
+            ("src/other.ts", 50, 2),
+            ("src/core.test.ts", 200, 9),
+        ]);
+        let scores = hotspot_scores(&super::hotspots_on(&conn, None).expect("hotspots"));
         assert_eq!(
             scores,
-            vec![("src/core.ts".to_string(), 400)],
+            vec![
+                ("src/core.ts".to_string(), 400),  // 100 * 4
+                ("src/other.ts".to_string(), 100), // 50 * 2
+            ],
             "test file must be excluded from hotspots: {scores:?}"
         );
     }
