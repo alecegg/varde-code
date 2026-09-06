@@ -318,14 +318,19 @@ mod type_hierarchy_mode {
     use super::*;
 
     #[test]
-    fn returns_declaration_context_chain() {
+    fn returns_inheritance_hierarchy() {
         let db = temp_db("th");
-        // A class entity inside an enclosing function.
-        let mut class = fn_entity(0, "Thing");
-        class.kind = EntityKind::Class;
-        class.enclosing_function = Some("outer".to_string());
+        // `Thing extends Base`, encoded as an Extends entity (kind 15) whose
+        // `enclosing_function` is the subtype and `name` is the supertype.
+        let mut base = fn_entity(0, "Base");
+        base.kind = EntityKind::Class;
+        let mut thing = fn_entity(0, "Thing");
+        thing.kind = EntityKind::Class;
+        let mut extends = fn_entity(0, "Base");
+        extends.kind = EntityKind::Extends;
+        extends.enclosing_function = Some("Thing".to_string());
         let output = ExtractOutput {
-            entities: vec![fn_entity(0, "outer"), class],
+            entities: vec![base, thing, extends],
             symbols: vec![],
             diagnostics: vec![],
             files: vec!["a.rs".to_string()],
@@ -348,12 +353,24 @@ mod type_hierarchy_mode {
         )
         .expect("persist");
 
+        // Seed prefers the class declaration over the same-named Extends edge.
         let result = data("type_hierarchy", &db, r#""name":"Thing","filePath":"a.rs""#);
         assert_eq!(result["symbol"]["name"], "Thing");
         assert_eq!(result["symbol"]["kind"], "class");
-        assert_eq!(result["symbol"]["enclosing_function"], "outer");
+        let supers = result["supertypes"].as_array().expect("supertypes array");
+        assert_eq!(supers.len(), 1, "Thing has one supertype: {result}");
+        assert_eq!(supers[0]["name"], "Base");
+        // hierarchy = ancestor chain parent-first, ending in the seed.
         let chain = result["hierarchy"].as_array().expect("hierarchy array");
-        assert_eq!(chain.len(), 2, "entity + enclosing function: {result}");
+        assert_eq!(chain.len(), 2, "Base + Thing: {result}");
+        assert_eq!(chain[0]["name"], "Base");
+        assert_eq!(chain[1]["name"], "Thing");
+
+        // From the base, Thing is reported as a subtype (implementer).
+        let base_res = data("type_hierarchy", &db, r#""name":"Base","filePath":"a.rs""#);
+        let subs = base_res["subtypes"].as_array().expect("subtypes array");
+        assert_eq!(subs.len(), 1, "Base has one subtype: {base_res}");
+        assert_eq!(subs[0]["name"], "Thing");
     }
 
     #[test]
@@ -364,23 +381,25 @@ mod type_hierarchy_mode {
         assert_eq!(env["error"]["code"], "not_found");
     }
 
-    /// Regression (review fix H4): two same-file entities that mutually
-    /// enclose each other by name (`A.enclosing_function == "B"`,
-    /// `B.enclosing_function == "A"`) must not loop forever — the
-    /// `name + file ORDER BY id LIMIT 1` parent lookup has no other exit
-    /// besides an empty/absent `enclosing_function`, so the walk needs its
-    /// own cycle guard. Without it this test hangs rather than fails.
+    /// Regression: a mutually-recursive inheritance cycle (`A extends B` and
+    /// `B extends A`) must not loop forever. The BFS carries its own visited
+    /// set so the walk terminates once both A and B are seen.
     #[test]
-    fn cyclic_enclosing_function_terminates_instead_of_looping_forever() {
+    fn cyclic_inheritance_terminates_instead_of_looping_forever() {
         let db = temp_db("th-cycle");
         let mut a = fn_entity(0, "A");
         a.kind = EntityKind::Class;
-        a.enclosing_function = Some("B".to_string());
         let mut b = fn_entity(0, "B");
         b.kind = EntityKind::Class;
-        b.enclosing_function = Some("A".to_string());
+        // A extends B, B extends A.
+        let mut a_ext_b = fn_entity(0, "B");
+        a_ext_b.kind = EntityKind::Extends;
+        a_ext_b.enclosing_function = Some("A".to_string());
+        let mut b_ext_a = fn_entity(0, "A");
+        b_ext_a.kind = EntityKind::Extends;
+        b_ext_a.enclosing_function = Some("B".to_string());
         let output = ExtractOutput {
-            entities: vec![a, b],
+            entities: vec![a, b, a_ext_b, b_ext_a],
             symbols: vec![],
             diagnostics: vec![],
             files: vec!["a.rs".to_string()],
@@ -404,12 +423,15 @@ mod type_hierarchy_mode {
         .expect("persist");
 
         let result = data("type_hierarchy", &db, r#""name":"A","filePath":"a.rs""#);
-        let chain = result["hierarchy"].as_array().expect("hierarchy array");
+        // Walk terminates; A's only supertype is B (B's back-edge to A is
+        // pruned by the visited set).
+        let supers = result["supertypes"].as_array().expect("supertypes array");
         assert_eq!(
-            chain.len(),
-            2,
+            supers.len(),
+            1,
             "cycle must terminate once both A and B are seen: {result}"
         );
+        assert_eq!(supers[0]["name"], "B");
     }
 }
 

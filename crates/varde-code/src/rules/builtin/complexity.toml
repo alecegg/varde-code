@@ -62,5 +62,5 @@ name = "Function complexity hotspot"
 description = "A single function's cyclomatic complexity exceeds the threshold — the file-level rules can miss one complex function buried in an otherwise simple file."
 message = "function is high-complexity"
 remediation = "extract branches into smaller helper functions, or simplify the control flow"
-query = "SELECT f.path AS file, fn.start_line AS line, fn.name, 1 + COUNT(cf.id) AS complexity FROM entities fn JOIN files f ON f.id = fn.file_id LEFT JOIN entities cf ON cf.file_id = fn.file_id AND cf.enclosing_function = fn.name AND cf.kind = 12 AND cf.owner_type IS fn.owner_type WHERE fn.kind = 0 GROUP BY fn.id HAVING 1 + COUNT(cf.id) > :max_function_complexity"
+query = "SELECT f.path AS file, fn.start_line AS line, fn.start_byte AS start_byte, fn.end_byte AS end_byte, fn.start_col AS start_col, fn.end_line AS end_line, fn.end_col AS end_col, fn.name, 1 + COUNT(cf.id) AS complexity FROM entities fn JOIN files f ON f.id = fn.file_id LEFT JOIN entities cf ON cf.file_id = fn.file_id AND cf.enclosing_function = fn.name AND cf.kind = 12 AND cf.owner_type IS fn.owner_type WHERE fn.kind = 0 GROUP BY fn.id HAVING 1 + COUNT(cf.id) > :max_function_complexity"
 thresholds = { max_function_complexity = 15.0 }

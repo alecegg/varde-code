@@ -152,6 +152,25 @@ pub fn scan_repo(input: &serde_json::Value) -> Result<serde_json::Value, ApiErro
     diagnostics.extend(pattern_diags);
     diagnostics.extend(sql_diags);
 
+    // 4a′. Drop findings on generated/vendored/minified files — bundled JS
+    //      assets (`priv/static/phoenix.*.js`), committed tree-sitter
+    //      `grammars/*/parser.c`, `node_modules`, `vendor`, etc. This code is
+    //      not the user's to fix, so a complexity/clone/lint finding on it is
+    //      pure noise (audit S8: 87% of one repo's findings cited generated JS;
+    //      25 complexity findings cited a generated `parser.c`). Applied here,
+    //      after both engines merge, so it covers pattern AND SQL rules
+    //      uniformly regardless of how each selects files.
+    let before_generated_filter = findings.len();
+    findings
+        .retain(|f| !crate::query::noise_filter::is_generated_or_vendored_path(&f.location.file));
+    let generated_dropped = before_generated_filter - findings.len();
+    if generated_dropped > 0 {
+        tracing::info!(
+            dropped = generated_dropped,
+            "suppressed findings on generated/vendored files"
+        );
+    }
+
     // 4b. Drop findings covered by an inline per-file or next-line
     //     suppression comment (see rules::suppress for the marker
     //     constants), and collect suppressions that matched nothing

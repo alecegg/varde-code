@@ -224,6 +224,148 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   license outside the permissive allow-list (no copyleft), so a future
   copyleft/unlicensed dependency is caught before release.
 
+### Fixed
+- **`scan` findings from SQL rules now carry a precise byte/line/column span**
+  instead of a line-only span with zeroed byte/column. The audit flagged this as
+  "C/C++ zeroed scan spans", but the root cause was language-agnostic: entity-
+  anchored SQL rules (`duplicate-code-clone`, `function-complexity-hotspot`,
+  `vertical-slice-sprawl`, `circular-import`) selected only `start_line AS line`,
+  so `start_byte`/`end_byte`/`start_col`/`end_line`/`end_col` defaulted to 0 and
+  the span collapsed to a single line — C/C++ repos merely surfaced it because
+  they are dominated by SQL-rule findings (pattern rules, which already carry
+  full spans, fire less there). Each rule now selects its anchor entity's full
+  span (`circular-import` additionally points at the offending import statement
+  rather than line 1). Whole-file rules (`file-complexity-hotspot`,
+  `low-fan-in-high-fan-out-file`) keep their honest line-1 anchor — a byte range
+  would be fabricated for a file-level metric. Example: a C++ clone finding went
+  from `L75:0-L75:0 byte 0-0` to `L75-L83 byte 2104-2442`.
+- **`nav_map` entrypoints now include language process mains.** Detection covered
+  web-framework handlers/routes but excluded the `main`/`Main` a program actually
+  starts at (they were filtered as bootstrap). A new `detect_process_mains` pass
+  surfaces them as a distinct `process_main` role — Rust/Go/C/C++/Java/Kotlin
+  `main`, C# `Main` — matched structurally by name **and** language (a C# helper
+  named `main` or a Rust method named `Main` is not mistaken for one), with
+  test/generated/scaffold paths excluded. Process mains are flow roots, so they
+  also seed the flow trees (a CLI/binary's call graph is now navigable from its
+  entry). Example: c-inih went from 0 entrypoints to its 6 example/tool `main`s.
+- **Cross-module import resolution now follows re-exports and package/module
+  boundaries** (`dependents`/`blast_radius`/dependency graph). The audit found the
+  resolver only stem-matched an import's trailing segment against file basenames,
+  so three whole idioms went unresolved and left the graph disconnected:
+  (1) **package/directory imports** — Python `from pkg import X`, a bare
+  directory `index.*` import, or Lua's `require "pkg"` — now resolve to the
+  package's index file (`__init__.py`/`index.ts`/`init.lua`) via a new
+  package-directory index; (2) **multi-segment module paths** — `from a.b.c
+  import X` (and `use crate::a::b`) — now match on the *full trailing path
+  suffix* (`a/b/c` → the one `.../a/b/c.py`) instead of colliding on the bare
+  `c` stem across every same-named file; and (3) **namespaced module aliases** —
+  Elixir `alias/import/use Foo.Bar` — now resolve to the file that declares
+  `defmodule Foo.Bar` via a module-declaration index, independent of Elixir's
+  snake_case file naming; and (4) **Go package imports** — a Go import names a
+  *directory* of `.go` files, not a single file, so it is resolved through
+  `go.mod`'s `module` path (mapping the import-path prefix to the package
+  directory) and emits one import edge per file in the target package
+  (`_test.go` files excluded — they are not part of the importable surface).
+  Lua's dotted `require "a.b.c"` module paths are also normalized to slash form
+  at extraction so they stop being truncated as a file extension. Effect
+  (verified end-to-end): a Python package's re-exported leaf
+  (`crewai/agent/core.py`) went from **0 → 641** transitive dependents once the
+  `consumer → __init__.py → core.py` chain connects; Elixir
+  (`Phoenix.Controller` 20, `Phoenix.Router` 12), Lua (`busted/init.lua` 16,
+  `busted/block.lua` 18), and Go (go-cobra root-package files now report their 11
+  `doc/`+external-test dependents, was 0) dependency edges, previously near-empty,
+  now resolve. All resolution stays deterministic and single-match-only for the
+  file-targeted cases (ambiguous specifiers stay unresolved — no invented edges);
+  Go resolves via the module-path prefix so a stdlib import (`fmt`, `os`) never
+  mis-matches a local file.
+- **`type_hierarchy` now returns the real inheritance graph** instead of the
+  lexical enclosing-scope chain. A cross-language accuracy audit found the mode
+  walked `enclosing_function` containment (so a top-level type reported only
+  `[self]`, and a bare name could resolve to a call-site or a local variable —
+  even one in a different language, e.g. Rust `Shape` matching a Haskell
+  `Shape`). It now (1) resolves the seed to an actual class/interface
+  *declaration* preferentially, scoped to the seed's language; (2) walks the
+  `Extends`/`Implements` edge set both ways, returning `supertypes` (transitive
+  parents) and `subtypes` (transitive implementers/subclasses); and (3) keeps a
+  backward-compatible `hierarchy` field, now the inheritance ancestry
+  (parent-first, ending in the seed). E.g. `IChatCompletionService` returns 18
+  implementers (was 0), Java `Owner` returns `Person → BaseEntity → Serializable`
+  (was self only), and Python `BaseLLM` returns 24 subclasses (was 1).
+- **`fat-interface` / `solid-lsp` / `solid-isp` no longer inflate method counts
+  by cross-file name collision.** The member-count subqueries matched every
+  method whose `owner_type` *name* equalled the type's name across the whole
+  repo, so N sample files each defining a `class MenuPlugin` summed into one
+  bogus count (a 2-method class reported as "declares 102 methods" — a 122/122
+  false-positive rate on `semantic-kernel`). `fat-interface` now counts only
+  methods nested in the declaration's own file+byte span; the SOLID rules scope
+  their class-side counts to the implementing type's file. On `semantic-kernel`
+  `fat-interface` drops from 122 findings to 82, all with accurate per-declaration
+  counts. Covered by a new regression test.
+- **C/C++ no longer emit reserved keywords as entities or reference symbols.**
+  Under preprocessor confusion or tree-sitter error recovery, `if (...)` was
+  captured as a `function`/`call` named `if`, and `class`/`template`/`typename`/
+  `struct`/`const` flooded the reference list (663 keyword symbols in one fmt
+  header). A reserved word can never be a valid identifier, so it is now dropped
+  at the C/C++ push sites, in the symbol classifier, and via a language-scoped
+  backstop in `ExtractCtx::push`. Scoped enums (`enum class Color`) still keep
+  their real type name. Covered by new regression tests.
+- **`get_symbol` prefers definitions over weaker same-named matches.** Candidate
+  ordering now ranks a type/function declaration above a variable/parameter
+  binding, and a `Binding` above a `Reference`, so a bare lookup returns the
+  declaration rather than a use of it.
+- **Blank-name entities and symbols are no longer emitted.** Unnamed constructs
+  and error recovery (Ruby `class << self`, Haskell type operators like `:>`, JS
+  `export default function(){}`, Lua table-literal method closures) produced
+  `name:""` rows that could never match a lookup, flooded `symbols_in_file`, and
+  inflated scan counts (22 blank symbols in one Ruby file, 25 in one Haskell
+  file, all-anonymous Lua object methods). A single post-extraction filter drops
+  every blank-named declaration/reference row; control-flow and error markers
+  (`ControlFlow`/`Catch`/`Throw`) are exempt so a bare `rescue` or re-`raise`
+  stays queryable. Verified on ruby-sinatra/haskell-servant/lua-busted (blank
+  counts 22/25/n → 0/0/0); covered by new regression tests.
+- **`context_pack` handles multi-word queries.** A `query` like `"router
+  controller"` was matched as one literal phrase against paths and symbol names;
+  since no path/name contains the phrase verbatim it returned `not_found`. The
+  query is now split into whitespace-delimited keywords, each seeded
+  independently and unioned (matches deduped). Single-word queries are
+  unchanged. Verified on elixir-phoenix (`"router controller"`: not_found → 49
+  files / 5 symbols); covered by a new parity check.
+- **Declaration coverage greatly expanded — many constructs were extracted but
+  never surfaced, or never captured at all.** Two root causes:
+  - *Persistence dropped `Variable`/`Parameter`.* The persistence layer dropped
+    those kinds on the assumption nothing read them back, but `declaration_kinds`
+    (behind `symbols_in_file`/`get_symbol`/`filter_symbols`) lists both — so every
+    field, property, constant, and parameter was invisible to exactly the queries
+    meant to return them. They are now persisted (DB size effectively unchanged;
+    the dropped bulk is `Literal`/`MemberAccess`). This alone restored Java
+    `@Column` fields, PHP typed properties, TS module `const`s, and C# properties.
+  - *Extractors dropped whole declaration forms.* Added capture, mapped to the
+    closest existing kind so they are queryable without a schema change:
+    TS `type` aliases (→interface) and `enum` (→class); C# `record`/`struct`/
+    `enum` types (→class) and properties (→variable); Go named func/defined/alias
+    types (→class); Kotlin `object`/`companion object` (→class); Ruby
+    `attr_accessor`/`reader`/`writer` (→variable, owned by the class); Solidity
+    `event`/`error` (→function); C `#define` macros (object-like→variable,
+    function-like→function) and header function prototypes (→function); Dart
+    factory constructors and getters/setters (→function); Scala `given`
+    (→variable) and `type` members (→interface); Haskell `type family`
+    (→interface). Members carry their owning type via `owner_type`. Verified
+    end-to-end (extract→build→query) on the audit repos; covered by per-language
+    regression tests.
+- **`scan` no longer reports findings on generated/vendored files.** Bundled/
+  minified JS assets, committed tree-sitter `parser.c`, and dependency trees were
+  linted like source, so complexity/clone/lint rules fired on code the user can't
+  fix — 87% of one repo's findings (1359/1958) cited `priv/static/phoenix.*.js`
+  bundles, and 25 complexity findings cited a generated `grammars/*/parser.c`.
+  `noise_filter::is_generated_or_vendored_path` now also recognizes `vendor`/
+  `third_party`/`bower_components`/`.next`/`.nuxt`/`grammars` directories, the
+  `priv/static/` compiled-asset tree, and `*.min.js`/`*.bundle.js` filenames; the
+  scan engine drops findings on such files after both rule engines merge (so it
+  covers pattern AND SQL rules). Verified on elixir-phoenix (1958 → 599 findings,
+  0 on generated files; the 1359 dropped are logged, not silent). The broadened
+  detection also de-noises the nav `hotspots`/`foundational_files` sections, which
+  share this predicate.
+
 ## [0.1.0] - 2026-09-03
 
 Initial standalone port of varde-code: multi-language parsing (tree-sitter), entity/symbol

@@ -51,6 +51,7 @@ impl RoleTag {
             RoleTag::BackgroundJob => "background_job",
             RoleTag::EventListener => "event_listener",
             RoleTag::Middleware => "middleware",
+            RoleTag::ProcessMain => "process_main",
         }
     }
 }
@@ -396,6 +397,79 @@ pub fn detect_routes(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
     Ok(results)
 }
 
+/// The `main`/`Main` function name that marks a language's process entrypoint,
+/// keyed by file extension. Deliberately narrow: only languages with a genuine
+/// named-function program entry are listed, so a helper coincidentally named
+/// `main` in an unrelated language (a Ruby method, a Python function) is not
+/// mistaken for one. C# capitalizes `Main`; the rest use `main`. Python's
+/// `if __name__ == "__main__"` guard and Node bin scripts have no named entry
+/// function, so they are out of scope here.
+fn process_main_name_for_path(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit('.').next()?;
+    Some(match ext {
+        "rs" | "go" | "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "java" | "kt" | "kts" => {
+            "main"
+        }
+        "cs" => "Main",
+        _ => return None,
+    })
+}
+
+/// Detect language process entrypoints — the `main`/`Main` function a program
+/// starts at (Rust/Go/C/C++/Java/Kotlin `main`, C# `Main`). Complements
+/// [`detect`], which only surfaces decorator/base-class-role-tagged web handlers
+/// and deliberately *excludes* these bootstrap functions; this reinstates them
+/// as their own [`RoleTag::ProcessMain`] category so a CLI/binary's true entry
+/// point is navigable (and gets a real flow tree from `main`'s call graph).
+///
+/// Matched structurally by name + language (not a decorator), scoped to
+/// `Function` entities; test, generated/vendored, and scaffold paths are
+/// excluded, consistent with the other detectors.
+pub fn detect_process_mains(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.id, f.path, e.name
+             FROM entities e
+             JOIN files f ON f.id = e.file_id
+             WHERE e.kind = ?1 AND f.is_test_path = 0 AND e.name IN ('main', 'Main')",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([EntityKind::Function.as_i64()], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    let mut results = Vec::new();
+    for (entity_id, file, name) in rows {
+        if is_generated_or_vendored_path(&file) || is_scaffold_template_path(&file) {
+            continue;
+        }
+        // The name must be the *right* main for the file's language (C# `Main`,
+        // everyone else `main`) — so a Rust struct method named `Main` or a C#
+        // helper named `main` is not surfaced.
+        if process_main_name_for_path(&file) != Some(name.as_str()) {
+            continue;
+        }
+        results.push(Entrypoint {
+            entity_id,
+            file,
+            symbol: name,
+            role: RoleTag::ProcessMain,
+            flow_root: true,
+        });
+    }
+
+    results.sort_by(|a, b| a.file.cmp(&b.file).then(a.symbol.cmp(&b.symbol)));
+    Ok(results)
+}
+
 /// Resolve a route handler's bare name to its `Function` entity id: prefer a
 /// declaration in the same file as the registration, else a repo-wide unique
 /// match. Returns `None` when the name is absent, unknown, or ambiguous
@@ -588,6 +662,74 @@ mod semantic_entrypoint_tests {
                     .iter()
                     .any(|e| e.symbol == "ok" && e.file.ends_with("routes.py")),
                 "the non-bootstrap file's route handler must still be present: {entrypoints:?}"
+            );
+
+            let _ = std::fs::remove_file(&db);
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    /// S9: language process mains (`fn main`, `func main`, C# `Main`) are
+    /// surfaced by [`detect_process_mains`] with the `ProcessMain` role — even
+    /// though [`detect`] excludes them as bootstrap — while a non-main function,
+    /// a wrong-case name for the language, and a test-file main are not.
+    #[test]
+    fn detect_process_mains_surfaces_named_program_entrypoints() {
+        with_isolated_home("entrypoints", "process-mains", || {
+            let root = temp_root("process-mains");
+            std::fs::write(
+                root.join("main.rs"),
+                "fn main() {\n    helper();\n}\nfn helper() {}\n",
+            )
+            .expect("write main.rs");
+            std::fs::write(
+                root.join("cmd.go"),
+                "package main\n\nfunc main() {\n    run()\n}\nfunc run() {}\n",
+            )
+            .expect("write cmd.go");
+            std::fs::write(
+                root.join("Program.cs"),
+                "class Program {\n    static void Main(string[] args) {\n    }\n}\n",
+            )
+            .expect("write Program.cs");
+            // Wrong case for the language: a Rust `fn Main` is not a process main.
+            std::fs::write(root.join("other.rs"), "fn Main() {}\n").expect("write other.rs");
+            // A `main` in a test file must be excluded.
+            std::fs::write(
+                root.join("main_test.go"),
+                "package main\n\nfunc main() {}\n",
+            )
+            .expect("write test main");
+
+            crate::build::run_with_force(root.to_str().unwrap(), true).expect("full build");
+            let db = crate::db::path::repo_db_path(&root);
+            let conn = Connection::open(&db).expect("open db");
+
+            let mains = detect_process_mains(&conn).expect("detect computes");
+            let files: Vec<(&str, &str)> = mains
+                .iter()
+                .map(|e| (e.file.rsplit('/').next().unwrap_or(""), e.symbol.as_str()))
+                .collect();
+
+            assert!(
+                mains
+                    .iter()
+                    .all(|e| e.role == RoleTag::ProcessMain && e.flow_root),
+                "every process main is a ProcessMain flow root: {mains:?}"
+            );
+            assert!(files.contains(&("main.rs", "main")), "rust main: {mains:?}");
+            assert!(files.contains(&("cmd.go", "main")), "go main: {mains:?}");
+            assert!(
+                files.contains(&("Program.cs", "Main")),
+                "c# Main: {mains:?}"
+            );
+            assert!(
+                !mains.iter().any(|e| e.file.ends_with("other.rs")),
+                "wrong-case `fn Main` in a .rs file is excluded: {mains:?}"
+            );
+            assert!(
+                !mains.iter().any(|e| e.file.ends_with("main_test.go")),
+                "a main in a test file is excluded: {mains:?}"
             );
 
             let _ = std::fs::remove_file(&db);

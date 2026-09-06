@@ -9,7 +9,7 @@ pub mod langs;
 pub mod minhash;
 pub mod symbol;
 
-use crate::model::{Entity, Symbol};
+use crate::model::{Entity, EntityKind, Symbol};
 use crate::parse::ParsedFile;
 use ast_grep_core::tree_sitter::StrDoc;
 use ast_grep_language::SupportLang;
@@ -44,7 +44,38 @@ pub fn extract(parsed: &ParsedFile, file_id: u32) -> ExtractResult {
         type_scope: &mut type_scope,
     };
     walk(&root, &mut ctx, false, false, 0);
+    drop_blank_named(&mut result);
     result
+}
+
+/// Drop rows whose name failed to resolve to a real identifier (empty or
+/// whitespace-only).
+///
+/// Blank names come from unnamed constructs and error recovery — Ruby
+/// `class << self` singleton classes, Haskell type operators (`:>`), JS
+/// `export default function(){}`, Lua table-literal method closures — where the
+/// extractor's `field_name(node).unwrap_or_default()` yields `""`. As name-keyed
+/// rows these are pure noise: they can never match a `get_symbol`/`dependencies`
+/// lookup, they flood `symbols_in_file`, and they inflate scan counts (the audit
+/// found 22 blank symbols in one Ruby file, 25 in one Haskell file).
+///
+/// Control-flow and error markers are exempt: a bare `rescue` (Catch) or a
+/// re-`raise` (Throw) is a real, queryable point whose name is *legitimately*
+/// absent, and error-handling scan rules rely on those markers existing.
+fn drop_blank_named(result: &mut ExtractResult) {
+    result
+        .entities
+        .retain(|e| kind_allows_blank_name(e.kind) || !e.name.trim().is_empty());
+    result.symbols.retain(|s| !s.name.trim().is_empty());
+}
+
+/// True for the entity kinds whose name may legitimately be empty (control-flow
+/// and error markers named after a caught/thrown value that need not exist).
+fn kind_allows_blank_name(kind: EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::ControlFlow | EntityKind::Catch | EntityKind::Throw
+    )
 }
 
 /// The stable-across-the-walk inputs threaded through every [`walk`] call:
@@ -246,6 +277,66 @@ mod type_context_tests {
         assert!(
             !reference_names.contains(&"std") && !reference_names.contains(&"string"),
             "path segments of a Rust type must not leak as Reference symbols: {reference_names:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod blank_name_tests {
+    use super::*;
+    use crate::model::EntityKind;
+
+    /// Regression (audit S8): unnamed declarations and error recovery produced
+    /// blank-name (`""`) entities/symbols that flooded name-keyed query output
+    /// (22 in one Ruby file, 25 in one Haskell file). `drop_blank_named` strips
+    /// them; every remaining declaration/reference row must carry a real name.
+    #[test]
+    fn declaration_and_reference_rows_never_have_blank_names() {
+        // A JS default-anonymous export historically emitted a blank Function.
+        let cases = [
+            (
+                SupportLang::JavaScript,
+                "export default function () { return 1; }\n",
+            ),
+            (
+                SupportLang::Ruby,
+                "class Foo\n  class << self\n    def bar; end\n  end\nend\n",
+            ),
+            (
+                SupportLang::Haskell,
+                "data (path :: k) :> (a :: Type)\nmain :: IO ()\nmain = pure ()\n",
+            ),
+        ];
+        for (lang, src) in cases {
+            let parsed = crate::parse::parse_source(&lang, src);
+            let result = crate::extract::extract(&parsed, 0);
+            for e in &result.entities {
+                assert!(
+                    kind_allows_blank_name(e.kind) || !e.name.trim().is_empty(),
+                    "{lang:?}: blank-name {:?} entity survived the filter",
+                    e.kind
+                );
+            }
+            for s in &result.symbols {
+                assert!(
+                    !s.name.trim().is_empty(),
+                    "{lang:?}: blank-name symbol survived the filter"
+                );
+            }
+        }
+    }
+
+    /// The filter must NOT strip control-flow/error markers whose name is
+    /// legitimately absent — a bare `rescue` is a real, queryable Catch point
+    /// that error-handling scan rules depend on.
+    #[test]
+    fn bare_rescue_keeps_its_unnamed_catch_marker() {
+        let src = "def risky\n  do_work\nrescue\n  nil\nend\n";
+        let parsed = crate::parse::parse_source(&SupportLang::Ruby, src);
+        let result = crate::extract::extract(&parsed, 0);
+        assert!(
+            result.entities.iter().any(|e| e.kind == EntityKind::Catch),
+            "bare rescue must still emit a Catch marker even with a blank name"
         );
     }
 }

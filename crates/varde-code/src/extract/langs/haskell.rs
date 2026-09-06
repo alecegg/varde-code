@@ -193,6 +193,15 @@ pub fn visit(
                 node,
             );
         }
+        // `type family HeaderValMap …` / `data family …` -> Interface (a
+        // type-level declaration). Previously dropped (audit S3).
+        "type_family" | "data_family" => {
+            ctx.push(
+                EntityKind::Interface,
+                field_name(node).unwrap_or_default(),
+                node,
+            );
+        }
         // `instance Show T where …` -> Implements referencing the typeclass.
         "instance" => {
             push_type_ref(
@@ -372,6 +381,16 @@ mod tests {
 
     fn find<'a>(es: &'a [Entity], kind: EntityKind, name: &str) -> Option<&'a Entity> {
         es.iter().find(|e| e.kind == kind && e.name == name)
+    }
+
+    #[test]
+    fn type_family_is_captured_as_interface() {
+        // Audit S3: `type family` declarations were dropped.
+        let es = entities("type family HeaderValMap (f :: *) (xs :: [*])\n");
+        assert!(
+            find(&es, EntityKind::Interface, "HeaderValMap").is_some(),
+            "type family: {es:?}"
+        );
     }
 
     #[test]

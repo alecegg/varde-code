@@ -38,7 +38,11 @@ use ast_grep_core::tree_sitter::StrDoc;
 use ast_grep_language::SupportLang;
 
 /// Node kinds that introduce a named function scope.
-pub const TYPE_SCOPES: &[&str] = &["class_declaration"];
+pub const TYPE_SCOPES: &[&str] = &[
+    "class_declaration",
+    "object_declaration",
+    "companion_object",
+];
 pub const FUNCTION_SCOPES: &[&str] = &["function_declaration"];
 
 /// Entity kinds the fixtures must produce (all 14 expressible in Kotlin).
@@ -97,6 +101,30 @@ pub fn visit(
             // `constructor_invocation` (`Base()`, call syntax) names the
             // superclass; one wrapping a bare `user_type` (`IFoo`, no call
             // syntax) names an implemented interface.
+            for spec in node
+                .children()
+                .filter(|c| c.kind() == "delegation_specifier")
+            {
+                if let Some((edge_kind, ty_name)) = delegation_target(&spec) {
+                    push_type_ref(ctx, edge_kind, ty_name, &name, &spec);
+                }
+            }
+        }
+        // `object Registry : Base` / `companion object Key` — Kotlin singleton
+        // and companion declarations. Previously dropped entirely (audit S3:
+        // top-level `object` and `companion object` were absent from
+        // symbols_in_file). Mapped to Class (a named type). An unnamed companion
+        // object defaults to "Companion", Kotlin's implicit name for it.
+        "object_declaration" | "companion_object" => {
+            let name = first_identifier(node).unwrap_or_else(|| {
+                if kind == "companion_object" {
+                    "Companion".to_string()
+                } else {
+                    String::new()
+                }
+            });
+            ctx.push(EntityKind::Class, name.clone(), node);
+            maybe_export(node, &name, ctx);
             for spec in node
                 .children()
                 .filter(|c| c.kind() == "delegation_specifier")
@@ -470,6 +498,29 @@ mod tests {
     use super::*;
     use crate::extract;
     use crate::parse::parse_source;
+
+    #[test]
+    fn object_and_companion_object_declarations_are_captured() {
+        // Audit S3: top-level `object` and `companion object` were dropped.
+        let src = "object Registry {\n  fun reg() {}\n}\nclass Foo {\n  companion object Key\n}\n";
+        let parsed = parse_source(&SupportLang::Kotlin, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+        let classes: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Class)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(classes.contains(&"Registry"), "object: {classes:?}");
+        assert!(classes.contains(&"Key"), "companion object: {classes:?}");
+        // The object's member method records it as owner.
+        assert!(
+            entities.iter().any(|e| e.kind == EntityKind::Function
+                && e.name == "reg"
+                && e.owner_type.as_deref() == Some("Registry")),
+            "object member owner: {entities:?}"
+        );
+    }
 
     #[test]
     fn extends_implements_entities_carry_raw_name_and_owner() {

@@ -57,7 +57,8 @@ SELECT file, line, start_byte, end_byte, start_col, end_line, end_col,
     (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.name
        AND m.end_line = m.start_line
        AND EXISTS (SELECT 1 FROM entities cm WHERE cm.kind = 0
-         AND cm.owner_type = imp.enclosing_function AND cm.name = m.name)) AS class_methods,
+         AND cm.owner_type = imp.enclosing_function AND cm.file_id = imp.file_id
+         AND cm.name = m.name)) AS class_methods,
     (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.name
        AND m.end_line = m.start_line) AS iface_methods,
     :coverage_threshold AS threshold
@@ -88,7 +89,8 @@ SELECT file, line, start_byte, end_byte, start_col, end_line, end_col,
     imp.end_line AS end_line, imp.end_col AS end_col,
     imp.enclosing_function AS class_name, imp.name AS interface_name,
     (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.name) AS iface_method_count,
-    (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.enclosing_function) AS class_methods,
+    (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.enclosing_function
+       AND m.file_id = imp.file_id) AS class_methods,
     -- Empty-stub count: short (<=2 line) methods that ALSO contain no call.
     -- The line-span alone can't tell a genuine no-op (`void Foo() {}`) from a
     -- one-line *delegation* (`int Foo() => _inner.Foo();`) or a concise
@@ -99,6 +101,7 @@ SELECT file, line, start_byte, end_byte, start_col, end_line, end_col,
     -- stubs, whose `new` is a call — an acceptable, conservative trade that
     -- only lowers the count).
     (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.enclosing_function
+       AND m.file_id = imp.file_id
        AND (m.end_line - m.start_line + 1) <= 2
        AND NOT EXISTS (
          SELECT 1 FROM entities call
@@ -145,7 +148,14 @@ SELECT file, line, start_byte, end_byte, start_col, end_line, end_col,
     c.start_byte AS start_byte, c.end_byte AS end_byte, c.start_col AS start_col,
     c.end_line AS end_line, c.end_col AS end_col,
     c.name AS class_name,
-    (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = c.name) AS member_count,
+    -- Count methods that belong to THIS declaration, not every method whose
+    -- `owner_type` name collides across the repo. A method belongs to `c` when
+    -- it is declared in the same file and nested inside `c`'s byte span. Without
+    -- the file+span scope, N sample files each defining a `class MenuPlugin`
+    -- summed to a bogus "102 methods" (a 122/122 false-positive rate on .NET).
+    (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = c.name
+       AND m.file_id = c.file_id
+       AND m.start_byte >= c.start_byte AND m.end_byte <= c.end_byte) AS member_count,
     :max_members AS threshold
   FROM entities c
   JOIN files f ON f.id = c.file_id

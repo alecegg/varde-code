@@ -740,6 +740,19 @@ fn check_q_context_pack(db: &std::path::Path) -> Result<(), String> {
             "context_pack: readingOrder should mirror files 1:1, got {env}"
         ));
     }
+
+    // Audit S10: a multi-word query must tokenize and keyword-search, not match
+    // the literal phrase (which never appears verbatim) and return not_found.
+    // One matching token ("a.rs") unioned with a non-matching one must still
+    // resolve to the same seed as the single-token query above.
+    let multi = qrun("context_pack", db, r#""query":"a.rs zzznomatch""#);
+    assert_ok(&multi, "context_pack multi-word")?;
+    let multi_files = multi["data"]["files"].as_array();
+    if multi_files.is_none_or(|f| f.is_empty()) {
+        return Err(format!(
+            "context_pack: multi-word query should resolve via keyword search, got {multi}"
+        ));
+    }
     Ok(())
 }
 

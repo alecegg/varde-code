@@ -487,6 +487,30 @@ impl RowSource {
             RowSource::Symbols => String::new(),
         }
     }
+
+    /// `ORDER BY` expression that ranks a genuine *definition* ahead of a
+    /// weaker match with the same name: a type/function declaration beats a
+    /// variable/parameter binding, and (for symbols) a `Binding` beats a
+    /// `Reference` use-site. Without this a bare `get_symbol Foo` could return
+    /// a local variable or a use of `Foo` rather than the type `Foo` itself.
+    fn kind_priority_sql(self) -> String {
+        use crate::model::{EntityKind, SymbolKind};
+        match self {
+            RowSource::Entities => format!(
+                "CASE t.kind WHEN {class} THEN 0 WHEN {iface} THEN 0 WHEN {func} THEN 1 \
+                 WHEN {var} THEN 2 WHEN {param} THEN 3 ELSE 4 END",
+                class = EntityKind::Class.as_i64(),
+                iface = EntityKind::Interface.as_i64(),
+                func = EntityKind::Function.as_i64(),
+                var = EntityKind::Variable.as_i64(),
+                param = EntityKind::Parameter.as_i64(),
+            ),
+            RowSource::Symbols => format!(
+                "CASE t.kind WHEN {binding} THEN 0 ELSE 1 END",
+                binding = SymbolKind::Binding.as_i64(),
+            ),
+        }
+    }
 }
 
 /// Rows named `name` from `source`, optionally restricted to a specific `kind`
@@ -508,8 +532,9 @@ fn rows_by_name(
                 t.end_line, t.end_col
          FROM {} t JOIN files f ON f.id = t.file_id
          WHERE t.name = ?1{kind_clause}
-         ORDER BY t.id",
-        source.table()
+         ORDER BY {}, t.id",
+        source.table(),
+        source.kind_priority_sql()
     );
     // `?2` is the kind discriminant when filtering; when not, the `?2 = ?2`
     // tautology keeps a stable two-parameter binding (value is irrelevant).

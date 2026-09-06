@@ -157,6 +157,7 @@ fn role_tag_cluster_name(tag: RoleTag) -> String {
         RoleTag::BackgroundJob => "background_job",
         RoleTag::EventListener => "event_listener",
         RoleTag::Middleware => "middleware",
+        RoleTag::ProcessMain => "process_main",
     };
     format!("{snake}s")
 }

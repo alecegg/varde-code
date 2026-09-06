@@ -117,6 +117,20 @@ pub fn visit(
             ctx.push(EntityKind::Interface, name.clone(), node);
             visit_supertypes(node, &name, ctx);
         }
+        // `type Member = List[Int]` — a type member/alias; mapped to Interface
+        // (type-level). Previously dropped (audit S3).
+        "type_definition" => {
+            let name = field_name(node).unwrap_or_default();
+            ctx.push(EntityKind::Interface, name, node);
+        }
+        // `given regOrd: Ordering[Int] = ...` — a Scala 3 given (implicit
+        // instance); mapped to Variable (a named value). Anonymous givens have
+        // no name field and are dropped by the blank-name filter. Previously
+        // dropped entirely (audit S3).
+        "given_definition" => {
+            let name = field_name(node).unwrap_or_default();
+            ctx.push(EntityKind::Variable, name, node);
+        }
 
         // ---- variables ----
         "val_definition" | "var_definition" => {
@@ -343,6 +357,20 @@ mod tests {
 
     fn find<'a>(es: &'a [Entity], kind: EntityKind, name: &str) -> Option<&'a Entity> {
         es.iter().find(|e| e.kind == kind && e.name == name)
+    }
+
+    #[test]
+    fn given_and_type_definitions_are_captured() {
+        // Audit S3: Scala 3 `given` and `type` members were dropped.
+        let es = entities("given regOrd: Ordering[Int] = ???\ntype Member = List[Int]\n");
+        assert!(
+            find(&es, EntityKind::Variable, "regOrd").is_some(),
+            "given: {es:?}"
+        );
+        assert!(
+            find(&es, EntityKind::Interface, "Member").is_some(),
+            "type: {es:?}"
+        );
     }
 
     #[test]

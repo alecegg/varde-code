@@ -92,6 +92,15 @@ pub fn visit(
             }
         }
         "interface_declaration" => push_named(node, EntityKind::Interface, ctx),
+        // `type X = ...` — a first-class TS type declaration (alias, union,
+        // mapped type). Mapped to Interface (the closest structural type kind)
+        // so it is queryable via `symbols_in_file`/`get_symbol`; previously
+        // dropped entirely (audit S3: all 17 aliases in one file were missing).
+        "type_alias_declaration" => push_named(node, EntityKind::Interface, ctx),
+        // `enum X { ... }` / `const enum X { ... }` — a runtime object of named
+        // members; mapped to Class so it surfaces as a declaration rather than
+        // being dropped.
+        "enum_declaration" => push_named(node, EntityKind::Class, ctx),
         // Class/interface methods — previously invisible to extraction (only
         // top-level `function_declaration` emitted a Function entity), so
         // class-membership queries (SOLID interface-coverage/fat-interface
@@ -453,6 +462,33 @@ mod tests {
             .collect();
         assert_eq!(implements.len(), 1, "entities: {entities:?}");
         assert_eq!(implements[0].name, "Comparable");
+    }
+
+    #[test]
+    fn type_aliases_and_enums_are_captured_as_declarations() {
+        // Audit S3: `type X = ...` and `enum X {}` were dropped entirely, so
+        // they never appeared in symbols_in_file/get_symbol. Aliases map to
+        // Interface (type-level), enums to Class (runtime object of members).
+        let src = "export type JsonValue = string | number;\ntype Mode = \"a\" | \"b\";\nexport enum Color { Red, Green }\n";
+        let parsed = parse_source(&SupportLang::TypeScript, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        let interfaces: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Interface)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(
+            interfaces.contains(&"JsonValue") && interfaces.contains(&"Mode"),
+            "type aliases must be captured as Interface: {entities:?}"
+        );
+        assert!(
+            entities
+                .iter()
+                .any(|e| e.kind == EntityKind::Class && e.name == "Color"),
+            "enum must be captured as Class: {entities:?}"
+        );
     }
 
     #[test]

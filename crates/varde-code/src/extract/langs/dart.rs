@@ -116,7 +116,15 @@ pub fn visit(
         }
 
         // ---- structural ----
-        "function_signature" | "constructor_signature" => {
+        // Factory constructors and getters/setters are accessor/constructor
+        // methods that were previously dropped (audit S3: `factory Client()`
+        // and top-level `get zoneClient` invisible). Mapped to Function.
+        "function_signature"
+        | "constructor_signature"
+        | "factory_constructor_signature"
+        | "redirecting_factory_constructor_signature"
+        | "getter_signature"
+        | "setter_signature" => {
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Function, name, node);
         }
@@ -288,6 +296,28 @@ mod tests {
 
     fn find<'a>(es: &'a [Entity], kind: EntityKind, name: &str) -> Option<&'a Entity> {
         es.iter().find(|e| e.kind == kind && e.name == name)
+    }
+
+    #[test]
+    fn factory_constructors_and_getters_are_captured() {
+        // Audit S3: factory constructors and getters/setters were dropped.
+        let es = entities(
+            "class Client {\n  factory Client() => Client._();\n  Client._();\n  Client? get zoneClient => null;\n  set mode(int v) {}\n}\n",
+        );
+        assert!(
+            find(&es, EntityKind::Function, "zoneClient").is_some(),
+            "getter: {es:?}"
+        );
+        assert!(
+            find(&es, EntityKind::Function, "mode").is_some(),
+            "setter: {es:?}"
+        );
+        // At least two Function entities named "Client" (factory + named ctor).
+        let ctors = es
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function && e.name == "Client")
+            .count();
+        assert!(ctors >= 2, "factory + named ctor both captured: {es:?}");
     }
 
     #[test]

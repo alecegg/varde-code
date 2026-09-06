@@ -28,8 +28,16 @@ use crate::model::{Entity, EntityKind};
 use ast_grep_core::tree_sitter::StrDoc;
 use ast_grep_language::SupportLang;
 
-/// Node kinds that introduce a named function scope.
-pub const TYPE_SCOPES: &[&str] = &["class_declaration", "interface_declaration"];
+/// Node kinds that introduce a named type scope (members inside record
+/// `owner_type`). Records and structs carry methods/properties too, so they
+/// join class/interface here — otherwise a record's members would have no
+/// owning type for class-membership queries (SOLID rules).
+pub const TYPE_SCOPES: &[&str] = &[
+    "class_declaration",
+    "interface_declaration",
+    "record_declaration",
+    "struct_declaration",
+];
 
 pub const FUNCTION_SCOPES: &[&str] = &[
     "method_declaration",
@@ -92,7 +100,11 @@ pub fn visit(
                 node,
             );
         }
-        "class_declaration" => {
+        // `record`/`record class`/`record struct` share class semantics: a
+        // record can inherit one base record plus interfaces, so it reuses the
+        // class heritage heuristic. Previously dropped entirely (audit S3: a
+        // `public record` produced no type symbol, only its constructor).
+        "class_declaration" | "record_declaration" => {
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Class, name.clone(), node);
             maybe_export(node, &name, ctx);
@@ -129,6 +141,42 @@ pub fn visit(
                     push_type_ref(ctx, EntityKind::Extends, ty, &name, &base_list);
                 }
             }
+        }
+
+        // `struct Foo : IBar` — structs cannot inherit a base class, so every
+        // base_list entry is an interface (Implements). Previously dropped
+        // entirely (audit S3: a `readonly struct` produced no type symbol).
+        "struct_declaration" => {
+            let name = field_name(node).unwrap_or_default();
+            ctx.push(EntityKind::Class, name.clone(), node);
+            maybe_export(node, &name, ctx);
+            if let Some(base_list) = node.children().find(|c| c.kind() == "base_list") {
+                for ty in base_list_types(&base_list) {
+                    push_type_ref(ctx, EntityKind::Implements, ty, &name, &base_list);
+                }
+            }
+        }
+        // `enum Color { ... }` (incl. nested enums) — a runtime type of named
+        // members; mapped to Class so it surfaces as a declaration. Its `: byte`
+        // base is a storage type, not inheritance, so no heritage is emitted.
+        "enum_declaration" => {
+            let name = field_name(node).unwrap_or_default();
+            ctx.push(EntityKind::Class, name.clone(), node);
+            maybe_export(node, &name, ctx);
+        }
+
+        // ---- properties ----
+        // `public int Foo { get; set; }` — a property is declared state, the
+        // C# analog of a field; mapped to Variable with its owning type (via
+        // `ctx.push`) so class-membership queries see it. Previously never
+        // captured (audit S3: 0 properties anywhere). A TypeRef links it to its
+        // declared type for receiver resolution, mirroring field handling.
+        "property_declaration" => {
+            let name = field_name(node).unwrap_or_default();
+            if let Some(ty) = node.field("type") {
+                push_type_ref_for_var(ctx, &strip_generic_args(&ty.text()), &name, node);
+            }
+            ctx.push(EntityKind::Variable, name, node);
         }
 
         // ---- variables / parameters ----
@@ -507,6 +555,55 @@ mod tests {
             .collect();
         assert_eq!(extends.len(), 1, "entities: {entities:?}");
         assert_eq!(extends[0].name, "Base");
+    }
+
+    #[test]
+    fn records_structs_enums_and_properties_are_captured() {
+        // Audit S3: record/struct/enum type declarations and properties were
+        // never emitted (only their constructors appeared, mis-labeled).
+        let src = "public record Step : Base { public int X { get; } }\n\
+                   public struct Purpose : IEquatable<Purpose> { }\n\
+                   public class Kernel { public IServiceProvider Services { get; } public enum Behavior { A } }\n";
+        let parsed = parse_source(&SupportLang::CSharp, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        let classes: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Class)
+            .map(|e| e.name.as_str())
+            .collect();
+        for expect in ["Step", "Purpose", "Kernel", "Behavior"] {
+            assert!(
+                classes.contains(&expect),
+                "missing class {expect}: {classes:?}"
+            );
+        }
+        // Properties are captured as Variable carrying their owning type.
+        let x = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Variable && e.name == "X")
+            .expect("property X captured");
+        assert_eq!(x.owner_type.as_deref(), Some("Step"));
+        assert!(
+            entities.iter().any(|e| e.kind == EntityKind::Variable
+                && e.name == "Services"
+                && e.owner_type.as_deref() == Some("Kernel")),
+            "property Services with owner: {entities:?}"
+        );
+        // A record inherits a base (Extends); a struct only implements.
+        assert!(
+            entities
+                .iter()
+                .any(|e| e.kind == EntityKind::Extends && e.name == "Base"),
+            "record base as Extends: {entities:?}"
+        );
+        assert!(
+            entities
+                .iter()
+                .any(|e| e.kind == EntityKind::Implements && e.name == "IEquatable"),
+            "struct interface as Implements: {entities:?}"
+        );
     }
 
     #[test]

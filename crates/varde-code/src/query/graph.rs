@@ -7,7 +7,7 @@
 //! O(1) in the number of nodes and cyclic input always terminates.
 
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::{ApiError, db_err, freshen_for_mode, open_db, opt_str, req_str};
@@ -339,14 +339,18 @@ pub fn symbol_blast_radius(input: &serde_json::Value) -> Result<serde_json::Valu
     }))
 }
 
-/// type_hierarchy — declaration context chain of a type.
+/// type_hierarchy — inheritance graph of a type.
 ///
-/// Inputs: `name` (required), `filePath` (optional). Output:
-/// `{name, kind, file, span, enclosing_function}` — the persisted containment
-/// hierarchy available in the schema (entity → enclosing function → file).
-/// `not_found` when no matching entity exists.
+/// Inputs: `name` (required), `filePath` (optional). Resolves `name` to a type
+/// *declaration* (class/interface, preferred over a same-named reference or
+/// call-site) and walks the `Extends`/`Implements` edge set both ways, scoped
+/// to the seed's language. Output: `{symbol, supertypes, subtypes, hierarchy}`
+/// where `supertypes` are the transitive parents, `subtypes` the transitive
+/// implementers/subclasses, and `hierarchy` the ancestor chain (parent-first)
+/// ending in the seed. `not_found` when no matching entity exists.
 /// A single `entities JOIN files` row shared by [`type_hierarchy`]'s initial
-/// lookup and its parent-walk loop.
+/// lookup and its inheritance walk.
+#[derive(Clone)]
 struct EntityRow {
     kind: String,
     name: String,
@@ -400,30 +404,101 @@ fn map_entity_row(r: &rusqlite::Row) -> rusqlite::Result<EntityRow> {
     })
 }
 
-/// Look up a single `entities JOIN files` row by name, optionally scoped to a
-/// declaring file path. Returns the first match ordered by entity id.
-fn entity_row(
-    conn: &rusqlite::Connection,
+/// Direction of an inheritance walk from a seed type.
+#[derive(Clone, Copy)]
+enum HierDir {
+    /// Toward supertypes (the seed's parents): follow `enclosing_function`
+    /// (subtype) → `name` (supertype).
+    Up,
+    /// Toward subtypes (the seed's implementers/subclasses): follow `name`
+    /// (supertype) → `enclosing_function` (subtype).
+    Down,
+}
+
+/// Resolve a type name to its declaration (class/interface), scoped to a
+/// language so a `Shape` in Rust never resolves to a `Shape` in Haskell.
+/// Returns `None` when the type is not declared in the indexed repo (e.g. an
+/// external supertype like `JpaRepository`).
+fn resolve_type_decl(
+    conn: &Connection,
     name: &str,
-    file_filter: Option<&str>,
-) -> rusqlite::Result<Option<EntityRow>> {
-    match file_filter {
-        Some(path) => {
-            let sql = format!(
-                "SELECT {ENTITY_ROW_COLUMNS} FROM entities e JOIN files f ON f.id = e.file_id \
-                 WHERE e.name = ?1 AND f.path = ?2 ORDER BY e.id LIMIT 1"
-            );
-            conn.query_row(&sql, rusqlite::params![name, path], map_entity_row)
-                .optional()
+    lang: Option<ast_grep_language::SupportLang>,
+) -> Result<Option<EntityRow>, ApiError> {
+    let sql = format!(
+        "SELECT {ENTITY_ROW_COLUMNS} FROM entities e JOIN files f ON f.id = e.file_id \
+         WHERE e.name = ?1 AND e.kind IN (1, 2) ORDER BY e.id"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+    let rows = stmt.query_map([name], map_entity_row).map_err(db_err)?;
+    for row in rows {
+        let row = row.map_err(db_err)?;
+        if lang.is_some()
+            && crate::parse::language_for_path(std::path::Path::new(&row.path)) != lang
+        {
+            continue;
         }
-        None => {
-            let sql = format!(
-                "SELECT {ENTITY_ROW_COLUMNS} FROM entities e JOIN files f ON f.id = e.file_id \
-                 WHERE e.name = ?1 ORDER BY e.id LIMIT 1"
-            );
-            conn.query_row(&sql, [name], map_entity_row).optional()
+        return Ok(Some(row));
+    }
+    Ok(None)
+}
+
+/// Breadth-first walk of the `Extends`/`Implements` edge set from `seed_name`
+/// in one direction. Edges are stored as `kind IN (15, 16)` entities with
+/// `enclosing_function` = subtype and `name` = supertype (see
+/// `resolve::resolve_type_hierarchy` and the `deep-inheritance` rule). The walk
+/// is language-scoped (the edge lives in the subtype's file) and cycle-guarded.
+fn walk_inheritance(
+    conn: &Connection,
+    seed_name: &str,
+    lang: Option<ast_grep_language::SupportLang>,
+    dir: HierDir,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let (match_col, read_col) = match dir {
+        HierDir::Up => ("enclosing_function", "name"),
+        HierDir::Down => ("name", "enclosing_function"),
+    };
+    let sql = format!(
+        "SELECT DISTINCT e.{read_col} AS neighbor, f.path AS path \
+         FROM entities e JOIN files f ON f.id = e.file_id \
+         WHERE e.kind IN (15, 16) AND e.{match_col} = ?1 \
+           AND e.{read_col} IS NOT NULL AND e.{read_col} <> ''"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(seed_name.to_string());
+    let mut queue: VecDeque<String> = VecDeque::new();
+    queue.push_back(seed_name.to_string());
+    while let Some(cur) = queue.pop_front() {
+        let rows = stmt
+            .query_map([&cur], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(db_err)?;
+        let mut neighbors = Vec::new();
+        for row in rows {
+            let (neighbor, path) = row.map_err(db_err)?;
+            // The edge lives in the subtype's file; only follow edges declared
+            // in a file of the seed's language.
+            if lang.is_some()
+                && crate::parse::language_for_path(std::path::Path::new(&path)) != lang
+            {
+                continue;
+            }
+            neighbors.push(neighbor);
+        }
+        for neighbor in neighbors {
+            if !seen.insert(neighbor.clone()) {
+                continue;
+            }
+            let node = resolve_type_decl(conn, &neighbor, lang)?
+                .map(|r| r.to_json())
+                .unwrap_or_else(|| serde_json::json!({"name": neighbor, "kind": "unknown"}));
+            out.push(node);
+            queue.push_back(neighbor);
         }
     }
+    Ok(out)
 }
 
 pub fn type_hierarchy(input: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
@@ -432,13 +507,17 @@ pub fn type_hierarchy(input: &serde_json::Value) -> Result<serde_json::Value, Ap
     let name = req_str(input, "name")?;
     let file_path = opt_str(input, "filePath");
 
+    // Gather every entity matching `name` (optionally scoped to a file) so we
+    // can prefer an actual type *declaration* (class/interface) over a
+    // reference, call-site, or local variable that merely shares the name — the
+    // root cause of `type_hierarchy` resolving to a use rather than a def.
     let sql = format!(
         "SELECT {ENTITY_ROW_COLUMNS} FROM entities e JOIN files f ON f.id = e.file_id \
          WHERE e.name = ?1 ORDER BY e.id"
     );
     let mut stmt = conn.prepare(&sql).map_err(db_err)?;
     let rows = stmt.query_map([name], map_entity_row).map_err(db_err)?;
-    let mut matches = Vec::new();
+    let mut candidates = Vec::new();
     for row in rows {
         let row = row.map_err(db_err)?;
         if let Some(fp) = file_path
@@ -446,44 +525,34 @@ pub fn type_hierarchy(input: &serde_json::Value) -> Result<serde_json::Value, Ap
         {
             continue;
         }
-        matches.push(row.to_json());
+        candidates.push(row);
     }
-    if matches.is_empty() {
+    if candidates.is_empty() {
         return Err(ApiError::not_found(format!("type {name:?}")));
     }
-    // Hierarchy: the type itself plus the enclosing chain, parent-first.
-    // `seen` guards against a cycle: `entity_row`'s `name + file ORDER BY id
-    // LIMIT 1` lookup means two same-file entities that mutually enclose
-    // each other by name would otherwise loop forever (the only other exit
-    // is an empty/absent `enclosing_function`).
-    let mut chain = Vec::new();
-    let mut seen = HashSet::new();
-    let mut current = matches[0].clone();
-    loop {
-        let current_name = current["name"].as_str().unwrap_or("").to_string();
-        let current_file = current["file"].as_str().unwrap_or("").to_string();
-        if !seen.insert((current_file.clone(), current_name)) {
-            break;
-        }
-        chain.push(current.clone());
-        let enclosing = current["enclosing_function"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        if enclosing.is_empty() {
-            break;
-        }
-        let parent = entity_row(&conn, &enclosing, Some(&current_file))
-            .map_err(db_err)
-            .ok()
-            .flatten();
-        let Some(parent) = parent else { break };
-        current = parent.to_json();
-    }
-    chain.reverse();
+    let seed = candidates
+        .iter()
+        .find(|r| r.kind == "class" || r.kind == "interface")
+        .cloned()
+        .unwrap_or_else(|| candidates[0].clone());
+    let seed_lang = crate::parse::language_for_path(std::path::Path::new(&seed.path));
+
+    // Supertypes (parents) and subtypes (implementers/subclasses), walked over
+    // the inheritance edge set rather than the lexical-enclosing chain.
+    let supertypes = walk_inheritance(&conn, &seed.name, seed_lang, HierDir::Up)?;
+    let subtypes = walk_inheritance(&conn, &seed.name, seed_lang, HierDir::Down)?;
+
+    // Backward-compatible `hierarchy`: the ancestor chain parent-first, ending
+    // in the seed itself. Previously this was the lexical-enclosing chain; it is
+    // now the inheritance ancestry, which is what the field name implies.
+    let mut hierarchy: Vec<serde_json::Value> = supertypes.iter().rev().cloned().collect();
+    hierarchy.push(seed.to_json());
+
     Ok(serde_json::json!({
-        "symbol": matches[0],
-        "hierarchy": chain,
+        "symbol": seed.to_json(),
+        "supertypes": supertypes,
+        "subtypes": subtypes,
+        "hierarchy": hierarchy,
     }))
 }
 

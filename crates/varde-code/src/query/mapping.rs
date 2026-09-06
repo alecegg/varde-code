@@ -636,27 +636,48 @@ pub fn context_pack(input: &serde_json::Value) -> Result<serde_json::Value, ApiE
     let conn = open_db(input)?;
     let query = req_str(input, "query")?;
 
+    // Split the query into whitespace-delimited keywords so a multi-word query
+    // ("http router") does keyword search instead of matching the literal phrase
+    // — the phrase never appears verbatim in a path or symbol name, so the whole
+    // pack returned `not_found`. Each token seeds independently and the matches
+    // are unioned. A single-word query yields one token and behaves exactly as
+    // before. An all-whitespace query falls back to the raw string (→ no match →
+    // the same `not_found` as before).
+    let tokens: Vec<&str> = {
+        let split: Vec<&str> = query.split_whitespace().collect();
+        if split.is_empty() { vec![query] } else { split }
+    };
+
     // Step 1: file/directory-path substring match (case-insensitive; a path
     // already contains its directory components, so no separate dir query).
     let mut stmt = conn
         .prepare("SELECT id FROM files WHERE lower(path) LIKE '%' || lower(?1) || '%'")
         .map_err(db_err)?;
-    let mut seed_ids: HashSet<i64> = stmt
-        .query_map([query], |r| r.get::<_, i64>(0))
-        .map_err(db_err)?
-        .collect::<std::result::Result<_, _>>()
-        .map_err(db_err)?;
+    let mut seed_ids: HashSet<i64> = HashSet::new();
+    for tok in &tokens {
+        for id in stmt
+            .query_map([tok], |r| r.get::<_, i64>(0))
+            .map_err(db_err)?
+        {
+            seed_ids.insert(id.map_err(db_err)?);
+        }
+    }
 
-    // Step 1 (symbols): exact name match wins; substring fallback only when
-    // exact finds nothing — same tiering as `explore`'s `resolve_seeds`.
+    // Step 1 (symbols): exact name match wins; substring fallback only when the
+    // exact pass finds nothing for *any* token — same tiering as `explore`'s
+    // `resolve_seeds`, applied per token then unioned.
     let mut stmt = conn
         .prepare("SELECT name, kind, file_id FROM entities WHERE name = ?1 ORDER BY id")
         .map_err(db_err)?;
-    let mut symbol_rows: Vec<(String, i64, i64)> = stmt
-        .query_map([query], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .map_err(db_err)?
-        .collect::<std::result::Result<_, _>>()
-        .map_err(db_err)?;
+    let mut symbol_rows: Vec<(String, i64, i64)> = Vec::new();
+    for tok in &tokens {
+        for row in stmt
+            .query_map([tok], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(db_err)?
+        {
+            symbol_rows.push(row.map_err(db_err)?);
+        }
+    }
     if symbol_rows.is_empty() {
         let mut stmt = conn
             .prepare(
@@ -664,11 +685,22 @@ pub fn context_pack(input: &serde_json::Value) -> Result<serde_json::Value, ApiE
                  WHERE lower(name) LIKE '%' || lower(?1) || '%' ORDER BY id LIMIT 200",
             )
             .map_err(db_err)?;
-        symbol_rows = stmt
-            .query_map([query], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .map_err(db_err)?
-            .collect::<std::result::Result<_, _>>()
-            .map_err(db_err)?;
+        for tok in &tokens {
+            for row in stmt
+                .query_map([tok], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(db_err)?
+            {
+                symbol_rows.push(row.map_err(db_err)?);
+            }
+        }
+    }
+
+    // Distinct tokens can match the same symbol (e.g. "http"/"handler" both
+    // substring-match `httpHandler`); dedup so it appears once, keeping first
+    // occurrence (which preserves the by-id order for a single-token query).
+    {
+        let mut seen: HashSet<(String, i64, i64)> = HashSet::new();
+        symbol_rows.retain(|row| seen.insert(row.clone()));
     }
 
     // Step 2: every direct match becomes a seed.

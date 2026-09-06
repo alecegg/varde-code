@@ -678,6 +678,79 @@ mod tests {
     }
 
     #[test]
+    fn builtin_fat_interface_counts_methods_per_declaration_not_by_global_name() {
+        // Regression: `fat-interface`'s member count must be scoped to the
+        // declaration's own file+byte span, not every method whose `owner_type`
+        // name collides across the repo. Previously N sample files each defining
+        // a `class MenuPlugin` summed their methods into one bogus count (a
+        // 122/122 false-positive rate on semantic-kernel — a 2-method class
+        // reported as "declares 102 methods").
+        let (_dir, conn) = temp_db("builtin-fat-interface-scope");
+        conn.execute_batch(
+            "INSERT INTO files (path) VALUES
+                ('fat.rs'),      -- id 1: one genuinely fat class (16 methods)
+                ('a.rs'),        -- id 2: a `Widget` with 10 methods
+                ('b.rs');        -- id 3: a DIFFERENT `Widget` with 10 methods
+             -- One real fat class: 16 methods nested in Fat's [0, 10000) span.
+             INSERT INTO entities (kind, name, file_id, start_byte, end_byte,
+                                   start_line, start_col, end_line, end_col)
+             VALUES (1, 'Fat', 1, 0, 10000, 1, 0, 400, 1);",
+        )
+        .expect("fat class insert");
+        // 16 methods for Fat.
+        for i in 0..16 {
+            let sb = 100 + i * 20;
+            conn.execute(
+                "INSERT INTO entities (kind, name, file_id, start_byte, end_byte,
+                    start_line, start_col, end_line, end_col, owner_type)
+                 VALUES (0, ?1, 1, ?2, ?3, ?4, 0, ?4, 5, 'Fat')",
+                rusqlite::params![format!("fm{i}"), sb, sb + 10, 10 + i],
+            )
+            .expect("fat method insert");
+        }
+        // Two SEPARATE `Widget` classes (different files), 10 methods each.
+        // Per-declaration each is under the 15 threshold; only the old
+        // global-name sum (20) would (wrongly) fire.
+        for (fid, tag) in [(2u32, "a"), (3u32, "b")] {
+            conn.execute(
+                "INSERT INTO entities (kind, name, file_id, start_byte, end_byte,
+                    start_line, start_col, end_line, end_col)
+                 VALUES (1, 'Widget', ?1, 0, 5000, 1, 0, 200, 1)",
+                rusqlite::params![fid],
+            )
+            .expect("widget class insert");
+            for i in 0..10 {
+                let sb = 100 + i * 20;
+                conn.execute(
+                    "INSERT INTO entities (kind, name, file_id, start_byte, end_byte,
+                        start_line, start_col, end_line, end_col, owner_type)
+                     VALUES (0, ?1, ?2, ?3, ?4, ?5, 0, ?5, 5, 'Widget')",
+                    rusqlite::params![format!("{tag}m{i}"), fid, sb, sb + 10, 10 + i],
+                )
+                .expect("widget method insert");
+            }
+        }
+
+        let rules = crate::rules::builtin_rules();
+        let (findings, diagnostics) = run_sql_rules(&rules, &conn).expect("runs");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let fat: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.rule_id == "fat-interface")
+            .collect();
+        // Exactly one finding — the genuinely fat class. Neither `Widget`
+        // declaration fires (10 < 15 each), proving counts are per-declaration.
+        assert_eq!(fat.len(), 1, "only the 16-method class fires: {fat:?}");
+        assert_eq!(fat[0].location.file, "fat.rs");
+        assert!(
+            fat[0].message.contains("declares 16 methods"),
+            "count must be the per-declaration 16, not a cross-file sum: {}",
+            fat[0].message
+        );
+    }
+
+    #[test]
     fn builtin_vertical_slice_sprawl_fires_only_at_or_above_foreign_slice_threshold() {
         let (_dir, conn) = temp_db("builtin-vertical-slice-sprawl");
         conn.execute_batch(
@@ -815,6 +888,24 @@ mod tests {
                 ("tri_c.rs".to_string(), 30),
             ],
             "every member of the qualifying band is reported at its own line"
+        );
+        // Precise span carried from the anchor entity, not the line-only
+        // fallback that collapsed `end_line` to `start_line` with zero
+        // byte/col — the "C/C++ zeroed scan spans" bug, which was really every
+        // SQL rule that selected only `line`. The fixture's band members end at
+        // `start_line + 2`, col 4, byte 10.
+        let mut spans: Vec<(u32, u32, u32, u32)> = clone_findings
+            .iter()
+            .map(|f| {
+                let s = &f.location.span;
+                (s.start_line, s.end_line, s.end_byte, s.end_col)
+            })
+            .collect();
+        spans.sort();
+        assert_eq!(
+            spans,
+            vec![(10, 12, 10, 4), (20, 22, 10, 4), (30, 32, 10, 4)],
+            "clone findings carry the anchor entity's full byte/line/col span"
         );
         assert!(
             clone_findings

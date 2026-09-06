@@ -52,22 +52,77 @@ pub fn is_scaffold_template_path(path: &str) -> bool {
 
 /// Directory names (as path components) that mark a path as
 /// generated/vendored and therefore noise for navigation purposes.
-const EXCLUDED_DIR_COMPONENTS: &[&str] = &["target", "node_modules", "dist", "build"];
-
-/// Returns `true` if `path` is under a generated/vendored directory such as
-/// `target/`, `node_modules/`, `dist/`, or `build/`.
 ///
-/// Matching is component-based: a path only matches if one of its
-/// directory components exactly equals an excluded name (e.g. `target`),
-/// so `distiller.rs` or `crates/distributor/` do not false-positive.
+/// `vendor`/`third_party`/`bower_components` are third-party dependency trees;
+/// `.next`/`.nuxt` are framework build output; `grammars` is the tree-sitter
+/// convention for a directory of generated `parser.c`/grammar files (the audit
+/// found 25 false-positive complexity findings on `grammars/*/parser.c`).
+const EXCLUDED_DIR_COMPONENTS: &[&str] = &[
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    "vendor",
+    "third_party",
+    "third-party",
+    "bower_components",
+    ".next",
+    ".nuxt",
+    "grammars",
+];
+
+/// Consecutive path-component sequences that mark a framework's *compiled*
+/// asset tree — generated/bundled output living under an otherwise-ordinary
+/// name. Matched as an adjacent window so a lone `static/` (a real source dir
+/// in many apps) is not excluded. Phoenix serves compiled JS/CSS from
+/// `priv/static/` (the audit found 87% of one repo's findings cited
+/// `priv/static/phoenix.*.js` bundles).
+const EXCLUDED_DIR_SEQUENCES: &[&[&str]] = &[&["priv", "static"]];
+
+/// Filename suffixes that mark a file as a minified/bundled asset rather than
+/// source a human edits (`app.min.js`, `vendor.bundle.js`, ...).
+const GENERATED_FILE_SUFFIXES: &[&str] = &[
+    ".min.js",
+    ".min.mjs",
+    ".min.cjs",
+    ".min.css",
+    ".bundle.js",
+    ".bundle.mjs",
+];
+
+/// Returns `true` if `path` is generated/vendored: under a dependency/build
+/// directory (`target/`, `node_modules/`, `vendor/`, `grammars/`, ...), under a
+/// framework compiled-asset tree (`priv/static/`), or a minified/bundled
+/// filename (`*.min.js`, `*.bundle.js`).
+///
+/// Matching is component-based: a path only matches on a whole directory
+/// component (e.g. `target`), never a substring, so `distiller.rs` or
+/// `crates/distributor/` do not false-positive.
 pub fn is_generated_or_vendored_path(path: &str) -> bool {
-    Path::new(path).components().any(|component| {
-        component
-            .as_os_str()
-            .to_str()
-            .map(|s| EXCLUDED_DIR_COMPONENTS.contains(&s))
-            .unwrap_or(false)
-    })
+    let p = Path::new(path);
+    let components: Vec<&str> = p
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    if components
+        .iter()
+        .any(|c| EXCLUDED_DIR_COMPONENTS.contains(c))
+    {
+        return true;
+    }
+    if EXCLUDED_DIR_SEQUENCES
+        .iter()
+        .any(|seq| components.windows(seq.len()).any(|w| w == *seq))
+    {
+        return true;
+    }
+    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+        let lower = name.to_ascii_lowercase();
+        if GENERATED_FILE_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -86,6 +141,29 @@ mod tests {
     fn true_for_nested_generated_or_vendored_paths() {
         assert!(is_generated_or_vendored_path("crates/foo/target/debug/x"));
         assert!(is_generated_or_vendored_path("a/b/node_modules/c.js"));
+    }
+
+    #[test]
+    fn true_for_broadened_generated_cases() {
+        // Audit S8: these were the specific false-positive sources.
+        assert!(is_generated_or_vendored_path("priv/static/phoenix.js"));
+        assert!(is_generated_or_vendored_path("priv/static/phoenix.cjs.js"));
+        assert!(is_generated_or_vendored_path("priv/static/phoenix.mjs"));
+        assert!(is_generated_or_vendored_path("assets/app.min.js"));
+        assert!(is_generated_or_vendored_path("public/vendor.bundle.js"));
+        assert!(is_generated_or_vendored_path("grammars/kotlin/parser.c"));
+        assert!(is_generated_or_vendored_path("vendor/lib/dep.go"));
+        assert!(is_generated_or_vendored_path("third_party/x/y.cc"));
+    }
+
+    #[test]
+    fn false_for_lookalikes_of_broadened_cases() {
+        // A lone `static/` source dir must not be excluded (only `priv/static`).
+        assert!(!is_generated_or_vendored_path("static/site.js"));
+        assert!(!is_generated_or_vendored_path("app/static/handler.rs"));
+        // A hand-written file that merely ends in these words is source.
+        assert!(!is_generated_or_vendored_path("src/admin.js"));
+        assert!(!is_generated_or_vendored_path("src/parser.rs"));
     }
 
     #[test]

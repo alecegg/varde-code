@@ -22,6 +22,11 @@ pub enum RoleTag {
     BackgroundJob,
     EventListener,
     Middleware,
+    /// A language process entrypoint: the `main`/`Main` function a compiled or
+    /// interpreted program starts at (Rust/Go/C/C++/Java/Kotlin `main`, C#
+    /// `Main`). Not decorator/base-class inferred — detected structurally by
+    /// name + language (see `query::entrypoints::detect_process_mains`).
+    ProcessMain,
 }
 
 /// One declarative rule: a symbol matches when every `Some(_)` field matches

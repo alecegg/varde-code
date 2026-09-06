@@ -278,6 +278,30 @@ pub(crate) fn resolve_imports(
         .collect();
     let stem_index = build_stem_index(files);
     let relative_path_index = build_relative_path_index(files);
+    let path_suffix_index = build_path_suffix_index(files);
+    let package_index = build_package_index(files);
+    let file_lang: Vec<Option<ast_grep_language::SupportLang>> = files
+        .iter()
+        .map(|p| crate::parse::language_for_path(std::path::Path::new(p)))
+        .collect();
+    let module_index = build_module_def_index(entities, &file_lang);
+    // Go packages are directories, mapped through go.mod's module path — a
+    // resolution model distinct from the file-stem matcher below. Only paid for
+    // when the repo actually has a go.mod.
+    let go_modules = discover_go_modules(files);
+    let go_pkg_index = if go_modules.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        build_go_package_index(files)
+    };
+    let indexes = ImportIndexes {
+        by_path: &by_path,
+        stem: &stem_index,
+        relative: &relative_path_index,
+        path_suffix: &path_suffix_index,
+        package: &package_index,
+        module: &module_index,
+    };
 
     let mut edges = Vec::new();
     for (i, entity) in entities.iter().enumerate() {
@@ -298,13 +322,45 @@ pub(crate) fn resolve_imports(
             );
             continue;
         };
-        let target = match_import_target(
-            &entity.name,
-            from_file,
-            &by_path,
-            &stem_index,
-            &relative_path_index,
-        );
+        // Go imports name a package (a directory of `.go` files) via go.mod's
+        // module path, not a single file — resolve them separately, emitting one
+        // edge per file in the target package. Skip the file-stem matcher for Go
+        // so a stdlib import (`fmt`, `os`) can't accidentally stem-match a local
+        // file.
+        if file_lang.get(from_id as usize).copied().flatten()
+            == Some(ast_grep_language::SupportLang::Go)
+        {
+            match resolve_go_import(&entity.name, from_id, &go_modules, &go_pkg_index) {
+                Some(targets) => {
+                    for t in targets {
+                        edges.push(ResolvedEdge {
+                            from: from_id,
+                            to: EdgeTarget::File(t),
+                            kind: EdgeKind::Import,
+                            resolved: true,
+                            from_entity: Some(i as u32),
+                        });
+                    }
+                }
+                None => {
+                    tracing::debug!(
+                        file = %from_file,
+                        kind = "import",
+                        specifier = %entity.name,
+                        "unresolved reference"
+                    );
+                    edges.push(ResolvedEdge {
+                        from: from_id,
+                        to: EdgeTarget::Unknown,
+                        kind: EdgeKind::Import,
+                        resolved: false,
+                        from_entity: Some(i as u32),
+                    });
+                }
+            }
+            continue;
+        }
+        let target = match_import_target(&entity.name, from_file, &indexes);
         if target.is_none() {
             // debug, not warn: on a large repo this fires per-unresolved-import
             // (often tens of thousands of times) — warn-level volume made
@@ -374,26 +430,321 @@ fn build_relative_path_index(files: &[String]) -> RelativePathIndex {
     index
 }
 
-/// Find the file an import specifier points at, or `None`.
-fn match_import_target(
+/// Filenames that make their containing *directory* an importable package: a
+/// directory import (`from pkg import X`, `import a.b`, `require "a.b"`)
+/// resolves to this index file rather than a same-named file. Python packages
+/// use `__init__.py`; Node/TS resolve a bare directory import to `index.*`;
+/// Lua's `require` finds a directory's `init.lua`.
+const PACKAGE_INDEX_FILES: &[&str] = &[
+    "__init__.py",
+    "index.js",
+    "index.jsx",
+    "index.mjs",
+    "index.cjs",
+    "index.ts",
+    "index.tsx",
+    "init.lua",
+];
+
+/// `directory-path-suffix -> [(index-file id, language)]`. For a package index
+/// file at `a/b/__init__.py`, every suffix of its directory (`a/b`, then `b`)
+/// maps to it, so both a fully-qualified `import a.b` and a bare
+/// `from b import X` can match — longest suffix tried first for specificity,
+/// ambiguity left unresolved (same deterministic rule as the stem index).
+type PackageIndex =
+    std::collections::HashMap<String, Vec<(u32, Option<ast_grep_language::SupportLang>)>>;
+
+/// `module-name -> [(declaring-file id, language)]` for namespaced module
+/// declarations (Elixir `defmodule Foo.Bar` emits a `Class` whose name is the
+/// full dotted path). Lets an `alias`/`import`/`use Foo.Bar` resolve to the
+/// file that declares the module even though Elixir's snake_case file names
+/// never stem-match a PascalCase module path. Only dotted names are indexed: a
+/// bare `Foo` collides with every same-named class across the repo, while a
+/// dotted `Foo.Bar` is specific enough to key on.
+type ModuleDefIndex =
+    std::collections::HashMap<String, Vec<(u32, Option<ast_grep_language::SupportLang>)>>;
+
+/// `path-suffix -> [(file id, language)]` over every file's trailing path
+/// segments (extensionless), bounded to the last [`MAX_PATH_SUFFIX`] segments.
+/// Lets a multi-segment module path (`from a.b.c import X`, `use crate::a::b`)
+/// resolve on its full trailing path — `crewai/agent/core` picks the one
+/// `.../crewai/agent/core.py` — instead of colliding on the bare `core` stem.
+type PathSuffixIndex =
+    std::collections::HashMap<String, Vec<(u32, Option<ast_grep_language::SupportLang>)>>;
+
+/// Cap on how many trailing segments the path-suffix index stores per file (and
+/// the longest spec suffix tried). Module specifiers rarely need more than a
+/// few trailing segments to disambiguate; the cap keeps the index bounded on
+/// deep trees.
+const MAX_PATH_SUFFIX: usize = 6;
+
+/// Build the path-suffix index once per resolve pass.
+fn build_path_suffix_index(files: &[String]) -> PathSuffixIndex {
+    let mut index: PathSuffixIndex = std::collections::HashMap::new();
+    for (i, p) in files.iter().enumerate() {
+        let path = std::path::Path::new(p);
+        let lang = crate::parse::language_for_path(path);
+        let norm = normalize_path(path).with_extension("");
+        let comps: Vec<String> = norm
+            .components()
+            .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_string()))
+            .collect();
+        let n = comps.len();
+        let lo = n.saturating_sub(MAX_PATH_SUFFIX);
+        for start in lo..n {
+            let key = comps[start..].join("/");
+            if key.is_empty() {
+                continue;
+            }
+            index.entry(key).or_default().push((i as u32, lang));
+        }
+    }
+    index
+}
+
+/// Build the package-index (directory imports) once per resolve pass.
+fn build_package_index(files: &[String]) -> PackageIndex {
+    let mut index: PackageIndex = std::collections::HashMap::new();
+    for (i, p) in files.iter().enumerate() {
+        let path = std::path::Path::new(p);
+        let is_index = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| PACKAGE_INDEX_FILES.contains(&n));
+        if !is_index {
+            continue;
+        }
+        let Some(dir) = path.parent() else { continue };
+        let lang = crate::parse::language_for_path(path);
+        let dir_norm = normalize_path(dir);
+        let comps: Vec<String> = dir_norm
+            .components()
+            .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_string()))
+            .collect();
+        for start in 0..comps.len() {
+            let key = comps[start..].join("/");
+            if key.is_empty() {
+                continue;
+            }
+            index.entry(key).or_default().push((i as u32, lang));
+        }
+    }
+    index
+}
+
+/// Build the namespaced-module-declaration index once per resolve pass.
+fn build_module_def_index(
+    entities: &[Entity],
+    file_lang: &[Option<ast_grep_language::SupportLang>],
+) -> ModuleDefIndex {
+    let mut index: ModuleDefIndex = std::collections::HashMap::new();
+    for e in entities {
+        if !matches!(
+            e.kind,
+            crate::model::EntityKind::Class | crate::model::EntityKind::Interface
+        ) {
+            continue;
+        }
+        if !e.name.contains('.') {
+            continue;
+        }
+        let lang = file_lang.get(e.file_id as usize).copied().flatten();
+        index
+            .entry(e.name.clone())
+            .or_default()
+            .push((e.file_id, lang));
+    }
+    index
+}
+
+/// Strip a single pair of matching surrounding quotes, if present.
+fn strip_quotes(s: &str) -> &str {
+    let t = s.trim();
+    if t.len() >= 2 {
+        let b = t.as_bytes();
+        if (b[0] == b'"' && b[t.len() - 1] == b'"') || (b[0] == b'\'' && b[t.len() - 1] == b'\'') {
+            return &t[1..t.len() - 1];
+        }
+    }
+    t
+}
+
+/// A Go module discovered from a `go.mod` in the file set: its declared module
+/// path and the (normalized) directory that path maps to — the `go.mod`'s
+/// parent. A Go import names a *package* (a directory of `.go` files); mapping
+/// the module-path prefix to its root directory is what turns an import path
+/// (`github.com/x/y/pkg`) into the repo directory holding that package.
+struct GoModule {
+    module_path: String,
+    root_dir: String,
+}
+
+/// Extract the module path from `go.mod` contents: the token after a leading
+/// `module` directive. Ignores comments/blank lines and any trailing
+/// comment/quotes on the directive.
+fn parse_go_module_path(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("module")
+            && rest.starts_with(char::is_whitespace)
+        {
+            let token = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches('"');
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Discover Go modules by reading every `go.mod` in `files` (they are indexed
+/// as non-source rows). Unreadable files (e.g. synthetic test paths) and
+/// go.mods without a `module` line are skipped. Sorted longest-module-path
+/// first so a nested module wins over an enclosing one.
+fn discover_go_modules(files: &[String]) -> Vec<GoModule> {
+    let mut mods = Vec::new();
+    for p in files {
+        let path = std::path::Path::new(p);
+        if path.file_name().and_then(|n| n.to_str()) != Some("go.mod") {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Some(module_path) = parse_go_module_path(&contents) else {
+            continue;
+        };
+        let Some(dir) = path.parent() else { continue };
+        mods.push(GoModule {
+            module_path,
+            root_dir: normalize_path(dir).to_string_lossy().into_owned(),
+        });
+    }
+    mods.sort_by_key(|m| std::cmp::Reverse(m.module_path.len()));
+    mods
+}
+
+/// `normalized-directory -> [Go file ids in that directory]`. A Go package is a
+/// directory of `.go` files, so this is the layout Go import resolution targets.
+/// `_test.go` files are excluded: they are not part of the package's importable
+/// surface (a production `import` never compiles them), so linking an importer
+/// to them would invent spurious edges.
+fn build_go_package_index(files: &[String]) -> std::collections::HashMap<String, Vec<u32>> {
+    let mut index: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::new();
+    for (i, p) in files.iter().enumerate() {
+        let path = std::path::Path::new(p);
+        if crate::parse::language_for_path(path) != Some(ast_grep_language::SupportLang::Go) {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with("_test.go"))
+        {
+            continue;
+        }
+        let Some(dir) = path.parent() else { continue };
+        let key = normalize_path(dir).to_string_lossy().into_owned();
+        index.entry(key).or_default().push(i as u32);
+    }
+    index
+}
+
+/// Resolve a Go import specifier to the file ids of the target package's `.go`
+/// files, or `None` when it names an external/stdlib package (no module prefix
+/// matches) or the package isn't in the file set. A Go import depends on the
+/// *whole* package, so it resolves to every file in the target directory (one
+/// import edge each); `from_id` is excluded so a file never imports itself.
+fn resolve_go_import(
     spec: &str,
-    from_file: &str,
-    by_path: &std::collections::HashMap<&str, u32>,
-    stem_index: &StemIndex,
-    relative_path_index: &RelativePathIndex,
-) -> Option<u32> {
+    from_id: u32,
+    modules: &[GoModule],
+    pkg_index: &std::collections::HashMap<String, Vec<u32>>,
+) -> Option<Vec<u32>> {
+    let import_path = strip_quotes(spec);
+    for m in modules {
+        let rel = if import_path == m.module_path {
+            ""
+        } else if let Some(rest) = import_path.strip_prefix(&m.module_path) {
+            // Require a `/` boundary so module `github.com/x/y` does not swallow
+            // an unrelated `github.com/x/ya`.
+            match rest.strip_prefix('/') {
+                Some(sub) => sub,
+                None => continue,
+            }
+        } else {
+            continue;
+        };
+        let target_dir = if rel.is_empty() {
+            m.root_dir.clone()
+        } else {
+            normalize_path(std::path::Path::new(&format!("{}/{}", m.root_dir, rel)))
+                .to_string_lossy()
+                .into_owned()
+        };
+        // The module prefix matched: the import is internal. Resolve to the
+        // package's files if present, else stay unresolved — never fall through
+        // to a shorter module prefix that would mis-target.
+        return pkg_index.get(&target_dir).and_then(|ids| {
+            let targets: Vec<u32> = ids.iter().copied().filter(|&id| id != from_id).collect();
+            (!targets.is_empty()).then_some(targets)
+        });
+    }
+    None
+}
+
+/// The set of per-pass indexes [`match_import_target`] consults, built once in
+/// [`resolve_imports`]. Bundled so the matcher takes one reference instead of
+/// six positional arguments.
+struct ImportIndexes<'a> {
+    by_path: &'a std::collections::HashMap<&'a str, u32>,
+    stem: &'a StemIndex,
+    relative: &'a RelativePathIndex,
+    path_suffix: &'a PathSuffixIndex,
+    package: &'a PackageIndex,
+    module: &'a ModuleDefIndex,
+}
+
+/// Find the file an import specifier points at, or `None`.
+fn match_import_target(spec: &str, from_file: &str, idx: &ImportIndexes<'_>) -> Option<u32> {
+    let from_lang = crate::parse::language_for_path(std::path::Path::new(from_file));
+
     // 1. Relative-path resolution against the importing file's directory,
     //    using the unquoted specifier BEFORE prefix stripping (so `../x`
     //    and `./x` resolve from the importing file, not globally).
     if let Some(rel) = resolve_relative(spec, from_file) {
-        if let Some(&pos) = by_path.get(rel.as_str()) {
+        if let Some(&pos) = idx.by_path.get(rel.as_str()) {
             return Some(pos);
         }
 
-        let from_lang = crate::parse::language_for_path(std::path::Path::new(from_file));
         let relative_stem = normalize_path(std::path::Path::new(&rel)).with_extension("");
-        let matches: Vec<u32> = relative_path_index
+        let matches: Vec<u32> = idx
+            .relative
             .get(relative_stem.to_string_lossy().as_ref())
+            .into_iter()
+            .flatten()
+            .filter(|(_, lang)| from_lang.is_none() || *lang == from_lang)
+            .map(|(i, _)| *i)
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0]);
+        }
+    }
+
+    // 2. Namespaced module-name resolution (e.g. Elixir `alias Foo.Bar`): the
+    //    raw, quote-stripped specifier names a module declared somewhere in the
+    //    repo. Uses the RAW spec — `normalize_spec` below would strip the
+    //    trailing `.Bar` as if it were a file extension — and requires a single
+    //    same-language declaring file.
+    let raw = strip_quotes(spec);
+    if raw.contains('.') {
+        let matches: Vec<u32> = idx
+            .module
+            .get(raw)
             .into_iter()
             .flatten()
             .filter(|(_, lang)| from_lang.is_none() || *lang == from_lang)
@@ -409,14 +760,39 @@ fn match_import_target(
         return None;
     }
 
-    // 2. Segment-wise stem matching: try the full path first, then drop
+    let segments = split_keep_segments(&norm);
+
+    // 3. Full-path-suffix matching: match the specifier's trailing segments
+    //    against whole file-path suffixes, longest first, so a multi-segment
+    //    module path resolves the *specific* file (`crewai/agent/core` ->
+    //    `.../crewai/agent/core.py`) instead of colliding on the bare `core`
+    //    stem. Only a unique same-language match resolves; an ambiguous suffix
+    //    is skipped (a shorter suffix or the stem step below may still decide),
+    //    never producing a wrong edge.
+    let n = segments.len();
+    let max = n.min(MAX_PATH_SUFFIX);
+    for len in (2..=max).rev() {
+        let key = segments[n - len..].join("/");
+        let matches: Vec<u32> = idx
+            .path_suffix
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|(_, lang)| from_lang.is_none() || *lang == from_lang)
+            .map(|(i, _)| *i)
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0]);
+        }
+    }
+
+    // 4. Segment-wise stem matching: try the full path first, then drop
     //    trailing segments one at a time. A single same-language candidate
     //    wins; ambiguity stays unresolved (deterministic).
-    let segments = split_keep_segments(&norm);
-    let from_lang = crate::parse::language_for_path(std::path::Path::new(from_file));
     for keep in (1..=segments.len()).rev() {
         let last = &segments[keep - 1];
-        let matches: Vec<u32> = stem_index
+        let matches: Vec<u32> = idx
+            .stem
             .get(last.as_str())
             .into_iter()
             .flatten()
@@ -428,6 +804,29 @@ fn match_import_target(
         }
         if matches.len() > 1 {
             // ambiguous — deterministic unresolved
+            return None;
+        }
+    }
+
+    // 5. Package-directory resolution: the specifier names a package/module
+    //    directory whose index file (`__init__.py`, `index.ts`, `init.lua`) is
+    //    the imported module. Try the full segment path first, then drop
+    //    leading segments (so `import a.b.c` matches `.../a/b/c/__init__.py`
+    //    and a bare `from pkg import X` matches `.../pkg/__init__.py`).
+    for start in 0..segments.len() {
+        let key = segments[start..].join("/");
+        let matches: Vec<u32> = idx
+            .package
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|(_, lang)| from_lang.is_none() || *lang == from_lang)
+            .map(|(i, _)| *i)
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0]);
+        }
+        if matches.len() > 1 {
             return None;
         }
     }
@@ -551,9 +950,13 @@ mod test_util {
         let mut entities = Vec::new();
         let mut symbols = Vec::new();
         for (file_id, path) in paths.iter().enumerate() {
-            let parsed = parse_file(path)
-                .expect("parse_file ok")
-                .expect("fixture is a supported language");
+            // Non-source files (e.g. a `go.mod` that drives Go package
+            // resolution) still get a `files` slot — mirroring production, where
+            // the build walks every file — but carry no entities. Only
+            // parseable source files are extracted.
+            let Some(parsed) = parse_file(path).expect("parse_file ok") else {
+                continue;
+            };
             let result = extract::extract(&parsed, file_id as u32);
             entities.extend(result.entities);
             symbols.extend(result.symbols);
@@ -649,6 +1052,137 @@ mod import_resolution {
                 && edge.to == EdgeTarget::File(parent_target)
                 && edge.resolved
         }));
+    }
+
+    /// S6: a package re-export. `app.py` does `from pkg import Thing`; `pkg` is
+    /// a directory whose `__init__.py` re-exports `Thing` from the `core`
+    /// submodule. The bare package import must resolve to `pkg/__init__.py`
+    /// (package-directory resolution), and the `__init__.py`'s `from .core
+    /// import Thing` must resolve to `pkg/core.py` — together they connect
+    /// `app.py` to `core.py` transitively, which is what the dependents graph
+    /// walks. Before the fix `from pkg import Thing` stem-matched nothing
+    /// (`pkg`'s only file stem is `__init__`), so every consumer was dangling.
+    #[test]
+    fn python_package_reexport_resolves_through_init() {
+        let (entities, symbols, files) = load_project("python/package_reexport");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+        let app = file_id(&graph, "/app.py");
+        let init = file_id(&graph, "/pkg/__init__.py");
+        let core = file_id(&graph, "/pkg/core.py");
+
+        let resolved: Vec<&ResolvedEdge> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Import && e.resolved)
+            .collect();
+        assert!(
+            resolved
+                .iter()
+                .any(|e| e.from == app && e.to == EdgeTarget::File(init)),
+            "`from pkg import Thing` must resolve to pkg/__init__.py: {resolved:?}"
+        );
+        assert!(
+            resolved
+                .iter()
+                .any(|e| e.from == init && e.to == EdgeTarget::File(core)),
+            "`from .core import Thing` must resolve to pkg/core.py: {resolved:?}"
+        );
+    }
+
+    /// S6: Elixir `alias MyApp.Repo` in `user.ex` resolves to `repo.ex` (which
+    /// declares `defmodule MyApp.Repo`) via the module-declaration index — the
+    /// PascalCase module path never stem-matches the snake_case file name.
+    #[test]
+    fn elixir_alias_resolves_via_module_name() {
+        let (entities, symbols, files) = load_project("elixir/aliases");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+        let user = file_id(&graph, "/user.ex");
+        let repo = file_id(&graph, "/repo.ex");
+
+        let resolved: Vec<&ResolvedEdge> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Import && e.resolved)
+            .collect();
+        assert!(
+            resolved
+                .iter()
+                .any(|e| e.from == user && e.to == EdgeTarget::File(repo)),
+            "`alias MyApp.Repo` must resolve to repo.ex: {resolved:?}"
+        );
+    }
+
+    /// S6: a Go import names a *package* (a directory of `.go` files) via
+    /// go.mod's module path. `cmd/main.go` imports the module-root package
+    /// (`example.com/app` -> `app.go`) and a subpackage (`example.com/app/sub`
+    /// -> `sub/helper.go`); both resolve. The stdlib `fmt` import names no
+    /// module prefix, so it stays unresolved (no invented edge).
+    #[test]
+    fn go_module_and_subpackage_imports_resolve() {
+        let (entities, symbols, files) = load_project("go/package_import");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+        let main = file_id(&graph, "/cmd/main.go");
+        let root = file_id(&graph, "/package_import/app.go");
+        let helper = file_id(&graph, "/sub/helper.go");
+
+        let resolved: Vec<&ResolvedEdge> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Import && e.resolved)
+            .collect();
+        assert!(
+            resolved
+                .iter()
+                .any(|e| e.from == main && e.to == EdgeTarget::File(root)),
+            "root-package import must resolve cmd/main.go -> app.go: {resolved:?}"
+        );
+        assert!(
+            resolved
+                .iter()
+                .any(|e| e.from == main && e.to == EdgeTarget::File(helper)),
+            "subpackage import must resolve cmd/main.go -> sub/helper.go: {resolved:?}"
+        );
+        // `fmt` is stdlib: it names no internal module prefix, so it must not
+        // resolve to any file.
+        let unresolved_from_main = graph
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Import && e.from == main && !e.resolved);
+        assert!(
+            unresolved_from_main,
+            "the stdlib `fmt` import must stay unresolved: {:?}",
+            graph.edges
+        );
+    }
+
+    /// S6: Lua `require "foo.bar"` (dotted module path) resolves to
+    /// `foo/bar.lua`, and `require "util"` (a directory package) resolves to
+    /// `util/init.lua`.
+    #[test]
+    fn lua_dotted_and_package_requires_resolve() {
+        let (entities, symbols, files) = load_project("lua/nested_require");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+        let main = file_id(&graph, "/main.lua");
+        let bar = file_id(&graph, "/foo/bar.lua");
+        let init = file_id(&graph, "/util/init.lua");
+
+        let resolved: Vec<&ResolvedEdge> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Import && e.resolved)
+            .collect();
+        assert!(
+            resolved
+                .iter()
+                .any(|e| e.from == main && e.to == EdgeTarget::File(bar)),
+            "`require \"foo.bar\"` must resolve to foo/bar.lua: {resolved:?}"
+        );
+        assert!(
+            resolved
+                .iter()
+                .any(|e| e.from == main && e.to == EdgeTarget::File(init)),
+            "`require \"util\"` must resolve to util/init.lua: {resolved:?}"
+        );
     }
 }
 

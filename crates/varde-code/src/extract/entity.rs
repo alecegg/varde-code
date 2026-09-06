@@ -38,6 +38,18 @@ impl<'a> ExtractCtx<'a> {
         name: String,
         node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
     ) {
+        // Catch-all for C/C++: a reserved keyword surfacing as an entity name is
+        // always an error-recovery/preprocessor artifact (e.g. a scoped
+        // `enum class` mis-parsed so the `class` token becomes the type name).
+        // The per-arm guards in c.rs/cpp.rs cover the common paths; this backstops
+        // the rest, since a keyword can never be a real identifier. Control-flow
+        // entities are named after their node kind (`if_statement`, not `if`), so
+        // they are unaffected.
+        if matches!(self.lang, SupportLang::C | SupportLang::Cpp)
+            && super::langs::c::is_reserved_keyword(&name)
+        {
+            return;
+        }
         // Set on every entity kind (not just `Function`), so control-flow
         // entities inherit the same owner-type tag as their enclosing
         // method. `function-complexity-hotspot` uses this to disambiguate

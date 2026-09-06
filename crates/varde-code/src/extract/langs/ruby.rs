@@ -86,6 +86,9 @@ const REQUIRE_FUNCTIONS: &[&str] = &["require", "require_relative", "load", "aut
 /// Mixin methods that pull a module's behavior into the enclosing type.
 const MIXIN_FUNCTIONS: &[&str] = &["include", "prepend", "extend"];
 
+/// Attribute-macro calls that declare accessor methods over instance state.
+const ATTR_FUNCTIONS: &[&str] = &["attr_accessor", "attr_reader", "attr_writer", "attr"];
+
 /// Emit entities for one node (called for every node in the tree).
 pub fn visit(
     node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
@@ -168,6 +171,17 @@ fn visit_call(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>, ctx: &mut Ext
     if REQUIRE_FUNCTIONS.contains(&callee.as_str()) {
         if let Some(spec) = first_string_arg(node) {
             ctx.push(EntityKind::Import, spec, node);
+        }
+        return;
+    }
+
+    // `attr_accessor :a, :b` / `attr_reader :c` / `attr_writer :d` -> one
+    // Variable per attribute (the declared instance state a Ruby reader most
+    // wants), owned by the enclosing class via `ctx.push`. Previously dropped
+    // entirely (audit S3). Not a plain Call.
+    if ATTR_FUNCTIONS.contains(&callee.as_str()) {
+        for name in symbol_arg_names(node) {
+            ctx.push(EntityKind::Variable, name, node);
         }
         return;
     }
@@ -279,6 +293,20 @@ fn call_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> String {
         .find(|c| matches!(c.kind().as_ref(), "identifier" | "constant"))
         .map(|c| c.text().into_owned())
         .unwrap_or_default()
+}
+
+/// Names of the symbol arguments of a call (`attr_accessor :a, :b` -> `["a",
+/// "b"]`), stripping the leading `:`. Non-symbol arguments (e.g. a string) are
+/// skipped. Handles both `simple_symbol` (`:a`) and the rare `hash_key_symbol`.
+fn symbol_arg_names(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Vec<String> {
+    let Some(args) = node.children().find(|c| c.kind() == "argument_list") else {
+        return Vec::new();
+    };
+    args.children()
+        .filter(|c| matches!(c.kind().as_ref(), "simple_symbol" | "hash_key_symbol"))
+        .map(|c| c.text().trim_start_matches(':').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// First positional argument node of a call (skipping `(` `,` `)` tokens).
@@ -415,6 +443,24 @@ mod tests {
 
     fn find<'a>(es: &'a [Entity], kind: EntityKind, name: &str) -> Option<&'a Entity> {
         es.iter().find(|e| e.kind == kind && e.name == name)
+    }
+
+    #[test]
+    fn attr_macros_capture_one_variable_per_symbol_with_owner() {
+        // Audit S3: attr_accessor/reader/writer were never captured.
+        let es = entities(
+            "class C\n  attr_accessor :params\n  attr_reader :entry, :name\n  attr_writer :content_type\nend\n",
+        );
+        for attr in ["params", "entry", "name", "content_type"] {
+            let v = find(&es, EntityKind::Variable, attr)
+                .unwrap_or_else(|| panic!("attr {attr} not captured: {es:?}"));
+            assert_eq!(v.owner_type.as_deref(), Some("C"), "attr {attr} owner");
+        }
+        // The macro call itself must not also leak as a plain Call.
+        assert!(
+            find(&es, EntityKind::Call, "attr_accessor").is_none(),
+            "{es:?}"
+        );
     }
 
     #[test]

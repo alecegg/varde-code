@@ -149,10 +149,14 @@ pub(crate) fn classify<'r>(
     in_type: bool,
 ) -> Option<(SymbolKind, &'r str)> {
     match lang {
+        // C/C++ under preprocessor confusion or error recovery emit reserved
+        // keywords (`typename`, `template`, `const`, `struct`, …) as bare
+        // `identifier` leaves, which would otherwise flood the reference list.
+        // A keyword can never be a real identifier, so dropping it is safe.
+        SupportLang::C | SupportLang::Cpp => classify_generic(node, in_type)
+            .filter(|(_, name)| !crate::extract::langs::c::is_reserved_keyword(name)),
         SupportLang::Php
         | SupportLang::Ruby
-        | SupportLang::C
-        | SupportLang::Cpp
         | SupportLang::Scala
         | SupportLang::Dart
         | SupportLang::Lua

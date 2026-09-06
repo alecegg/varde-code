@@ -150,6 +150,16 @@ pub fn visit(
             ctx.push(EntityKind::Interface, name.clone(), node);
             visit_supertypes(node, &name, ctx);
         }
+        // `event Transfer(address indexed from, ...)` / `error Unauthorized()`
+        // — named, parameterized contract members. Previously dropped entirely
+        // (audit S3: ERC20 Transfer/Approval never indexed, so `get_symbol
+        // Transfer` and interface/event coverage failed). Mapped to Function
+        // (the closest callable-signature kind; `emit`/`revert` invoke them),
+        // carrying the owning contract via `ctx.push`.
+        "event_definition" | "error_declaration" => {
+            let name = field_name(node).unwrap_or_default();
+            ctx.push(EntityKind::Function, name, node);
+        }
 
         // ---- variables (state + locals) ----
         "state_variable_declaration" | "variable_declaration" => {
@@ -347,6 +357,30 @@ mod tests {
 
     fn with_preamble(body: &str) -> String {
         format!("{PREAMBLE}{body}")
+    }
+
+    #[test]
+    fn events_and_errors_are_captured_as_functions() {
+        // Audit S3: `event` and `error` declarations were never indexed.
+        let es = entities(&with_preamble(
+            "contract T {\n  event Transfer(address indexed from, address indexed to);\n  error Unauthorized();\n  function f() public {}\n}\n",
+        ));
+        assert!(
+            find(&es, EntityKind::Function, "Transfer").is_some(),
+            "{es:?}"
+        );
+        assert!(
+            find(&es, EntityKind::Function, "Unauthorized").is_some(),
+            "{es:?}"
+        );
+        // The owning contract is recorded so event/interface coverage works.
+        assert_eq!(
+            find(&es, EntityKind::Function, "Transfer")
+                .unwrap()
+                .owner_type
+                .as_deref(),
+            Some("T")
+        );
     }
 
     #[test]

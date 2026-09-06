@@ -91,17 +91,18 @@ pub fn visit(
             let name = field_name(node).unwrap_or_default();
             let struct_type = node.children().find(|c| c.kind() == "struct_type");
             let has_interface = node.children().any(|c| c.kind() == "interface_type");
-            let kind = if struct_type.is_some() {
-                Some(EntityKind::Class)
-            } else if has_interface {
-                Some(EntityKind::Interface)
+            // Interfaces map to Interface; every other named type — struct, func
+            // type (`type X func(...)`), defined type (`type Weekday int`), map/
+            // slice/alias — maps to Class so it is captured as a declaration.
+            // Previously only struct/interface were kept and all other named
+            // types were dropped entirely (audit S3).
+            let kind = if has_interface {
+                EntityKind::Interface
             } else {
-                None
+                EntityKind::Class
             };
-            if let Some(kind) = kind {
-                ctx.push(kind, name.clone(), node);
-                maybe_export(node, &name, ctx);
-            }
+            ctx.push(kind, name.clone(), node);
+            maybe_export(node, &name, ctx);
             // Struct embedding (a `field_declaration` with no `name` field)
             // -> Extends, linking the embedding struct to the embedded
             // type. Implicit interface satisfaction (structural typing) is
@@ -121,6 +122,14 @@ pub fn visit(
                     ));
                 }
             }
+        }
+
+        // `type MyAlias = OtherType` — a Go type alias (distinct node kind from
+        // `type_spec`); mapped to Class so it surfaces as a declaration.
+        "type_alias" => {
+            let name = field_name(node).unwrap_or_default();
+            ctx.push(EntityKind::Class, name.clone(), node);
+            maybe_export(node, &name, ctx);
         }
 
         // ---- variables ----
@@ -421,6 +430,31 @@ mod tests {
             .filter(|e: &Entity| e.kind == EntityKind::Route)
             .map(|e| (e.method, e.path))
             .collect()
+    }
+
+    #[test]
+    fn named_non_struct_types_are_captured() {
+        // Audit S3: `type X func(...)`, `type X int`, and `type X = alias` were
+        // dropped — only struct/interface types survived.
+        let src = "package m\n\
+                   type PositionalArgs func(args []string) error\n\
+                   type Weekday int\n\
+                   type MyAlias = OtherType\n\
+                   type Command struct{ Name string }\n";
+        let parsed = parse_source(&SupportLang::Go, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let names: Vec<String> = extract::extract(&parsed, 0)
+            .entities
+            .into_iter()
+            .filter(|e: &Entity| e.kind == EntityKind::Class)
+            .map(|e| e.name)
+            .collect();
+        for expect in ["PositionalArgs", "Weekday", "MyAlias", "Command"] {
+            assert!(
+                names.contains(&expect.to_string()),
+                "missing {expect}: {names:?}"
+            );
+        }
     }
 
     #[test]

@@ -102,9 +102,14 @@ pub fn visit(
         "function_declaration" => {
             ctx.push(EntityKind::Function, function_name(node), node);
         }
-        // Anonymous `function() … end` (e.g. `local f = function() end`).
+        // `function() … end` as a value. When it is assigned to a table field
+        // (`{ foo = function() end }`) or an assignment target
+        // (`status.bar = function() end`), name it after that field/target so
+        // metatable-/table-based OOP methods are queryable instead of anonymous
+        // (audit S3: table-literal method values were all emitted blank and
+        // dropped). A truly anonymous closure keeps a blank name and is filtered.
         "function_definition" => {
-            ctx.push(EntityKind::Function, String::new(), node);
+            ctx.push(EntityKind::Function, function_definition_name(node), node);
         }
 
         // ---- variables ----
@@ -160,10 +165,14 @@ pub fn visit(
 fn visit_call(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>, ctx: &mut ExtractCtx) {
     let callee = call_name(node);
 
-    // `require "mod"` / `require("mod")` -> Import (not a Call).
+    // `require "mod"` / `require("mod")` -> Import (not a Call). Lua module
+    // paths use `.` as the package separator (`require "a.b.c"` -> `a/b/c`);
+    // normalize to slash-separated form so resolve.rs's shared `/`-segment
+    // matching applies unchanged (and its extension-stripping does not mistake
+    // the trailing `.c` for a file extension).
     if REQUIRE_FUNCTIONS.contains(&callee.as_str()) {
         if let Some(spec) = first_string_arg(node) {
-            ctx.push(EntityKind::Import, spec, node);
+            ctx.push(EntityKind::Import, spec.replace('.', "/"), node);
         }
         return;
     }
@@ -207,6 +216,45 @@ fn function_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> String 
     node.field("name")
         .map(|n| n.text().into_owned())
         .unwrap_or_default()
+}
+
+/// Name for a `function_definition` used as a value, derived from context: the
+/// table-field key it is bound to (`{ foo = function() end }` -> "foo"), or the
+/// matching-position target of the enclosing assignment (`a.b = function() end`
+/// -> "a.b"). Empty for a truly anonymous closure (callback argument, `return
+/// function() end`), which the blank-name filter then drops.
+fn function_definition_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> String {
+    let Some(parent) = node.parent() else {
+        return String::new();
+    };
+    match parent.kind().as_ref() {
+        "field" => parent
+            .field("name")
+            .map(|n| n.text().into_owned())
+            .unwrap_or_default(),
+        "expression_list" => {
+            let Some(assign) = parent
+                .parent()
+                .filter(|p| p.kind() == "assignment_statement")
+            else {
+                return String::new();
+            };
+            let Some(idx) = parent
+                .children()
+                .filter(|c| c.is_named())
+                .position(|c| c.node_id() == node.node_id())
+            else {
+                return String::new();
+            };
+            assign
+                .children()
+                .find(|c| c.kind() == "variable_list")
+                .and_then(|vlist| vlist.children().filter(|c| c.is_named()).nth(idx))
+                .map(|c| c.text().into_owned())
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    }
 }
 
 /// Callee name of a `function_call`: the `name` field's text (covers a plain
@@ -297,6 +345,24 @@ mod tests {
     }
 
     #[test]
+    fn table_field_function_values_are_named_from_their_key_or_target() {
+        // Audit S3: table-based OOP methods assigned as function values were
+        // emitted anonymously (blank) and dropped. They are now named from the
+        // assignment target or table-literal field key.
+        let es = entities(
+            "local status = {}\nstatus.foo = function() return 1 end\nlocal M = { baz = function() return 2 end }\n",
+        );
+        assert!(
+            find(&es, EntityKind::Function, "status.foo").is_some(),
+            "assignment: {es:?}"
+        );
+        assert!(
+            find(&es, EntityKind::Function, "baz").is_some(),
+            "table field: {es:?}"
+        );
+    }
+
+    #[test]
     fn named_and_local_and_table_functions() {
         let es = entities(
             "function f() end\nlocal function g() end\nlocal M = {}\nfunction M.m() end\nfunction M:c() end\n",
@@ -308,9 +374,13 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_function_has_empty_name() {
+    fn anonymous_function_is_not_emitted_as_a_blank_name_entity() {
+        // Audit S8: a blank-name Function is pure noise for name-keyed queries
+        // and floods `symbols_in_file`. The `extract` post-filter drops it (the
+        // `z` parameter and `z` reference still carry the real signal).
         let es = entities("local h = function(z) return z end\n");
-        assert!(find(&es, EntityKind::Function, "").is_some());
+        assert!(find(&es, EntityKind::Function, "").is_none());
+        assert!(find(&es, EntityKind::Parameter, "z").is_some());
     }
 
     #[test]

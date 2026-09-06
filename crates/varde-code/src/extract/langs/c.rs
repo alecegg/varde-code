@@ -76,7 +76,9 @@ pub fn visit(node: &Node<'_>, kind: &str, ctx: &mut ExtractCtx) {
                 .field("declarator")
                 .and_then(|d| declarator_identifier(&d))
                 .unwrap_or_default();
-            ctx.push(EntityKind::Function, name, node);
+            if !is_reserved_keyword(&name) {
+                ctx.push(EntityKind::Function, name, node);
+            }
         }
         "struct_specifier" | "union_specifier" | "enum_specifier" => {
             // Only *named* records/enums are types; an anonymous record used
@@ -115,11 +117,37 @@ pub fn visit(node: &Node<'_>, kind: &str, ctx: &mut ExtractCtx) {
             // storage, so they are skipped.
             for decl in node.field_children("declarator") {
                 if is_function_declarator(&decl) {
+                    // Function prototype (`int ini_parse(const char*);`):
+                    // declares no storage but names an API function. Emit it as
+                    // a Function so header APIs are queryable — previously
+                    // dropped, so every header-only prototype was invisible
+                    // (audit S3: all 5 ini.h API prototypes missing).
+                    if let Some(name) = declarator_identifier(&decl)
+                        && !is_reserved_keyword(&name)
+                    {
+                        ctx.push(EntityKind::Function, name, node);
+                    }
                     continue;
                 }
                 if let Some(name) = declarator_identifier(&decl) {
                     ctx.push(EntityKind::Variable, name, node);
                 }
+            }
+        }
+
+        // ---- preprocessor macros ----
+        // `#define MAX 100` — object-like macro, a named compile-time constant;
+        // mapped to Variable. `#define SQUARE(x) ((x)*(x))` — function-like
+        // macro; mapped to Function. Previously neither was captured (audit S3:
+        // all ~19 header macros dropped).
+        "preproc_def" => {
+            if let Some(name) = node.field("name") {
+                ctx.push(EntityKind::Variable, name.text().into_owned(), node);
+            }
+        }
+        "preproc_function_def" => {
+            if let Some(name) = node.field("name") {
+                ctx.push(EntityKind::Function, name.text().into_owned(), node);
             }
         }
 
@@ -139,7 +167,9 @@ pub fn visit(node: &Node<'_>, kind: &str, ctx: &mut ExtractCtx) {
                 .field("function")
                 .map(|n| n.text().into_owned())
                 .unwrap_or_default();
-            ctx.push(EntityKind::Call, name, node);
+            if !is_reserved_keyword(&name) {
+                ctx.push(EntityKind::Call, name, node);
+            }
         }
         "field_expression" => {
             if let Some(field) = node.field("field") {
@@ -169,6 +199,58 @@ pub fn visit(node: &Node<'_>, kind: &str, ctx: &mut ExtractCtx) {
 
         _ => {}
     }
+}
+
+/// C/C++ reserved keywords that must never surface as an entity name. Under
+/// preprocessor confusion or error recovery, tree-sitter can reparse
+/// `if (...)`, `while (...)`, `switch (...)`, or a `template`/`class`/
+/// `namespace` head as a `function_definition`/`call_expression`/type whose
+/// name text is the keyword itself. Since a reserved word can never be a valid
+/// identifier, dropping these at the name-bearing push sites removes the noise
+/// with no risk of discarding a real declaration. Shared with the C++ extractor.
+pub(crate) fn is_reserved_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "if" | "else"
+            | "for"
+            | "while"
+            | "do"
+            | "switch"
+            | "case"
+            | "default"
+            | "return"
+            | "break"
+            | "continue"
+            | "goto"
+            | "sizeof"
+            | "typedef"
+            | "struct"
+            | "union"
+            | "enum"
+            | "class"
+            | "template"
+            | "typename"
+            | "namespace"
+            | "using"
+            | "new"
+            | "delete"
+            | "throw"
+            | "try"
+            | "catch"
+            | "operator"
+            | "const"
+            | "static"
+            | "public"
+            | "private"
+            | "protected"
+            | "virtual"
+            | "friend"
+            | "inline"
+            | "explicit"
+            | "constexpr"
+            | "noexcept"
+            | "static_assert"
+    )
 }
 
 /// Peel a declarator down to its bottom `identifier` / `field_identifier`
@@ -263,6 +345,58 @@ mod tests {
             .filter(|e| e.kind == kind)
             .map(|e| e.name.clone())
             .collect()
+    }
+
+    #[test]
+    fn macros_and_header_prototypes_are_captured() {
+        // Audit S3: object-like macros, function-like macros, and header
+        // function prototypes were all dropped.
+        let src = "#define MAX 100\n\
+                   #define SQUARE(x) ((x)*(x))\n\
+                   int ini_parse(const char* path);\n";
+        let es = extract(src);
+        let funcs = names(&es, EntityKind::Function);
+        let vars = names(&es, EntityKind::Variable);
+        assert!(vars.contains(&"MAX".to_string()), "object macro: {vars:?}");
+        assert!(funcs.contains(&"SQUARE".to_string()), "fn macro: {funcs:?}");
+        assert!(
+            funcs.contains(&"ini_parse".to_string()),
+            "prototype: {funcs:?}"
+        );
+    }
+
+    #[test]
+    fn reserved_keywords_are_recognized_but_real_names_are_not() {
+        for kw in [
+            "if",
+            "while",
+            "for",
+            "switch",
+            "return",
+            "class",
+            "template",
+            "namespace",
+        ] {
+            assert!(is_reserved_keyword(kw), "{kw} should be reserved");
+        }
+        for name in ["add", "ini_parse", "handler", "Color", "user_data"] {
+            assert!(!is_reserved_keyword(name), "{name} is a real identifier");
+        }
+    }
+
+    #[test]
+    fn control_flow_keyword_is_not_emitted_as_a_function() {
+        // A normal `if` is a control-flow entity named after its node kind, never
+        // a Function/Call named `if` (the error-recovery artifact this guards).
+        let src = "int f(int x) { if (x) { g(); } return x; }\n";
+        let e = extract(src);
+        assert!(
+            !names(&e, EntityKind::Function).contains(&"if".to_string())
+                && !names(&e, EntityKind::Call).contains(&"if".to_string()),
+            "`if` must not be a function/call: {:?}",
+            e.iter().map(|x| (&x.kind, &x.name)).collect::<Vec<_>>()
+        );
+        assert!(names(&e, EntityKind::Function).contains(&"f".to_string()));
     }
 
     #[test]

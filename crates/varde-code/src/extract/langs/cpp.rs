@@ -39,7 +39,7 @@
 //!   bonus kind (fixtures + resolve check) but not on the required checklist.
 
 use crate::extract::entity::ExtractCtx;
-use crate::extract::langs::c::declarator_identifier;
+use crate::extract::langs::c::{declarator_identifier, is_reserved_keyword};
 use crate::model::EntityKind;
 use ast_grep_core::tree_sitter::StrDoc;
 use ast_grep_language::SupportLang;
@@ -83,10 +83,15 @@ pub fn visit(node: &Node<'_>, kind: &str, ctx: &mut ExtractCtx) {
                 .field("declarator")
                 .and_then(|d| declarator_identifier(&d))
                 .unwrap_or_default();
-            ctx.push(EntityKind::Function, name, node);
+            if !is_reserved_keyword(&name) {
+                ctx.push(EntityKind::Function, name, node);
+            }
         }
         "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
-            if let Some(name) = node.field("name") {
+            if let Some(name) = node
+                .field("name")
+                .filter(|n| !is_reserved_keyword(&n.text()))
+            {
                 let cls = name.text().into_owned();
                 ctx.push(EntityKind::Class, cls.clone(), node);
                 // Inheritance: each base type in the base_class_clause -> Extends.
@@ -112,6 +117,7 @@ pub fn visit(node: &Node<'_>, kind: &str, ctx: &mut ExtractCtx) {
             if let Some(name) = node
                 .field("declarator")
                 .and_then(|d| declarator_identifier(&d))
+                .filter(|n| !is_reserved_keyword(n))
             {
                 ctx.push(EntityKind::Class, name, node);
             }
@@ -171,7 +177,9 @@ pub fn visit(node: &Node<'_>, kind: &str, ctx: &mut ExtractCtx) {
                 .field("function")
                 .map(|n| n.text().into_owned())
                 .unwrap_or_default();
-            ctx.push(EntityKind::Call, name, node);
+            if !is_reserved_keyword(&name) {
+                ctx.push(EntityKind::Call, name, node);
+            }
         }
         "new_expression" => {
             // `new Foo(...)` — a constructor invocation; map to Call named
@@ -316,6 +324,23 @@ mod tests {
             names(&e, EntityKind::Extends).contains(&"Base".to_string()),
             "extends: {:?}",
             names(&e, EntityKind::Extends)
+        );
+    }
+
+    #[test]
+    fn scoped_enum_keeps_type_name_and_never_emits_the_keyword() {
+        // Regression: `enum class Color` is a scoped enum whose type name is
+        // `Color`, not the `class` keyword. Under error recovery the keyword can
+        // leak as an entity name; the reserved-keyword guard drops it while the
+        // real type survives.
+        let src = "enum class Color { red, green };\n";
+        let e = extract(src);
+        let classes = names(&e, EntityKind::Class);
+        assert!(classes.contains(&"Color".to_string()), "got {classes:?}");
+        assert!(
+            !e.iter().any(|x| x.name == "class"),
+            "the `class` keyword must never be an entity: {:?}",
+            e.iter().map(|x| &x.name).collect::<Vec<_>>()
         );
     }
 

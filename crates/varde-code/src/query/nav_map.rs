@@ -49,8 +49,16 @@ pub fn nav_map(input: &serde_json::Value) -> Result<serde_json::Value, ApiError>
     // entrypoint listing and subsystem role map but are excluded from flows.
     let entrypoints = super::entrypoints::detect(&conn)?;
     let routes = super::entrypoints::detect_routes(&conn)?;
-    let listed: Vec<super::entrypoints::Entrypoint> =
-        entrypoints.iter().chain(routes.iter()).cloned().collect();
+    // Language process mains (`fn main`, `func main`, `static void Main`, ...) —
+    // the CLI/binary entry points `detect` deliberately excludes as bootstrap.
+    // They are flow roots, so they also seed the flow trees below.
+    let process_mains = super::entrypoints::detect_process_mains(&conn)?;
+    let listed: Vec<super::entrypoints::Entrypoint> = entrypoints
+        .iter()
+        .chain(routes.iter())
+        .chain(process_mains.iter())
+        .cloned()
+        .collect();
     let entrypoints_json: Vec<serde_json::Value> = listed.iter().map(|e| e.to_json()).collect();
 
     let foundational_files =

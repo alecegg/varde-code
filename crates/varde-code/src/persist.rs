@@ -2238,20 +2238,21 @@ fn entity_id_at(entity_ids: &EntityIdIndex, flat_index: usize) -> Option<i64> {
 /// Insert `entities` rows in batches, each keyed to its file's `files.id`.
 /// Entity kinds extracted and used at build time (they feed derived columns
 /// and the call graph) but read back out of the index by *no* rule, query
-/// mode, or resolver — verified by an exhaustive consumer sweep
-/// (BUILD_PERSISTENCE_INVESTIGATION.md §3, 2026-09-03). They are not persisted:
-/// dropping them removes ~67% of `entities` rows with zero consumer impact.
-/// `ControlFlow` is deliberately NOT here — one `complexity` rule joins it live
-/// and it feeds the `files.complexity` count.
+/// mode, or resolver. They are not persisted, which shrinks the `entities`
+/// table substantially at zero consumer impact. `ControlFlow` is deliberately
+/// NOT here — one `complexity` rule joins it live and it feeds the
+/// `files.complexity` count.
+///
+/// `Variable` and `Parameter` were previously dropped too, but they ARE read
+/// back: `declaration_kinds()` (the contract behind `symbols_in_file`,
+/// `get_symbol`, and `filter_symbols`) lists both, so dropping them made every
+/// field/property/constant/parameter invisible to exactly the queries meant to
+/// surface them (audit S3: Java `@Column` fields, C#/PHP properties, TS module
+/// consts, Ruby attrs all "not captured"). They are now persisted.
 fn is_dropped_kind(kind: EntityKind) -> bool {
     matches!(
         kind,
-        EntityKind::Literal
-            | EntityKind::MemberAccess
-            | EntityKind::Variable
-            | EntityKind::Parameter
-            | EntityKind::Catch
-            | EntityKind::Throw
+        EntityKind::Literal | EntityKind::MemberAccess | EntityKind::Catch | EntityKind::Throw
     )
 }
 
@@ -4151,6 +4152,57 @@ def render():
                 .find(|e| e.name == "fs")
                 .expect("fs entity");
             assert_eq!(fs_entity.is_async, None);
+        }
+
+        #[test]
+        fn variables_and_parameters_are_persisted_but_literals_are_dropped() {
+            // Audit S3 root cause: `declaration_kinds()` (behind symbols_in_file
+            // / get_symbol / filter_symbols) lists Variable and Parameter, so
+            // they must survive persistence — dropping them made every field /
+            // property / constant / parameter invisible. Literal stays dropped.
+            let db_path = temp_db("keep-var-param");
+            let mut field = entity(0, "address");
+            field.kind = EntityKind::Variable;
+            let mut param = entity(0, "owner");
+            param.kind = EntityKind::Parameter;
+            let mut lit = entity(0, "42");
+            lit.kind = EntityKind::Literal;
+
+            let output = vec![ExtractOutput {
+                entities: vec![entity(0, "helper"), field, param, lit],
+                symbols: vec![],
+                diagnostics: vec![],
+                files: vec!["a.rs".to_string()],
+                file_meta: vec![dummy_meta()],
+            }];
+            persist(
+                &db_path,
+                &output,
+                &empty_graph(),
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+            )
+            .expect("persist succeeds");
+
+            let conn = rusqlite::Connection::open(&db_path).expect("db opens");
+            let names: Vec<String> = conn
+                .prepare("SELECT name FROM entities ORDER BY name")
+                .expect("prepare")
+                .query_map([], |r| r.get(0))
+                .expect("maps")
+                .map(|r| r.expect("row"))
+                .collect();
+            assert!(
+                names.contains(&"address".to_string()),
+                "Variable persisted: {names:?}"
+            );
+            assert!(
+                names.contains(&"owner".to_string()),
+                "Parameter persisted: {names:?}"
+            );
+            assert!(
+                !names.contains(&"42".to_string()),
+                "Literal still dropped: {names:?}"
+            );
         }
     }
 }
