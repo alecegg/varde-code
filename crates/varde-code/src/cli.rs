@@ -60,6 +60,12 @@ pub enum Command {
         /// Skip incremental detection and force a full rebuild.
         #[arg(long)]
         force: bool,
+        /// Include the full list of reparsed file paths in the JSON result.
+        /// Off by default: the result carries `changedFilesCount` and a small
+        /// `changedFilesSample` instead, so a large rebuild doesn't dump
+        /// hundreds of paths an agent rarely needs inline.
+        #[arg(long)]
+        changed_files: bool,
     },
     /// Query: run several query modes in one call.
     /// (see `batch` help for inputs)

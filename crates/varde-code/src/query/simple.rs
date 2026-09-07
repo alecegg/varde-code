@@ -206,18 +206,30 @@ fn query_symbols(
     conn: &Connection,
     file_id: i64,
     body_root: Option<&std::path::Path>,
+    include_references: bool,
 ) -> std::result::Result<Vec<serde_json::Value>, ApiError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT s.kind, s.name, f.path,
-                    s.start_byte, s.end_byte, s.start_line, s.start_col,
-                    s.end_line, s.end_col
-             FROM symbols s
-             JOIN files f ON f.id = s.file_id
-             WHERE s.file_id = ?1
-             ORDER BY s.id",
+    // `reference`-kind rows (call sites / usages) are 80–95% of a file's
+    // `symbols` rows and are noise when surveying what a file *declares*
+    // (audit F4) — excluded unless the caller opts in with `includeReferences`.
+    // Bindings stay; declarations come from `query_entity_declarations`.
+    let ref_filter = if include_references {
+        String::new()
+    } else {
+        format!(
+            " AND s.kind != {}",
+            crate::model::SymbolKind::Reference.as_i64()
         )
-        .map_err(db_err)?;
+    };
+    let sql = format!(
+        "SELECT s.kind, s.name, f.path,
+                s.start_byte, s.end_byte, s.start_line, s.start_col,
+                s.end_line, s.end_col
+         FROM symbols s
+         JOIN files f ON f.id = s.file_id
+         WHERE s.file_id = ?1{ref_filter}
+         ORDER BY s.id"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(db_err)?;
     let rows = stmt
         .query_map([file_id], |r| {
             Ok((
@@ -313,10 +325,21 @@ fn query_file_symbols(
     conn: &Connection,
     file_id: i64,
     body_root: Option<&std::path::Path>,
+    include_references: bool,
 ) -> std::result::Result<Vec<serde_json::Value>, ApiError> {
     let mut out = query_entity_declarations(conn, file_id, body_root)?;
-    out.extend(query_symbols(conn, file_id, body_root)?);
+    out.extend(query_symbols(conn, file_id, body_root, include_references)?);
     Ok(out)
+}
+
+/// Read the optional `includeReferences` input flag (default `false`): when
+/// set, `symbols_in_file`/`symbols_in_files` also return `reference`-kind
+/// symbols (call sites / usages), which are otherwise excluded as survey noise.
+fn include_references(input: &serde_json::Value) -> bool {
+    input
+        .get("includeReferences")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// `includeBody=true` needs a filesystem root to resolve the stored
@@ -344,9 +367,11 @@ fn body_root(input: &serde_json::Value) -> Option<std::path::PathBuf> {
 ///
 /// Inputs: `filePath` (required), `includeBody` (optional; when true, reads
 /// each symbol's byte span from disk and attaches it as `body` — best-effort,
-/// omitted if the file can't be read). Output: array of symbol objects. Empty
-/// array when the file exists with no symbols; `not_found` for an unknown
-/// file.
+/// omitted if the file can't be read), `includeReferences` (optional, default
+/// false; when true also returns `reference`-kind symbols — call sites/usages
+/// — which are otherwise excluded as survey noise, audit F4). Output: array of
+/// symbol objects (declarations + bindings by default). Empty array when the
+/// file exists with no symbols; `not_found` for an unknown file.
 ///
 /// Error model: all-or-nothing — any failure (unknown file, DB error) is an
 /// outer `Err(ApiError)` that fails the whole call. This differs from the
@@ -356,7 +381,12 @@ pub fn symbols_in_file(input: &serde_json::Value) -> Result<serde_json::Value, A
     freshen_for_mode("symbols_in_file", input)?;
     let conn = open_db(input)?;
     let fid = file_id(&conn, file_path)?;
-    let symbols = query_file_symbols(&conn, fid, body_root(input).as_deref())?;
+    let symbols = query_file_symbols(
+        &conn,
+        fid,
+        body_root(input).as_deref(),
+        include_references(input),
+    )?;
     Ok(serde_json::json!(symbols))
 }
 
@@ -395,10 +425,11 @@ pub fn symbols_in_files(input: &serde_json::Value) -> Result<serde_json::Value, 
 
     let conn = open_db(input)?;
     let root = body_root(input);
+    let incl_refs = include_references(input);
     let mut result = serde_json::Map::new();
     for file_path in file_paths {
         let entry = match file_id(&conn, file_path)
-            .and_then(|fid| query_file_symbols(&conn, fid, root.as_deref()))
+            .and_then(|fid| query_file_symbols(&conn, fid, root.as_deref(), incl_refs))
         {
             Ok(symbols) => serde_json::json!(symbols),
             Err(e) => serde_json::json!({"error": {"code": e.code, "message": e.message}}),
@@ -1071,6 +1102,71 @@ mod build_on_read_tests {
             assert!(
                 names.iter().any(|n| n == "bar"),
                 "build-on-read surfaced bar without a manual rebuild: {names:?}"
+            );
+
+            let db = crate::db::path::repo_db_path(&root);
+            let _ = std::fs::remove_file(&db);
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    /// F4: `symbols_in_file` excludes `reference`-kind symbols (call sites /
+    /// usages) by default, and includes them only when `includeReferences` is
+    /// set. Declarations and bindings are unaffected either way.
+    #[test]
+    fn symbols_in_file_excludes_references_unless_opted_in() {
+        with_isolated_home("bor", "refs", || {
+            let root = temp_root("refs");
+            let file = root.join("a.ts");
+            // The identifier usages inside `run` (`a`, `b`, `console`) are
+            // reference-kind symbols; the declarations are `run`/`a`/`b`.
+            std::fs::write(
+                &file,
+                "export function run(a) {\n  const b = a.value;\n  console.log(b);\n  return b;\n}\n",
+            )
+            .expect("write a.ts");
+
+            let base = serde_json::json!({
+                "repoRoot": root.to_str().unwrap(),
+                "filePath": file.to_str().unwrap(),
+            });
+            // The in-process query returns the symbol array directly (the
+            // `{ok, data}` envelope is added by the CLI layer).
+            let kinds = |v: &serde_json::Value| -> Vec<String> {
+                v.as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.get("kind").and_then(|k| k.as_str()))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+
+            let default = symbols_in_file(&base).expect("default query");
+            let default_kinds = kinds(&default);
+            assert!(
+                !default_kinds.iter().any(|k| k == "reference"),
+                "default excludes reference kind: {default_kinds:?}"
+            );
+            assert!(
+                default_kinds.iter().any(|k| k == "function"),
+                "declarations still present: {default_kinds:?}"
+            );
+
+            let mut with_refs = base.clone();
+            with_refs["includeReferences"] = serde_json::json!(true);
+            let all = symbols_in_file(&with_refs).expect("includeReferences query");
+            let all_kinds = kinds(&all);
+            assert!(
+                all_kinds.iter().any(|k| k == "reference"),
+                "includeReferences=true surfaces references: {all_kinds:?}"
+            );
+            assert!(
+                all_kinds.len() > default_kinds.len(),
+                "opting in returns strictly more rows ({} vs {})",
+                all_kinds.len(),
+                default_kinds.len()
             );
 
             let db = crate::db::path::repo_db_path(&root);

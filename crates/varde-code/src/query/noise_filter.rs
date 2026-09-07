@@ -90,6 +90,42 @@ const GENERATED_FILE_SUFFIXES: &[&str] = &[
     ".bundle.mjs",
 ];
 
+/// Web front-end asset source extensions — the JS/TS/CSS family. Under an
+/// `assets/` pipeline directory these are front-end glue (or a vendored
+/// framework client), not the code an agent orients on in a backend repo
+/// (audit F9: an Elixir/Phoenix repo surfaced `assets/js/phoenix/*.js` as its
+/// "foundational files" and top symbols, hiding every `.ex` controller).
+const FRONTEND_ASSET_EXTENSIONS: &[&str] = &[
+    "js", "mjs", "cjs", "jsx", "ts", "tsx", "css", "scss", "sass", "less", "vue", "svelte",
+];
+
+/// Directory component that marks a front-end asset pipeline.
+const FRONTEND_ASSET_DIR: &str = "assets";
+
+/// Returns `true` if `path` is a JS/TS/CSS-family file living under an
+/// `assets/` directory — front-end pipeline code that should not dominate a
+/// backend repo's nav_map *orientation* sections (`foundational_files`,
+/// `symbols`, `entrypoints`). Deliberately scoped to orientation: the file is
+/// still fully indexed, queryable, and scanned; it is only kept out of the
+/// "what is this repo about" summary. `assets/` is matched as a whole path
+/// component, so `src/assets_loader.rs` (no `assets` component, non-asset
+/// extension) is unaffected, and a `.ex`/`.rs`/`.py` file that happens to sit
+/// under `assets/` is kept (only asset-language extensions match).
+pub fn is_frontend_asset_path(path: &str) -> bool {
+    let p = Path::new(path);
+    let under_assets = p
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .any(|c| c == FRONTEND_ASSET_DIR);
+    if !under_assets {
+        return false;
+    }
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| FRONTEND_ASSET_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 /// Returns `true` if `path` is generated/vendored: under a dependency/build
 /// directory (`target/`, `node_modules/`, `vendor/`, `grammars/`, ...), under a
 /// framework compiled-asset tree (`priv/static/`), or a minified/bundled
@@ -190,6 +226,28 @@ mod tests {
                 "unexpected match for {p}"
             );
         }
+    }
+
+    #[test]
+    fn frontend_asset_paths_are_orientation_noise() {
+        // Phoenix vendored JS client + ordinary front-end pipeline code.
+        assert!(is_frontend_asset_path("assets/js/phoenix/index.js"));
+        assert!(is_frontend_asset_path("assets/js/app.js"));
+        assert!(is_frontend_asset_path("assets/css/app.scss"));
+        assert!(is_frontend_asset_path("web/assets/components/Nav.tsx"));
+        assert!(is_frontend_asset_path("assets/vendor/topbar.js"));
+    }
+
+    #[test]
+    fn frontend_asset_filter_is_scoped_to_assets_dir_and_web_extensions() {
+        // Not under an `assets/` component.
+        assert!(!is_frontend_asset_path("src/app.js"));
+        assert!(!is_frontend_asset_path("lib/assets_loader.rs"));
+        // Under assets/, but a backend-language file — kept for orientation.
+        assert!(!is_frontend_asset_path("assets/pipeline.ex"));
+        assert!(!is_frontend_asset_path("assets/gen.py"));
+        // `assets` as a substring of a component, not the component itself.
+        assert!(!is_frontend_asset_path("src/assetsx/app.js"));
     }
 
     #[test]

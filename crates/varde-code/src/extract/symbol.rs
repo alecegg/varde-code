@@ -120,6 +120,14 @@ pub(crate) fn is_symbol_ident(lang: SupportLang, kind: &str) -> bool {
         // of `variable_assignment`, so the generic classifier's name-field gate
         // drops it, leaving only expansions as References.
         SupportLang::Bash => kind == "variable_name",
+        // Swift's expression identifier leaf is `simple_identifier` (there is
+        // no `identifier` node), so gating on `identifier` alone produced
+        // **zero** symbols for `.swift` files — empty `symbols_in_file` /
+        // `get_symbol` / `filter_symbols` and an empty nav_map `symbols`
+        // section (audit F9). Declared/callee/parameter names sit in `name`
+        // fields or under `parameter`, which the generic classifier drops, so
+        // this yields the reference set without leaking entity names.
+        SupportLang::Swift => kind == "simple_identifier",
         SupportLang::Ruby
         | SupportLang::C
         | SupportLang::Cpp
@@ -163,6 +171,7 @@ pub(crate) fn classify<'r>(
         | SupportLang::Elixir
         | SupportLang::Solidity
         | SupportLang::Bash
+        | SupportLang::Swift
         | SupportLang::Haskell => classify_generic(node, in_type),
         _ => classify_jsts(node, in_type),
     }
@@ -310,5 +319,44 @@ fn is_entity_name_position(
         "call_expression" => is_self(parent.field("function")),
         "member_expression" => is_self(parent.field("property")),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::extract;
+    use crate::model::SymbolKind;
+    use crate::parse::parse_source;
+    use ast_grep_language::SupportLang;
+
+    /// Swift's expression identifier leaf is `simple_identifier`, not
+    /// `identifier` — the classifier used to gate on `identifier` and produced
+    /// zero symbols for every `.swift` file (audit F9). References in
+    /// expressions are now classified, while declared/parameter names stay out.
+    #[test]
+    fn swift_expression_identifiers_become_references() {
+        let src = "func run() -> Int {\n    let m = Math()\n    return m.add(2, 3)\n}\n";
+        let parsed = parse_source(&SupportLang::Swift, src);
+        assert!(!parsed.has_error(), "fixture parses");
+        let symbols = extract::extract(&parsed, 0).symbols;
+
+        assert!(
+            !symbols.is_empty(),
+            "Swift must produce reference symbols, not zero: {symbols:?}"
+        );
+        assert!(
+            symbols.iter().all(|s| s.kind == SymbolKind::Reference),
+            "generic classifier emits only references: {symbols:?}"
+        );
+        // The receiver `m` is used in `m.add(...)` -> a reference.
+        assert!(
+            symbols.iter().any(|s| s.name == "m"),
+            "receiver identifier `m` should be a reference: {symbols:?}"
+        );
+        // The declared function name `run` is a name position, never a symbol.
+        assert!(
+            !symbols.iter().any(|s| s.name == "run"),
+            "declared name `run` must not leak as a reference: {symbols:?}"
+        );
     }
 }

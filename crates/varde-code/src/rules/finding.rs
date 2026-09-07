@@ -80,11 +80,18 @@ pub struct Finding {
     pub location: Location,
     /// Populated from the match's `captures` map without lossy conversion.
     pub evidence: serde_json::Value,
+    /// Hoisted to the scan payload's per-rule `rules` legend at emission
+    /// (static per rule, so re-inlining it on every finding was pure
+    /// repetition — audit F2); omitted from the per-finding JSON there.
     pub remediation: Option<String>,
     /// Pattern matches carry ast-grep's confidence; SQL findings always
-    /// `None` (no match-confidence signal to derive it from).
+    /// `None` (no match-confidence signal to derive it from). Skipped when
+    /// `None` so SQL findings don't ship a `certainty: null` (audit F2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certainty: Option<Certainty>,
     /// Sourced from the rule's `fix` field when present (informational only).
+    /// Skipped when `None` — null on ~100% of findings otherwise (audit F2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_instructions: Option<String>,
     /// Outcome of an `--apply` run, set only for pattern-rule findings whose
     /// rule carries a `rewrite` template — omitted from JSON otherwise

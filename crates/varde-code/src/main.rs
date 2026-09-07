@@ -13,7 +13,11 @@ fn main() {
     init_tracing(cli.verbose);
     match cli.command {
         Command::Extract { path } => run_extract(&path),
-        Command::Build { repo_root, force } => run_build(&repo_root, force),
+        Command::Build {
+            repo_root,
+            force,
+            changed_files,
+        } => run_build(&repo_root, force, changed_files),
         Command::Batch { json } => run_query("batch", &json),
         Command::SymbolsInFile { json } => run_query("symbols_in_file", &json),
         Command::SymbolsInFiles { json } => run_query("symbols_in_files", &json),
@@ -738,6 +742,20 @@ fn render_nav_map_text(envelope: &str) -> String {
             None => out.push_str("(missing)\n\n"),
         }
     }
+    // Truncation guide (F1): tell the reader what the token budget cut and how
+    // to get the rest.
+    if let Some(truncated) = data.pointer("/guide/truncated").and_then(|t| t.as_object())
+        && !truncated.is_empty()
+    {
+        out.push_str("## truncated (token budget)\n");
+        for (section, info) in truncated {
+            let shown = info.get("shown").and_then(|v| v.as_u64()).unwrap_or(0);
+            let total = info.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+            let more = info.get("more").and_then(|v| v.as_str()).unwrap_or("");
+            out.push_str(&format!("- {section}: {shown}/{total} shown — {more}\n"));
+        }
+        out.push('\n');
+    }
     out
 }
 
@@ -757,22 +775,33 @@ fn init_tracing(verbose: bool) {
         .init();
 }
 
-fn run_build(repo_root: &str, force: bool) {
+fn run_build(repo_root: &str, force: bool, changed_files: bool) {
     match varde_code::build::run_with_force(repo_root, force) {
         Ok(summary) => {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "ok": true,
-                    "dbPath": summary.db_path,
-                    "entities": summary.entities,
-                    "symbols": summary.symbols,
-                    "diagnostics": summary.diagnostics,
-                    "unchanged": summary.unchanged,
-                    "reparsed": summary.reparsed,
-                    "changedFiles": summary.changed_files,
-                })
-            );
+            // The reparsed-path list is a drill-down handle, but on a full
+            // build it's the entire repo — hundreds of paths of low inline
+            // value (audit F11). Emit a count plus a small sample by default;
+            // `--changed-files` opts back into the full array.
+            const CHANGED_FILES_SAMPLE: usize = 10;
+            let mut result = serde_json::json!({
+                "ok": true,
+                "dbPath": summary.db_path,
+                "entities": summary.entities,
+                "symbols": summary.symbols,
+                "diagnostics": summary.diagnostics,
+                "unchanged": summary.unchanged,
+                "reparsed": summary.reparsed,
+                "changedFilesCount": summary.changed_files.len(),
+            });
+            if changed_files {
+                result["changedFiles"] = serde_json::json!(summary.changed_files);
+            } else if summary.changed_files.len() > CHANGED_FILES_SAMPLE {
+                result["changedFilesSample"] =
+                    serde_json::json!(summary.changed_files[..CHANGED_FILES_SAMPLE]);
+            } else {
+                result["changedFilesSample"] = serde_json::json!(summary.changed_files);
+            }
+            println!("{result}");
         }
         Err(e) => {
             tracing::error!(repo_root = repo_root, "fatal error: {e:#}");

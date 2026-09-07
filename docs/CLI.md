@@ -20,14 +20,30 @@ uniform envelope to stdout:
 The JSON object always accepts `repoRoot` or `dbPath` to locate the index,
 plus mode-specific fields (documented per command below).
 
+Two output-shaping fields are accepted by every query mode and by `scan`:
+
+- **`absolutePaths?`** (default `false`) — file paths in the output are emitted
+  repo-relative (the absolute `repoRoot` prefix is stripped) so the prefix
+  isn't re-stated on every path. Set `true` to keep absolute paths. Relative
+  paths round-trip: a relative `filePath` fed back into another mode still
+  resolves (paths are matched by suffix). No effect on `dbPath`-only calls
+  (no `repoRoot` to strip) or on paths outside the repo.
+- **`includeSpanDetail?`** (default `false`) — a `span` carries only
+  `start_line`/`end_line` by default; set `true` to also include the
+  `start_byte`/`end_byte`/`start_col`/`end_col` fields.
+
 ## Build / index
 
 - **`extract PATH`** — Extract entities and symbols from a file or directory
   tree; prints JSON to stdout. Does not touch the database.
-- **`build --repo-root ROOT [--force]`** — Extract, resolve, and persist a
-  repo's full index. Full rebuild every run (`--force` skips incremental
-  detection). Writes to `~/.config/varde-code/repos/<name>-<hash>/index.db`.
-  Query subcommands read from here (or freshen it incrementally on demand).
+- **`build --repo-root ROOT [--force] [--changed-files]`** — Extract, resolve,
+  and persist a repo's full index. Full rebuild every run (`--force` skips
+  incremental detection). Writes to
+  `~/.config/varde-code/repos/<name>-<hash>/index.db`. Query subcommands read
+  from here (or freshen it incrementally on demand). The JSON result reports
+  `changedFilesCount` plus a small `changedFilesSample`; pass `--changed-files`
+  to include the full `changedFiles` array instead (on a full build that is
+  every reparsed path in the repo).
 
 ## Query modes
 
@@ -37,8 +53,8 @@ Each takes `--json '<object>'`; fields shown are in addition to
 | Command | Extra JSON fields | Description |
 |---|---|---|
 | `batch` | `calls: [{mode, ...}]` | Run several query modes in one call, sharing `repoRoot`/`dbPath` |
-| `symbols_in_file` | `filePath`, `includeBody?` | List symbols declared in a file |
-| `symbols_in_files` | `filePaths`, `includeBody?` | Batch form of `symbols_in_file` over many files; maps each path to its symbols or `{error}` |
+| `symbols_in_file` | `filePath`, `includeBody?`, `includeReferences?` | List symbols declared in a file. Returns declarations + bindings by default; `reference`-kind symbols (call sites/usages, 80–95% of rows) are excluded unless `includeReferences: true` |
+| `symbols_in_files` | `filePaths`, `includeBody?`, `includeReferences?` | Batch form of `symbols_in_file` over many files; maps each path to its symbols or `{error}` |
 | `get_symbol` | `name`, `filePath?`, `kind?`, `includeBody?` | Get one symbol by name |
 | `dependencies` | `filePath`, `direction?`, `maxDepth?` | Files a file depends on |
 | `dependents` | `filePath`, `maxDepth?` | Files depending on a file |
@@ -46,7 +62,7 @@ Each takes `--json '<object>'`; fields shown are in addition to
 | `hotspots` | — | Risk hotspots ranked by complexity × churn (falls back to complexity alone when no file has churn) |
 | `clusters` | `minSize?`, `maxClusters?`, `seedPath?` | Community-detection (Louvain) partition of the resolution graph into densely-interconnected file clusters; each `{id, files, label, cohesion}` (`label` always `null`, `cohesion` is the fraction of touching edges kept inside). `seedPath` returns only the cluster containing that file |
 | `context_pack` | `query` | Keyword-driven context bundle: files/symbols whose paths, directory names, or symbol names match `query` (exact/substring), plus their one-hop dependency neighbors, ranked by complexity+churn, with covering tests and a `readingOrder`. Structural only — no doc corpus, no semantic search |
-| `nav_map` | — (plus `--format json\|text`) | Session-start repo orientation map: entrypoints, foundational files, module layers, subsystems, symbols, flows, and hotspots assembled from the persisted index. JSON is canonical; `--format text` renders the same data as plain text |
+| `nav_map` | `maxTokensEstimate?` (plus `--format json\|text`) | Session-start repo orientation map: entrypoints, foundational files, module layers, subsystems, symbols, flows, and hotspots assembled from the persisted index. Trimmed to a total token budget (default 8000, override with `maxTokensEstimate`) spent section-by-section in priority order so it stays fixed-cost regardless of repo size; a `guide.truncated` block reports `{shown, total, more}` per trimmed section and names the follow-up that returns the full data. The `symbols` leaderboard ranks by **caller breadth** (distinct calling files, reported as `callers`) rather than raw call count, and drops low-orientation accessor/stdlib names (`getName`, `push`, `ConfigureAwait`, …). The `flows` section lists only genuine multi-node call trees — single-node trees that merely restate an entrypoint are omitted. Orientation sections (`foundational_files`, `symbols`, `entrypoints`) exclude front-end asset code (JS/TS/CSS under `assets/`), and `foundational_files` ranks pure data classes (all-accessor/boilerplate methods) below real modules. `entrypoints` covers both annotation-based handlers and call-based routes (Express, Slim, Phoenix, Laravel, Ktor, net/http, …). JSON is canonical; `--format text` renders the same data as plain text |
 | `map_file` | `filePath` | Map a file to its persisted node info |
 | `map_symbol` | `name`, `sourceFile?` | Map a symbol to its persisted entity |
 | `map_path` | `sourceFile`, `targetFile`, `maxDepth?` | Dependency path between two files |
@@ -67,7 +83,15 @@ Each takes `--json '<object>'`; fields shown are in addition to
   non-zero when findings exist at/above the severity threshold, so it can gate
   CI. `--apply` writes `rewrite` templates to matched files (default is
   read-only); `--force` allows writing to files with uncommitted git changes
-  (otherwise skipped as `skipped-dirty`).
+  (otherwise skipped as `skipped-dirty`). Output is `{findings, diagnostics,
+  rules}`: each finding is `{id, rule_id, severity, location, evidence,
+  message?, certainty?, agent_instructions?}`, and the `rules` legend maps each
+  fired `rule_id` to its `{message, remediation}` once rather than repeating that
+  static text on every finding (a finding carries an inline `message` only when
+  rule interpolation changed it from the template). `duplicate-code-clone`
+  findings are collapsed one-per-clone-band: a single finding per band with
+  `evidence: {band, members: [{file, startLine, endLine}, …]}` instead of one
+  finding per member.
 - **`test --json '{rulesDir?}'`** — Run every rule's `[[test]]` entries through
   the pattern/SQL test runners and report pass/fail. Self-contained: no DB and
   no prior `build` required. `rulesDir` scopes discovery to a single directory

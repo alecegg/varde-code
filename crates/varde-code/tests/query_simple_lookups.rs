@@ -145,10 +145,11 @@ mod symbols_in_file {
 
         let result = data("symbols_in_file", &db, &format!(r#""filePath":"{a_rs}""#));
         let arr = result.as_array().expect("data is an array");
-        // symbols_in_file returns declaration entities (class/function/interface/
-        // variable/parameter) followed by the binding/reference symbols — both
-        // must be present and the count is exactly their sum.
-        use varde_code::model::EntityKind;
+        // By default (audit F4) symbols_in_file returns declaration entities
+        // (class/function/interface/variable/parameter) followed by the
+        // BINDING symbols only — `reference`-kind symbols are survey noise and
+        // are excluded unless `includeReferences` is set (asserted below).
+        use varde_code::model::{EntityKind, SymbolKind};
         let expected_decls: Vec<&Entity> = entities
             .iter()
             .filter(|e| {
@@ -163,15 +164,22 @@ mod symbols_in_file {
                     )
             })
             .collect();
-        let expected_syms: Vec<&Symbol> = symbols.iter().filter(|s| s.file_id == a_rs_id).collect();
+        let expected_all_syms: Vec<&Symbol> =
+            symbols.iter().filter(|s| s.file_id == a_rs_id).collect();
+        let expected_nonref_syms: Vec<&Symbol> = expected_all_syms
+            .iter()
+            .filter(|s| s.kind != SymbolKind::Reference)
+            .copied()
+            .collect();
         assert_eq!(
             arr.len(),
-            expected_decls.len() + expected_syms.len(),
-            "result: {result}"
+            expected_decls.len() + expected_nonref_syms.len(),
+            "default excludes references: {result}"
         );
         for item in arr {
             assert!(item["name"].is_string());
             assert!(item["kind"].is_string());
+            assert_ne!(item["kind"], "reference", "no references by default");
             assert_eq!(item["file"], a_rs);
             assert!(item["span"]["start_line"].is_number());
         }
@@ -179,7 +187,7 @@ mod symbols_in_file {
             .iter()
             .map(|i| i["name"].as_str().unwrap().to_string())
             .collect();
-        for sym in &expected_syms {
+        for sym in &expected_nonref_syms {
             assert!(names.contains(&sym.name), "missing symbol {}", sym.name);
         }
         for decl in &expected_decls {
@@ -189,6 +197,20 @@ mod symbols_in_file {
                 decl.name
             );
         }
+
+        // includeReferences=true restores the full declarations + all symbols
+        // (bindings + references) set.
+        let with_refs = data(
+            "symbols_in_file",
+            &db,
+            &format!(r#""filePath":"{a_rs}","includeReferences":true"#),
+        );
+        let with_refs_arr = with_refs.as_array().expect("data is an array");
+        assert_eq!(
+            with_refs_arr.len(),
+            expected_decls.len() + expected_all_syms.len(),
+            "includeReferences returns the full set: {with_refs}"
+        );
     }
 
     #[test]
@@ -312,8 +334,23 @@ mod get_symbol {
         assert_eq!(result["name"], sym.name);
         assert_eq!(result["kind"], "reference"); // rust fixtures produce references
         assert_eq!(result["file"], a_rs);
+        // Line-only span by default (audit F6): line pair kept, byte/col dropped.
         assert_eq!(result["span"]["start_line"], sym.span.start_line);
-        assert_eq!(result["span"]["end_col"], sym.span.end_col);
+        assert_eq!(result["span"]["end_line"], sym.span.end_line);
+        assert!(result["span"].get("end_col").is_none());
+        assert!(result["span"].get("start_byte").is_none());
+
+        // includeSpanDetail opts back into the full byte/col span.
+        let detailed = data(
+            "get_symbol",
+            &db,
+            &format!(
+                r#""name":"{}","filePath":"a.rs","includeSpanDetail":true"#,
+                sym.name
+            ),
+        );
+        assert_eq!(detailed["span"]["end_col"], sym.span.end_col);
+        assert_eq!(detailed["span"]["start_byte"], sym.span.start_byte);
     }
 
     #[test]

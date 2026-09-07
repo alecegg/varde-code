@@ -27,11 +27,12 @@
 //! categories). This module is not yet wired into any dispatcher/CLI mode —
 //! that's the later `nav-map-dispatch-cli` task.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
 
-use super::noise_filter::is_generated_or_vendored_path;
+use super::noise_filter::{is_frontend_asset_path, is_generated_or_vendored_path};
+use super::symbols_section::is_accessor;
 use super::{ApiError, db_err};
 
 /// Distinct dependent-file count per target file id.
@@ -65,6 +66,61 @@ fn distinct_dependents_by_file(conn: &Connection) -> Result<HashMap<i64, i64>, A
     Ok(map)
 }
 
+/// Standard value-type boilerplate method names (besides accessors) that a
+/// data class carries — case-insensitive. `equals`/`hashCode`/`toString` are
+/// the Java/Kotlin trio; `compareTo`/`clone`/`copy` and the builder/factory
+/// idioms (`builder`/`of`/`valueOf`/`with`) round out records and DTOs.
+const DATA_CLASS_BOILERPLATE: &[&str] = &[
+    "equals",
+    "hashcode",
+    "tostring",
+    "compareto",
+    "clone",
+    "copy",
+    "builder",
+    "of",
+    "valueof",
+    "with",
+    "deconstruct",
+];
+
+/// True when `name` is a trivial data-holder method: an accessor
+/// ([`is_accessor`]) or standard value-type boilerplate
+/// ([`DATA_CLASS_BOILERPLATE`]).
+fn is_trivial_data_method(name: &str) -> bool {
+    is_accessor(name) || DATA_CLASS_BOILERPLATE.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// File ids whose defined methods are *all* trivial data-holder methods —
+/// i.e. a data class (a JPA `@Entity`, a POJO/record, a DTO). Such a file is
+/// heavily depended on but low orientation value: an agent learns nothing
+/// about a service's architecture from `Person` or `BaseEntity` (audit F9).
+/// Only files with at least one `Function` entity are considered, and every
+/// one must be trivial — a single non-accessor method (real behavior) means
+/// the file is not a pure data holder and is left ranked on its merits.
+fn data_class_file_ids(conn: &Connection) -> Result<HashSet<i64>, ApiError> {
+    let mut stmt = conn
+        .prepare("SELECT file_id, name FROM entities WHERE kind = ?1")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([crate::model::EntityKind::Function.as_i64()], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(db_err)?;
+    // file_id -> "every method seen so far is trivial". A key exists only for
+    // files that define at least one method.
+    let mut all_trivial: HashMap<i64, bool> = HashMap::new();
+    for row in rows {
+        let (file_id, name) = row.map_err(db_err)?;
+        let entry = all_trivial.entry(file_id).or_insert(true);
+        *entry = *entry && is_trivial_data_method(&name);
+    }
+    Ok(all_trivial
+        .into_iter()
+        .filter_map(|(file_id, trivial)| trivial.then_some(file_id))
+        .collect())
+}
+
 /// Compute the foundational-files fan-in leaderboard.
 ///
 /// Reads `files.path`/`files.fan_in` (already-maintained fan-in counts, see
@@ -88,6 +144,7 @@ fn distinct_dependents_by_file(conn: &Connection) -> Result<HashMap<i64, i64>, A
 /// both.
 pub fn leaderboard(conn: &Connection, limit: Option<usize>) -> Result<serde_json::Value, ApiError> {
     let dependents_by_file = distinct_dependents_by_file(conn)?;
+    let data_classes = data_class_file_ids(conn)?;
     let mut stmt = conn
         .prepare(
             "SELECT id, path, fan_in FROM files
@@ -104,23 +161,29 @@ pub fn leaderboard(conn: &Connection, limit: Option<usize>) -> Result<serde_json
         })
         .map_err(db_err)?;
 
-    // (dependents, fan_in, path) — collected first so the leaderboard can be
-    // ranked by distinct dependents, a signal SQL doesn't have (it lives in the
-    // GROUP-BY map above) without a join.
-    let mut ranked: Vec<(i64, i64, String)> = Vec::new();
+    // (is_data_class, dependents, fan_in, path) — collected first so the
+    // leaderboard can be ranked by signals SQL doesn't have to hand: distinct
+    // dependents (the GROUP-BY map above) and the data-class flag (a per-file
+    // method-name heuristic). `is_data_class` is the *primary* discriminator so
+    // heavily-depended-on data holders (a JPA `@Entity`, a DTO) sink below real
+    // modules of comparable fan-in instead of topping the list (audit F9).
+    let mut ranked: Vec<(bool, i64, i64, String)> = Vec::new();
     for row in rows {
         let (file_id, path, fan_in) = row.map_err(db_err)?;
-        if is_generated_or_vendored_path(&path) {
+        if is_generated_or_vendored_path(&path) || is_frontend_asset_path(&path) {
             continue;
         }
         let dependents = dependents_by_file.get(&file_id).copied().unwrap_or(0);
-        ranked.push((dependents, fan_in, path));
+        ranked.push((data_classes.contains(&file_id), dependents, fan_in, path));
     }
-    // Rank: distinct dependents desc, then fan_in desc, then path asc.
+    // Rank: non-data-class first, then distinct dependents desc, then fan_in
+    // desc, then path asc. `false < true`, so ascending on the flag puts real
+    // modules ahead of data classes.
     ranked.sort_by(|a, b| {
-        b.0.cmp(&a.0)
+        a.0.cmp(&b.0)
             .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
     });
     if let Some(limit) = limit {
         ranked.truncate(limit);
@@ -128,7 +191,7 @@ pub fn leaderboard(conn: &Connection, limit: Option<usize>) -> Result<serde_json
 
     let entries: Vec<serde_json::Value> = ranked
         .into_iter()
-        .map(|(dependents, fan_in, path)| {
+        .map(|(_is_data_class, dependents, fan_in, path)| {
             // Describe the distinct dependent-file count (the real "how central
             // is this file" signal), and only add the raw reference total when
             // it differs — so a broadly-imported core module and a hot utility
@@ -384,5 +447,69 @@ mod foundational_files_section_tests {
         assert_eq!(entries[1]["file"], "src/c.rs");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn insert_function(conn: &Connection, file_id: i64, name: &str) {
+        conn.execute(
+            "INSERT INTO entities (kind, name, file_id, start_byte, end_byte, start_line, start_col, end_line, end_col)
+             VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0)",
+            rusqlite::params![crate::model::EntityKind::Function.as_i64(), name, file_id],
+        )
+        .expect("insert function entity");
+    }
+
+    /// A data-class file (all methods are accessors/boilerplate) sinks below a
+    /// real module in the leaderboard even when it is depended on by *more*
+    /// files — a JPA `@Entity` shouldn't top the foundational list (audit F9).
+    #[test]
+    fn foundational_files_section_sinks_data_classes_below_real_modules() {
+        let path = temp_db_path("data-class-sink");
+        let conn = crate::db::open_or_rebuild(&path).expect("schema creates");
+
+        // Person: a data class (getters/setters + equals), depended on by 3.
+        let person = insert_file_id(&conn, "src/Person.java", 3);
+        insert_function(&conn, person, "getName");
+        insert_function(&conn, person, "setName");
+        insert_function(&conn, person, "equals");
+        // OrderService: real behavior, depended on by only 2.
+        let svc = insert_file_id(&conn, "src/OrderService.java", 2);
+        insert_function(&conn, svc, "placeOrder");
+        insert_function(&conn, svc, "getName"); // a mix, but not all-trivial
+
+        for i in 0..3 {
+            let dep = insert_file_id(&conn, &format!("src/p{i}.java"), 0);
+            insert_resolved_edge(&conn, dep, person);
+        }
+        for i in 0..2 {
+            let dep = insert_file_id(&conn, &format!("src/s{i}.java"), 0);
+            insert_resolved_edge(&conn, dep, svc);
+        }
+
+        let result = leaderboard(&conn, None).expect("leaderboard computes");
+        let entries = result.as_array().expect("leaderboard is an array");
+        let svc_pos = entries
+            .iter()
+            .position(|e| e["file"] == "src/OrderService.java")
+            .expect("service present");
+        let person_pos = entries
+            .iter()
+            .position(|e| e["file"] == "src/Person.java")
+            .expect("person present");
+        assert!(
+            svc_pos < person_pos,
+            "real module must outrank the more-depended-on data class: {entries:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn data_class_detection_requires_all_methods_trivial() {
+        assert!(is_trivial_data_method("getName"));
+        assert!(is_trivial_data_method("setId"));
+        assert!(is_trivial_data_method("equals"));
+        assert!(is_trivial_data_method("toString"));
+        assert!(!is_trivial_data_method("placeOrder"));
+        assert!(!is_trivial_data_method("reconcile"));
     }
 }

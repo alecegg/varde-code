@@ -421,6 +421,21 @@ pub fn run_mode(mode: &str, input: &str) -> String {
 /// and [`batch`] (per-call routing inside a batch request) — adding a mode
 /// here wires it into both.
 fn dispatch_mode(mode: &str, value: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+    dispatch_mode_inner(mode, value).map(|mut data| {
+        // Single output boundary for every mode (and, via `batch`, each of its
+        // sub-calls): repo-relative paths (F5) + line-only spans (F6). Both
+        // transforms are idempotent, so a `batch` payload seeing this twice —
+        // once per sub-call with that call's own `repoRoot`, once for the
+        // aggregate — is harmless.
+        crate::query::output::postprocess(&mut data, value);
+        data
+    })
+}
+
+fn dispatch_mode_inner(
+    mode: &str,
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
     match mode {
         "symbols_in_file" => crate::query::simple::symbols_in_file(value),
         "symbols_in_files" => crate::query::simple::symbols_in_files(value),
@@ -528,6 +543,7 @@ pub mod mapping;
 pub mod module_layers;
 pub mod nav_map;
 pub mod noise_filter;
+pub mod output;
 pub mod simple;
 pub mod subsystems;
 pub mod symbols_section;

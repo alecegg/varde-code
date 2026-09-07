@@ -1268,6 +1268,21 @@ fn resolves_imports_by_namespace(lang: ast_grep_language::SupportLang) -> bool {
     matches!(lang, CSharp | Java | Kotlin | Scala)
 }
 
+/// Languages that need the repo-wide single-definition call fallback (Pass 3
+/// in [`resolve_calls`]): either their imports name a namespace rather than a
+/// file ([`resolves_imports_by_namespace`]), or they have no cross-file import
+/// statements at all because same-module symbols are implicitly visible
+/// (Swift — every file in a module sees every other without an `import`). In
+/// both cases the path-based cross-file import pass can't produce call edges,
+/// so resolution falls back to the unique repo-wide definition of the callee
+/// name (ambiguous names stay unresolved — no false edge). Audit F9: without
+/// this, Swift produced zero resolved cross-file edges, so nav_map's fan-in
+/// `symbols` leaderboard and `foundational_files` were empty.
+fn resolves_calls_by_repo_wide_fallback(lang: ast_grep_language::SupportLang) -> bool {
+    use ast_grep_language::SupportLang::*;
+    resolves_imports_by_namespace(lang) || matches!(lang, Swift)
+}
+
 /// Repo-wide "single definition" index for the languages in
 /// [`resolves_imports_by_namespace`]. Maps a normalized callee key to the sole
 /// callable entity of that name across the whole repo, or `None` when the name
@@ -1469,15 +1484,18 @@ fn resolve_calls(
     let repo_wide = build_repo_wide_unique_index(entities);
     let type_ctx = TypeResolveCtx::build(entities);
 
-    // Files whose language resolves imports by namespace, not by file path
-    // (C#/Java/Kotlin/Scala): the cross-file import pass can't fire for these,
-    // so they fall back to the repo-wide single-definition index (Pass 3
-    // below). Precomputed per file id so the per-call closure is a cheap
-    // lookup, not a path re-parse.
+    // Files whose language needs the repo-wide single-definition fallback
+    // because the path-based cross-file import pass can't fire: imports name a
+    // namespace, not a file (C#/Java/Kotlin/Scala), or there are no cross-file
+    // import statements at all because same-module symbols are implicitly
+    // visible (Swift). Both fall back to the repo-wide single-definition index
+    // (Pass 3 below). Precomputed per file id so the per-call closure is a
+    // cheap lookup, not a path re-parse.
     let namespace_import_file: Vec<bool> = files
         .iter()
         .map(|p| {
-            language_for_path(std::path::Path::new(p)).is_some_and(resolves_imports_by_namespace)
+            language_for_path(std::path::Path::new(p))
+                .is_some_and(resolves_calls_by_repo_wide_fallback)
         })
         .collect();
 
@@ -1977,10 +1995,40 @@ mod call_resolution_cross_file {
         );
     }
 
-    /// Gate check: the repo-wide fallback is C#-only. A Rust call to a
-    /// repo-unique function that the caller never `use`s must stay unresolved —
-    /// Rust resolves cross-file through import edges, and applying the fallback
-    /// to it would invent edges the language's own visibility rules forbid.
+    /// Pass 3 extends to Swift (audit F9): same-module files see each other
+    /// with no `import`, so a cross-file method call has no import edge to
+    /// resolve through and must fall back to the repo-wide unique definition.
+    /// Without this, Swift produced zero resolved cross-file edges, leaving
+    /// nav_map's fan-in `symbols` leaderboard and `foundational_files` empty.
+    #[test]
+    fn swift_same_module_call_resolves_via_repo_wide_unique_definition() {
+        let (entities, symbols, files) = load_project("swift/calls");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+
+        let place_order = entities
+            .iter()
+            .position(|e| e.kind == crate::model::EntityKind::Function && e.name == "placeOrder")
+            .expect("placeOrder defined") as u32;
+
+        let resolved_to_place_order = graph.edges.iter().any(|e| {
+            e.kind == EdgeKind::Call && e.resolved && e.to == EdgeTarget::Entity(place_order)
+        });
+        assert!(
+            resolved_to_place_order,
+            "svc.placeOrder() must resolve cross-file via the repo-wide fallback: {:?}",
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Call)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Gate check: the repo-wide fallback is scoped to namespace-import /
+    /// implicit-visibility languages. A Rust call to a repo-unique function
+    /// that the caller never `use`s must stay unresolved — Rust resolves
+    /// cross-file through import edges, and applying the fallback to it would
+    /// invent edges the language's own visibility rules forbid.
     #[test]
     fn non_csharp_language_does_not_use_repo_wide_fallback() {
         let (entities, symbols, files) = load_project("rust/unimported_unique");

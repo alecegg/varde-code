@@ -23,10 +23,10 @@
 //! symbol whose `entity_id` also appears in
 //! [`crate::query::entrypoints::detect`]'s output.
 //!
-//! Out of scope (per the task): changing the fan-in counting logic itself
-//! beyond the noise-filter and entrypoint-dedup steps. This module is not
-//! yet wired into any dispatcher/CLI mode — that's the later
-//! `nav-map-dispatch-cli` task.
+//! Ranking is by **caller breadth** (distinct caller files), not raw
+//! call-edge count, and low-orientation accessor/stdlib names are dropped
+//! (audit F8 — see [`leaderboard`] and [`is_low_orientation_symbol`]). Wired
+//! into the nav-map `symbols` section (`query::nav_map`).
 
 use std::collections::HashSet;
 
@@ -37,23 +37,32 @@ use crate::resolve::EdgeKind;
 
 #[cfg(test)]
 use super::entrypoints;
-use super::noise_filter::is_generated_or_vendored_path;
+use super::noise_filter::{is_frontend_asset_path, is_generated_or_vendored_path};
 use super::{ApiError, db_err};
 
 /// Compute the cross-file symbol fan-in leaderboard.
 ///
-/// Reads `Function`/`Class` entities and their cross-file resolved
-/// `Call`-edge fan-in count (see module docs for the exact reused join),
-/// excludes symbols defined in test files (via the authoritative
+/// Reads `Function`/`Class` entities and ranks them by **caller breadth** —
+/// the number of *distinct files* that call them across a file boundary
+/// (audit F8), not the raw call-edge count. Breadth is a far better proxy for
+/// architectural centrality: an accessor called 50× from one module scores 1,
+/// while a core interface touched from 8 files scores 8. Raw edge count is
+/// kept only as a deterministic tie-breaker.
+///
+/// Excludes symbols defined in test files (via the authoritative
 /// `is_test_path` generated column, matching [`entrypoints::detect`] and the
 /// foundational-files leaderboard), drops any path
-/// [`is_generated_or_vendored_path`] flags as
-/// generated/vendored, drops any entity also present in
-/// [`entrypoints::detect`]'s output, sorts descending by fan-in (ties broken
-/// by path then symbol name for determinism), and caps the result at
-/// `limit` entries (`None` = unbounded). Each entry is `{"file", "symbol",
-/// "owner", "count"}`, where `owner` is the method's owning type (from
-/// `entities.owner_type`) or `null` for a module/top-level function.
+/// [`is_generated_or_vendored_path`] flags as generated/vendored, drops any
+/// entity also present in [`entrypoints::detect`]'s output, and drops
+/// low-orientation names ([`is_low_orientation_symbol`] — accessors and
+/// stdlib/framework boilerplate like `setName`/`push`/`ConfigureAwait` that
+/// rank high but teach nothing about the repo's architecture). Sorts
+/// descending by breadth (ties broken by raw count, then path, then symbol
+/// name for determinism) and caps the result at `limit` entries (`None` =
+/// unbounded). Each entry is `{"file", "symbol", "owner", "callers"}`, where
+/// `callers` is the distinct-caller-file breadth and `owner` is the method's
+/// owning type (from `entities.owner_type`) or `null` for a module/top-level
+/// function.
 pub fn leaderboard(
     conn: &Connection,
     entrypoint_ids: &HashSet<i64>,
@@ -62,7 +71,9 @@ pub fn leaderboard(
     let call_kind = EdgeKind::Call.as_i64();
     let mut stmt = conn
         .prepare(
-            "SELECT e.id, f.path, e.name, e.owner_type, COUNT(re.id) AS fan_in
+            "SELECT e.id, f.path, e.name, e.owner_type,
+                    COUNT(DISTINCT re.from_file_id) AS breadth,
+                    COUNT(re.id) AS total
              FROM entities e
              JOIN files f ON f.id = e.file_id
              JOIN resolved_edges re
@@ -72,8 +83,8 @@ pub fn leaderboard(
                 AND re.from_file_id != e.file_id
              WHERE e.kind IN (?2, ?3) AND f.is_test_path = 0
              GROUP BY e.id
-             HAVING COUNT(re.id) > 0
-             ORDER BY fan_in DESC, f.path ASC, e.name ASC",
+             HAVING COUNT(DISTINCT re.from_file_id) > 0
+             ORDER BY breadth DESC, total DESC, f.path ASC, e.name ASC",
         )
         .map_err(db_err)?;
     let rows = stmt
@@ -97,11 +108,14 @@ pub fn leaderboard(
 
     let mut entries = Vec::new();
     for row in rows {
-        let (entity_id, path, name, owner_type, fan_in) = row.map_err(db_err)?;
-        if is_generated_or_vendored_path(&path) {
+        let (entity_id, path, name, owner_type, breadth) = row.map_err(db_err)?;
+        if is_generated_or_vendored_path(&path) || is_frontend_asset_path(&path) {
             continue;
         }
         if entrypoint_ids.contains(&entity_id) {
+            continue;
+        }
+        if is_low_orientation_symbol(&name) {
             continue;
         }
         // `owner` disambiguates common method names (`on` -> owner `EventBus`);
@@ -111,7 +125,7 @@ pub fn leaderboard(
             "file": path,
             "symbol": name,
             "owner": owner_type,
-            "count": fan_in,
+            "callers": breadth,
         }));
     }
     if let Some(limit) = limit {
@@ -119,6 +133,76 @@ pub fn leaderboard(
     }
     Ok(serde_json::json!(entries))
 }
+
+/// Accessor / stdlib / framework names that top a raw fan-in board but carry
+/// ~zero orientation value — an agent learns nothing about a repo's
+/// architecture from `setName` or `push` (audit F8). Two matchers:
+///
+/// - **Accessors**: the bare forms `get`/`set`/`is`/`has`, and the
+///   `getName`/`setValue`/`isReady`/`has_next` prefix pattern (prefix followed
+///   by an uppercase letter or `_`, so `issue`/`hash`/`setup` are *not*
+///   caught).
+/// - **Stopwords**: a curated set of container/stdlib method and
+///   language-sentinel names (case-insensitive), drawn from the names actually
+///   observed topping the leaderboard across the audit corpus.
+fn is_low_orientation_symbol(name: &str) -> bool {
+    if is_accessor(name) {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    LOW_ORIENTATION_NAMES.contains(&lower.as_str())
+}
+
+/// `get`/`set`/`is`/`has` accessor detection — see [`is_low_orientation_symbol`].
+/// Shared with [`super::foundational_files`]'s data-class heuristic (audit F9).
+pub(crate) fn is_accessor(name: &str) -> bool {
+    for prefix in ["get", "set", "is", "has"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            match rest.chars().next() {
+                None => return true, // bare `get`/`set`/`is`/`has`
+                Some(c) if c == '_' || c.is_ascii_uppercase() => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Case-insensitive stopword set for [`is_low_orientation_symbol`]. Kept
+/// deliberately focused on unambiguous container/stdlib methods and language
+/// sentinels (Rust trait methods, C++/Ruby/JS container ops, C# awaitable and
+/// constant boilerplate) rather than domain-plausible verbs like
+/// `add`/`find`/`run`, which can legitimately be a repo's core interface.
+const LOW_ORIENTATION_NAMES: &[&str] = &[
+    "new",
+    "push",
+    "pop",
+    "size",
+    "len",
+    "length",
+    "begin",
+    "end",
+    "clone",
+    "merge",
+    "dig",
+    "unwrap",
+    "default",
+    "hash",
+    "into",
+    "from",
+    "as_str",
+    "as_ref",
+    "as_mut",
+    "to_string",
+    "tostring",
+    "configureawait",
+    "true",
+    "false",
+    "none",
+    "null",
+    "notnull",
+    "nil",
+];
 
 #[cfg(test)]
 mod symbols_section_tests {
@@ -331,6 +415,105 @@ mod symbols_section_tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Ranking is by caller *breadth* (distinct caller files), not raw call
+    /// count: a symbol called 3× from 3 different files outranks one called
+    /// 10× from a single file (audit F8).
+    #[test]
+    fn symbols_section_ranks_by_caller_breadth_not_raw_count() {
+        let path = temp_db_path("breadth-rank");
+        let conn = crate::db::open_or_rebuild(&path).expect("schema creates");
+
+        let wide_file = insert_file(&conn, "src/wide.ts");
+        let hot_file = insert_file(&conn, "src/hot.ts");
+        let wide_id = insert_function(&conn, wide_file, "wideUse");
+        let hot_id = insert_function(&conn, hot_file, "hotLoop");
+
+        // wideUse: one call from each of 3 distinct caller files -> breadth 3.
+        for i in 0..3 {
+            let caller_file = insert_file(&conn, &format!("src/caller_w{i}.ts"));
+            let caller_id = insert_function(&conn, caller_file, &format!("cw{i}"));
+            insert_call_edge(&conn, caller_file, wide_file, caller_id, wide_id);
+        }
+        // hotLoop: 10 calls, all from a single caller file -> breadth 1.
+        let hot_caller = insert_file(&conn, "src/hot_caller.ts");
+        for i in 0..10 {
+            let caller_id = insert_function(&conn, hot_caller, &format!("ch{i}"));
+            insert_call_edge(&conn, hot_caller, hot_file, caller_id, hot_id);
+        }
+
+        let result = leaderboard(&conn, &HashSet::new(), None).expect("leaderboard computes");
+        let entries = result.as_array().expect("leaderboard is an array");
+
+        assert_eq!(
+            entries[0]["symbol"], "wideUse",
+            "breadth (3 caller files) must outrank raw count (10 calls, 1 file): {entries:?}"
+        );
+        assert_eq!(entries[0]["callers"], 3);
+        let hot = entries
+            .iter()
+            .find(|e| e["symbol"] == "hotLoop")
+            .expect("hotLoop present");
+        assert_eq!(
+            hot["callers"], 1,
+            "single-caller-file breadth is 1: {hot:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Accessor and stdlib/framework boilerplate names are dropped from the
+    /// leaderboard even with real cross-file breadth; a domain symbol is kept
+    /// (audit F8).
+    #[test]
+    fn symbols_section_excludes_low_orientation_names() {
+        let path = temp_db_path("low-orientation");
+        let conn = crate::db::open_or_rebuild(&path).expect("schema creates");
+
+        let target_file = insert_file(&conn, "src/model.ts");
+        let setter_id = insert_function(&conn, target_file, "setName"); // accessor
+        let push_id = insert_function(&conn, target_file, "push"); // stopword
+        let domain_id = insert_function(&conn, target_file, "reconcileLedger"); // kept
+
+        // Give each real cross-file breadth so only the name filter can drop them.
+        for (i, callee) in [setter_id, push_id, domain_id].into_iter().enumerate() {
+            let caller_file = insert_file(&conn, &format!("src/c{i}.ts"));
+            let caller_id = insert_function(&conn, caller_file, &format!("caller{i}"));
+            insert_call_edge(&conn, caller_file, target_file, caller_id, callee);
+        }
+
+        let result = leaderboard(&conn, &HashSet::new(), None).expect("leaderboard computes");
+        let entries = result.as_array().expect("leaderboard is an array");
+
+        assert!(
+            !entries.iter().any(|e| e["symbol"] == "setName"),
+            "accessor setName must be excluded: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e["symbol"] == "push"),
+            "stdlib name push must be excluded: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e["symbol"] == "reconcileLedger"),
+            "domain symbol reconcileLedger must remain: {entries:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Accessor detection: prefixes only fire on `getX`/`is_x`/bare forms, not
+    /// on words that merely start with those letters.
+    #[test]
+    fn accessor_detection_is_precise() {
+        for yes in [
+            "get", "set", "is", "has", "getName", "setValue", "is_ready", "hasNext",
+        ] {
+            assert!(is_accessor(yes), "{yes} should be an accessor");
+        }
+        for no in ["issue", "hash", "setup", "getaway", "reconcile", "index"] {
+            assert!(!is_accessor(no), "{no} should NOT be an accessor");
+        }
     }
 
     /// Leaderboard sorts descending by fan-in and respects `limit`.

@@ -25,7 +25,9 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::extract::langs::role_tags::{self, RoleTag, RoleTagRule};
 use crate::model::EntityKind;
 
-use super::noise_filter::{is_generated_or_vendored_path, is_scaffold_template_path};
+use super::noise_filter::{
+    is_frontend_asset_path, is_generated_or_vendored_path, is_scaffold_template_path,
+};
 use super::{ApiError, db_err};
 
 /// One detected semantic entrypoint.
@@ -206,6 +208,7 @@ pub fn detect(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
     for mut candidate in candidates {
         if is_generated_or_vendored_path(&candidate.path)
             || is_scaffold_template_path(&candidate.path)
+            || is_frontend_asset_path(&candidate.path)
         {
             continue;
         }
@@ -309,7 +312,22 @@ fn route_is_call_based(path: &str) -> bool {
     };
     matches!(
         ext,
-        "go" | "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "php" | "rb" | "cs" | "kt" | "kts"
+        "go" | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "ts"
+            | "tsx"
+            | "php"
+            | "rb"
+            | "cs"
+            | "kt"
+            | "kts"
+            // Elixir/Phoenix: routes are `get "/path", Ctrl, :action` macro
+            // calls in the router module — call-based, not annotations. The
+            // extractor already emits `Route` entities for them (audit F10).
+            | "ex"
+            | "exs"
     )
 }
 
@@ -361,6 +379,7 @@ pub fn detect_routes(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
         if !route_is_call_based(&file)
             || is_generated_or_vendored_path(&file)
             || is_scaffold_template_path(&file)
+            || is_frontend_asset_path(&file)
         {
             continue;
         }
@@ -448,7 +467,10 @@ pub fn detect_process_mains(conn: &Connection) -> Result<Vec<Entrypoint>, ApiErr
 
     let mut results = Vec::new();
     for (entity_id, file, name) in rows {
-        if is_generated_or_vendored_path(&file) || is_scaffold_template_path(&file) {
+        if is_generated_or_vendored_path(&file)
+            || is_scaffold_template_path(&file)
+            || is_frontend_asset_path(&file)
+        {
             continue;
         }
         // The name must be the *right* main for the file's language (C# `Main`,
@@ -576,6 +598,25 @@ fn is_bootstrap_by_fan_asymmetry(conn: &Connection, entity_id: i64) -> Result<bo
 #[cfg(test)]
 mod semantic_entrypoint_tests {
     use super::*;
+
+    #[test]
+    fn route_is_call_based_covers_elixir_and_php_and_js() {
+        // Frameworks whose routes are call/macro registrations, not
+        // annotations (audit F10): Phoenix (`.ex`), Slim (`.php`), Express
+        // (`.js`/`.ts`). Rust/Python are decorator/attribute-driven and must
+        // stay out of the call-based route path.
+        for p in [
+            "lib/router.ex",
+            "config/routes.exs",
+            "src/routes.php",
+            "app.ts",
+        ] {
+            assert!(route_is_call_based(p), "{p} should be call-based");
+        }
+        for p in ["src/main.rs", "app/views.py"] {
+            assert!(!route_is_call_based(p), "{p} should NOT be call-based");
+        }
+    }
 
     fn temp_root(label: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(

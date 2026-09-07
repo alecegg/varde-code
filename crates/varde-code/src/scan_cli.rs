@@ -211,6 +211,12 @@ pub fn scan_repo(input: &serde_json::Value) -> Result<serde_json::Value, ApiErro
         .filter(|f| rewrite_rule_ids.contains(f.rule_id.as_str()))
         .count();
 
+    // Collapse each clone band into ONE finding listing its members, instead
+    // of N findings that each point at a single member and never name the
+    // others (audit F3). Clone findings are SQL rules — never rewrite-bearing —
+    // so this runs after the rewrite wiring above without affecting it.
+    let findings = collapse_clone_bands(findings);
+
     let mut payload = serde_json::json!({ "findings": findings, "diagnostics": diagnostics });
     if !stale_suppressions.is_empty() {
         payload["stale_suppressions"] = serde_json::json!(stale_suppressions);
@@ -235,7 +241,158 @@ pub fn scan_repo(input: &serde_json::Value) -> Result<serde_json::Value, ApiErro
         }
     }
 
+    // 6. Hoist per-rule static text (message template + remediation) into a
+    //    one-per-rule `rules` legend so it is stated once, not re-inlined on
+    //    every finding (audit F2). Done last, after rewrite_status wiring,
+    //    which keys off the untouched `id` field.
+    hoist_rule_legend(&mut payload, &rules);
+
+    // 7. Same output boundary the query modes use: repo-relative paths (F5)
+    //    and line-only spans (F6). Runs last, after `--apply` has already read
+    //    each finding's byte offsets from the in-memory `Finding`, so trimming
+    //    the JSON never affects splicing.
+    crate::query::output::postprocess(&mut payload, input);
+
     Ok(payload)
+}
+
+/// The `rule_id` whose findings are collapsed one-per-band by
+/// [`collapse_clone_bands`].
+const CLONE_RULE_ID: &str = "duplicate-code-clone";
+
+/// Collapse duplicate-code-clone findings into ONE finding per clone band
+/// (audit F3).
+///
+/// The `duplicate-code-clone` SQL rule emits one finding per band *member*,
+/// each carrying only `evidence.label` (the band id) and its own location —
+/// never naming the other members. On real repos these are 58–95% of all
+/// findings (6,555 of 7,446 on a C# repo) and, as emitted, are not actionable:
+/// an agent can't act on "member of a clone band" without re-deriving the band.
+///
+/// This groups those findings by band label and emits a single finding whose
+/// `evidence` is `{band, members: [{file, startLine, endLine}, …]}`, sorted for
+/// determinism. Every other finding passes through untouched. Findings without
+/// a band label (shouldn't happen) also pass through, so no clone finding is
+/// ever dropped. The band finding reuses the first member's rule text/severity,
+/// so the F2 legend hoist still applies uniformly.
+fn collapse_clone_bands(
+    findings: Vec<crate::rules::finding::Finding>,
+) -> Vec<crate::rules::finding::Finding> {
+    use crate::rules::finding::{Finding, finding_id};
+    use std::collections::BTreeMap;
+
+    let mut bands: BTreeMap<String, Vec<Finding>> = BTreeMap::new();
+    let mut out: Vec<Finding> = Vec::new();
+    for f in findings {
+        match f
+            .evidence
+            .get("label")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        {
+            Some(label) if f.rule_id == CLONE_RULE_ID => {
+                bands.entry(label).or_default().push(f);
+            }
+            _ => out.push(f),
+        }
+    }
+
+    for (label, mut members) in bands {
+        members.sort_by(|a, b| {
+            a.location
+                .file
+                .cmp(&b.location.file)
+                .then(a.location.span.start_line.cmp(&b.location.span.start_line))
+                .then(a.location.span.end_line.cmp(&b.location.span.end_line))
+        });
+        let member_json: Vec<serde_json::Value> = members
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "file": m.location.file,
+                    "startLine": m.location.span.start_line,
+                    "endLine": m.location.span.end_line,
+                })
+            })
+            .collect();
+        // Anchor the band finding on its first (sorted) member: stable
+        // location + id, keyed by the band label so it's unique per band.
+        let anchor = &members[0];
+        out.push(Finding {
+            id: finding_id(&anchor.rule_id, &label, &anchor.location.span),
+            rule_id: anchor.rule_id.clone(),
+            severity: anchor.severity,
+            message: anchor.message.clone(),
+            location: anchor.location.clone(),
+            evidence: serde_json::json!({ "band": label, "members": member_json }),
+            remediation: anchor.remediation.clone(),
+            certainty: anchor.certainty,
+            agent_instructions: anchor.agent_instructions.clone(),
+            rewrite_status: None,
+            matched_file_state: None,
+        });
+    }
+    out
+}
+
+/// Hoist per-rule static text out of every finding into a one-per-rule
+/// `rules` legend, so the scan payload states each rule's `message` +
+/// `remediation` once instead of re-inlining them on every finding.
+///
+/// Audit F2: on a large C# repo the identical duplicate-code-clone
+/// message+remediation (~180 B) repeated across ~6,555 findings ≈ 1.3 MB of
+/// pure repetition. Lossless:
+///   - `remediation` is static per rule (never interpolated — see
+///     `sql::run_sql_rule`, which renders only `message`), so it is always
+///     dropped from the finding and read from `rules[rule_id].remediation`.
+///   - `message` MAY be interpolated per finding (SQL `{column}` templates,
+///     e.g. `fat-interface` → "declares 16 methods"), so it is dropped only
+///     when it still equals the rule's template; interpolated messages stay
+///     inline on the finding.
+///
+/// The legend carries the template `message` for every rule that fired, so a
+/// reader always has the human text for each `rule_id`.
+fn hoist_rule_legend(payload: &mut serde_json::Value, rules: &[crate::rules::Rule]) {
+    let Some(findings) = payload.get_mut("findings").and_then(|f| f.as_array_mut()) else {
+        return;
+    };
+    if findings.is_empty() {
+        return;
+    }
+    let by_id: std::collections::HashMap<&str, &crate::rules::Rule> =
+        rules.iter().map(|r| (r.id.as_str(), r)).collect();
+    let mut legend = serde_json::Map::new();
+    for finding in findings.iter_mut() {
+        let Some(obj) = finding.as_object_mut() else {
+            continue;
+        };
+        let Some(rule_id) = obj
+            .get("rule_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(rule) = by_id.get(rule_id.as_str()) else {
+            continue;
+        };
+        // remediation: always static -> legend only.
+        obj.remove("remediation");
+        // message: drop when it still equals the rule template (static);
+        // keep when interpolation changed it.
+        if obj.get("message").and_then(|v| v.as_str()) == Some(rule.message.as_str()) {
+            obj.remove("message");
+        }
+        if !legend.contains_key(&rule_id) {
+            let mut entry = serde_json::Map::new();
+            entry.insert("message".into(), serde_json::json!(rule.message));
+            if let Some(rem) = &rule.remediation {
+                entry.insert("remediation".into(), serde_json::json!(rem));
+            }
+            legend.insert(rule_id, serde_json::Value::Object(entry));
+        }
+    }
+    payload["rules"] = serde_json::Value::Object(legend);
 }
 
 /// Count findings per `RewriteStatus` value, emitting kebab-case status
@@ -2040,5 +2197,163 @@ mod git_gate {
         );
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+}
+
+#[cfg(test)]
+mod clone_collapse {
+    use super::*;
+    use crate::model::Span;
+    use crate::rules::Severity;
+    use crate::rules::finding::{Finding, Location};
+
+    fn clone_member(file: &str, start_line: u32, label: &str) -> Finding {
+        Finding {
+            id: format!("{file}-{start_line}"),
+            rule_id: CLONE_RULE_ID.to_string(),
+            severity: Severity::Warning,
+            message: "duplicated code".to_string(),
+            location: Location {
+                file: file.to_string(),
+                span: Span {
+                    start_byte: 0,
+                    end_byte: 0,
+                    start_line,
+                    start_col: 0,
+                    end_line: start_line + 5,
+                    end_col: 0,
+                },
+            },
+            evidence: serde_json::json!({ "label": label }),
+            remediation: Some("extract shared code".to_string()),
+            certainty: None,
+            agent_instructions: None,
+            rewrite_status: None,
+            matched_file_state: None,
+        }
+    }
+
+    fn other(rule_id: &str, file: &str) -> Finding {
+        Finding {
+            rule_id: rule_id.to_string(),
+            evidence: serde_json::json!({}),
+            ..clone_member(file, 1, "n/a")
+        }
+    }
+
+    /// F3: same-band clone members collapse into ONE finding listing all
+    /// members; a second band stays separate; non-clone findings pass through.
+    #[test]
+    fn collapses_bands_and_lists_members() {
+        let findings = vec![
+            clone_member("b.rs", 30, "clone-band-1"),
+            clone_member("a.rs", 10, "clone-band-1"),
+            clone_member("a.rs", 90, "clone-band-2"),
+            clone_member("c.rs", 5, "clone-band-2"),
+            other("file-complexity-hotspot", "big.rs"),
+        ];
+
+        let out = collapse_clone_bands(findings);
+
+        let clones: Vec<_> = out.iter().filter(|f| f.rule_id == CLONE_RULE_ID).collect();
+        assert_eq!(clones.len(), 2, "two bands -> two findings");
+        assert_eq!(
+            out.iter().filter(|f| f.rule_id != CLONE_RULE_ID).count(),
+            1,
+            "non-clone finding passes through"
+        );
+
+        let band1 = clones
+            .iter()
+            .find(|f| f.evidence["band"] == "clone-band-1")
+            .expect("band-1 present");
+        let members = band1.evidence["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2, "band-1 lists both members");
+        // Members sorted by (file, line): a.rs before b.rs.
+        assert_eq!(members[0]["file"], "a.rs");
+        assert_eq!(members[0]["startLine"], 10);
+        assert_eq!(members[1]["file"], "b.rs");
+    }
+}
+
+#[cfg(test)]
+mod rule_legend {
+    use super::*;
+    use crate::rules::{Rule, RuleKind, Severity};
+
+    fn rule(id: &str, message: &str, remediation: Option<&str>) -> Rule {
+        Rule {
+            id: id.to_string(),
+            kind: RuleKind::Sql,
+            severity: Severity::Warning,
+            message: message.to_string(),
+            name: None,
+            description: None,
+            remediation: remediation.map(str::to_string),
+            pattern: None,
+            query: None,
+            thresholds: None,
+            strings: None,
+            constraints: None,
+            fix: None,
+            rewrite: None,
+            languages: None,
+            exclude_test_paths: None,
+            exclude_tooling_paths: None,
+            test: None,
+        }
+    }
+
+    /// F2: static-message + remediation are hoisted to the `rules` legend and
+    /// dropped from findings; an interpolated message (differs from the rule
+    /// template) is kept inline; the legend always carries the template.
+    #[test]
+    fn hoists_static_text_and_keeps_interpolated_message() {
+        let rules = vec![
+            rule("clone", "duplicated code", Some("extract the shared logic")),
+            rule(
+                "fat-interface",
+                "'{class_name}' declares {n} methods",
+                Some("split the type"),
+            ),
+        ];
+        let mut payload = serde_json::json!({
+            "findings": [
+                // static: message equals the template -> dropped
+                {"id": "a", "rule_id": "clone", "severity": "warning",
+                 "message": "duplicated code", "remediation": "extract the shared logic",
+                 "location": {"file": "a.rs"}},
+                // interpolated: message differs from the template -> kept
+                {"id": "b", "rule_id": "fat-interface", "severity": "warning",
+                 "message": "'Foo' declares 16 methods", "remediation": "split the type",
+                 "location": {"file": "b.rs"}},
+            ],
+            "diagnostics": [],
+        });
+
+        hoist_rule_legend(&mut payload, &rules);
+
+        let findings = payload["findings"].as_array().unwrap();
+        // Static finding: message + remediation gone.
+        assert!(
+            findings[0].get("message").is_none(),
+            "static message dropped"
+        );
+        assert!(
+            findings[0].get("remediation").is_none(),
+            "remediation always dropped"
+        );
+        // Interpolated finding: rendered message stays; remediation still gone.
+        assert_eq!(findings[1]["message"], "'Foo' declares 16 methods");
+        assert!(findings[1].get("remediation").is_none());
+
+        // Legend carries the template message + remediation for both rules.
+        let legend = &payload["rules"];
+        assert_eq!(legend["clone"]["message"], "duplicated code");
+        assert_eq!(legend["clone"]["remediation"], "extract the shared logic");
+        assert_eq!(
+            legend["fat-interface"]["message"],
+            "'{class_name}' declares {n} methods"
+        );
     }
 }

@@ -7,6 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`nav_map` now has a token budget (audit F1).** nav_map is injected at
+  session start, so it must be fixed-cost, not proportional to repo size —
+  unbudgeted it reached ~140K tokens on a mainstream C# repo (and ~70K on
+  crewAI), enough to blow a context window on its own. The assembled map is now
+  trimmed to a total token budget spent section-by-section in a fixed priority
+  order (`entrypoints` → `foundational_files` → `subsystems` → `symbols` →
+  `hotspots` → `module_layers` → `flows`), with a hard per-section item cap, an
+  8-member cap per subsystem (surplus reported inline as `membersOmitted`), and
+  edge/cycle caps on `module_layers`. The budget defaults to 8000 tokens and is
+  overridable via a new `maxTokensEstimate` input (mirroring `context_pack`).
+  Every cut is self-describing: a new `guide.truncated` block reports
+  `{shown, total, more}` per trimmed section, where `more` names the follow-up
+  that returns the full data — a dedicated query mode where one exists
+  (`hotspots`, `filter_symbols`), otherwise re-running nav_map with a larger
+  `maxTokensEstimate`. Measured: C# 140K→~9.5K, crewAI 70K→~9.4K tokens. The
+  `--format text` renderer surfaces the same truncation summary.
+- **`scan` no longer re-inlines per-rule static text on every finding (audit
+  F2).** The identical `message`+`remediation` a rule emits were repeated on
+  every one of its findings — on the C# repo the duplicate-code-clone
+  message+remediation (~180 B) repeated across ~6,555 findings ≈ 1.3 MB of pure
+  repetition. They are now hoisted into a one-per-rule `rules` legend
+  (`{rule_id: {message, remediation}}`) stated once; `remediation` (always
+  static) is dropped from every finding, and `message` is dropped from a finding
+  only when it still equals the rule template (interpolated SQL `{column}`
+  messages such as `fat-interface`'s "declares 16 methods" stay inline —
+  lossless). The always-null `certainty` and `agent_instructions` fields are now
+  omitted from findings that don't set them (null on ~100% previously). Measured
+  lossless reduction: varde-code scan 74K→42K tokens (−43%).
+- **`scan` collapses clone bands into one finding each (audit F3).** The
+  `duplicate-code-clone` rule emitted one finding per band *member* — 58–95% of
+  all findings on real repos — each carrying only its own `evidence.label` and
+  location, never naming the other members, so a reader couldn't act on one
+  without re-deriving the band. Each band is now a single finding whose
+  `evidence` is `{band, members: [{file, startLine, endLine}, …]}`. On
+  varde-code this cut findings 590→155 (clone findings 556→120 bands) and, with
+  F2, scan output 74K→23K tokens (−69% total) — and every clone finding is now
+  self-contained and actionable.
+- **`symbols_in_file` / `symbols_in_files` return declarations by default, not
+  reference noise (audit F4).** `reference`-kind symbols (call sites / usages)
+  were 80–95% of a file's symbol rows — on `nav_map.rs`, 307 of 358 entries —
+  drowning the declarations a caller surveying a file actually wants. They are
+  now excluded by default (declarations + bindings remain); pass
+  `includeReferences: true` to restore them. Measured: `symbols_in_file` on
+  `nav_map.rs` 358→78 rows (~78% fewer tokens), with the full 616-row view still
+  available on request.
+- **All tool output is now repo-relative and line-only-span by default (audit
+  F5 + F6).** The MCP schema requires an absolute `repoRoot` and the index
+  stores each file exactly as the walker yielded it, so every emitted path
+  re-stated the absolute prefix (~200× in a single `nav_map`) and every `span`
+  shipped six fields (byte + line + col) where the line pair almost always
+  suffices. A single post-processing pass at the query/scan serialization
+  boundary now (a) strips the `repoRoot` prefix from every path — relative
+  paths round-trip because inputs already resolve a `filePath` by suffix match,
+  and out-of-repo paths like `dbPath` are untouched — and (b) drops the
+  `start_byte`/`end_byte`/`start_col`/`end_col` fields from every span, keeping
+  `start_line`/`end_line`. Opt back into the old shapes per call with
+  `absolutePaths: true` and `includeSpanDetail: true` respectively (the byte
+  offsets an `--apply` rewrite needs are read from the in-memory finding before
+  this runs, so trimming the JSON never affects splicing). Measured on
+  varde-code: `nav_map` 19.5K→14.4K bytes from F5 alone (−26%), on top of the F1
+  budget.
+- **`nav_map` drops dead `flows` and sharpens the `symbols` leaderboard (audit
+  F7 + F8).** `flows` was empty on most repos and, where present, a wrapper
+  around each entrypoint with an empty `children` array — restating the
+  `entrypoints` section at up to ~130 KB for ~0 marginal information (real call
+  trees are sparse because call resolution rarely produces outgoing edges for a
+  detected handler). Single-node flow trees are now omitted, so the section
+  carries only genuine multi-node call trees. Separately, the `symbols` "core
+  interfaces by fan-in" leaderboard ranked by raw call-edge count, which put
+  getters/setters and stdlib methods (`push`, `get`, `as_str`, `setName`,
+  `size`, `ConfigureAwait`, …) on top — high-frequency but zero
+  orientation-value. It now ranks by **caller breadth** (the number of distinct
+  files that call a symbol across a file boundary, reported as `callers`
+  replacing `count`), with raw count kept only as a tie-breaker, and excludes
+  low-orientation names (the `get`/`set`/`is`/`has` accessor pattern plus a
+  curated stdlib/framework stopword set). On varde-code the leaderboard now
+  leads with `parse_source`, `resolve`, `persist`, `language_for_path` rather
+  than container methods.
+- **nav_map orientation sections exclude front-end asset code (audit F9).** An
+  Elixir/Phoenix repo surfaced its bundled `assets/js/phoenix/*.js` client as
+  the top `foundational_files` and `symbols`, hiding every `.ex` controller. A
+  new `is_frontend_asset_path` drops JS/TS/CSS-family files under an `assets/`
+  directory from the three orientation sections (`foundational_files`,
+  `symbols`, `entrypoints`) only — the files stay fully indexed, queryable, and
+  scanned.
+- **`foundational_files` sinks data classes below real modules (audit F9).** A
+  JPA `@Entity`/DTO like `Person` or `BaseEntity` is depended on by many files
+  (high breadth) but teaches nothing about architecture. A file whose methods
+  are *all* trivial (accessors + `equals`/`hashCode`/`toString`/builder
+  boilerplate) is now ranked after real modules of comparable fan-in instead of
+  topping the list.
+- **`build` no longer dumps the full changed-file list by default (audit
+  F11).** The JSON result now carries `changedFilesCount` plus a small
+  `changedFilesSample`; the full `changedFiles` array (every reparsed path in
+  the repo on a full build) is opt-in via a new `--changed-files` flag.
+
+### Fixed
+- **Swift produced zero symbols and empty fan-in (audit F9).** Swift's
+  expression identifier leaf is `simple_identifier`, not `identifier`, so the
+  symbol classifier — gating on `identifier` — emitted no symbols for any
+  `.swift` file (empty `symbols_in_file`/`get_symbol`/`filter_symbols`). And
+  Swift has no cross-file `import` statements (same-module symbols are
+  implicitly visible), so call resolution produced no cross-file edges, leaving
+  nav_map's fan-in `symbols` leaderboard and `foundational_files` empty. Fixed
+  both: Swift is now classified via the generic (field-driven) path, and it
+  joins the repo-wide single-definition call fallback (previously C#/Java/
+  Kotlin/Scala only) so a call to a uniquely-named function/type resolves to
+  its definition anywhere in the module (ambiguous names stay unresolved — no
+  false edge).
+- **Call-based HTTP routes for Slim (PHP) and Phoenix (Elixir) were not
+  detected (audit F10).** Phoenix routes (`get "/users", Ctrl, :index`) were
+  already extracted but `.ex`/`.exs` was missing from the call-based-route
+  gate, so they never surfaced as entrypoints — fixed. Slim routes
+  (`$app->get('/users', $handler)`) are method calls, not the `Route::get`
+  static form Laravel uses, and had no extractor support — added, guarded
+  against PSR-11 container `->get('service')` false positives by requiring a
+  route-object receiver (`$app`/`$router`/`$group`) and a slash-path argument.
+  (Express `app.get`/`router.get` already worked; a routeless CLI like repomix
+  correctly reports zero.)
+
 ### Added
 - **Bash** (shell, Tier B) is now a full extraction/indexing language (the
   twenty-first), not just `find_pattern`-only — this completes **Phase 3**, the

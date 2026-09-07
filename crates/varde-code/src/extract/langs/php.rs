@@ -192,6 +192,26 @@ pub fn visit(
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::MemberAccess, name.clone(), node);
             emit_response_if_helper(node, &name, ctx);
+            // Slim / Slim-style call-based routes: `$app->get('/path', $handler)`
+            // (also `$router->post(...)`, group `$group->get(...)`). A method
+            // call, not the `Route::get` static form Laravel uses (audit F10).
+            if let Some((method, path)) = slim_route_of(node, &name) {
+                ctx.out.push(Entity {
+                    kind: EntityKind::Route,
+                    name: format!("{method} {path}"),
+                    file_id: ctx.file_id,
+                    span: crate::extract::span_of(node),
+                    enclosing_function: ctx.enclosing.map(|s| s.to_owned()),
+                    method: Some(method),
+                    path: Some(path),
+                    status: None,
+                    body_shape: None,
+                    body_minhash: None,
+                    is_async: None,
+                    is_test: false,
+                    owner_type: None,
+                });
+            }
             ctx.push(EntityKind::Call, name, node);
         }
         "scoped_call_expression" => visit_scoped_call(node, ctx),
@@ -423,6 +443,38 @@ fn first_arg_string(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Opti
     string_content(&arg.children().find(|c| c.get_inner_node().is_named())?)
 }
 
+/// Receiver variable names (without the leading `$`) that register Slim-style
+/// call-based routes: `$app`, `$router`, and route-group proxies `$group` /
+/// `$g`. Matched case-insensitively.
+const SLIM_ROUTE_OBJECTS: &[&str] = &["app", "router", "group", "g"];
+
+/// Detect a Slim-style route registration `$app->get('/path', $handler)` on a
+/// `member_call_expression`. Returns `(METHOD, path)`.
+///
+/// Guards against false positives — notably PSR-11 containers, which also
+/// expose `$c->get('service')`: the method must be an HTTP verb, the receiver
+/// must be a known route object, and the first argument must be a string path
+/// starting with `/` (a container key is not a slash-path). Together these make
+/// a non-route `->get(...)` on an allow-listed name vanishingly unlikely.
+fn slim_route_of(
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+    method: &str,
+) -> Option<(String, String)> {
+    if !HTTP_VERBS.contains(&method) {
+        return None;
+    }
+    let receiver = node.field("object")?.text().into_owned();
+    let receiver = receiver.trim_start_matches('$').to_ascii_lowercase();
+    if !SLIM_ROUTE_OBJECTS.contains(&receiver.as_str()) {
+        return None;
+    }
+    let path = first_arg_string(node)?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    Some((method.to_uppercase(), path))
+}
+
 /// Content of the first string literal anywhere below `node` (used for
 /// `require "helper.php"` where the string is a direct child).
 fn first_string_content(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
@@ -568,5 +620,33 @@ mod tests {
             .find(|e| e.kind == EntityKind::Response)
             .expect("response entity");
         assert_eq!(resp.body_shape.as_deref(), Some("view"));
+    }
+
+    #[test]
+    fn slim_call_based_routes_and_container_get_is_not_a_route() {
+        // Slim registers routes as method calls on `$app`/`$router`/`$group`
+        // (audit F10). A PSR-11 container `->get('service')` on any other
+        // receiver, or with a non-slash key, must NOT be mistaken for a route.
+        let es = entities(
+            "<?php\n$app->get('/users', 'UserController:index');\n$group->post('/nested', $h);\n$container->get('logger');\n$svc->get('id');\n",
+        );
+        let routes: Vec<&Entity> = es.iter().filter(|e| e.kind == EntityKind::Route).collect();
+        assert_eq!(
+            routes.len(),
+            2,
+            "only the two slash-path routes: {routes:?}"
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.method.as_deref() == Some("GET") && r.path.as_deref() == Some("/users")),
+            "{routes:?}"
+        );
+        assert!(
+            routes.iter().any(
+                |r| r.method.as_deref() == Some("POST") && r.path.as_deref() == Some("/nested")
+            ),
+            "{routes:?}"
+        );
     }
 }
