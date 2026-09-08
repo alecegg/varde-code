@@ -6,3 +6,4 @@
 - 2026-09-08: attribution-core/callable-boundaries done (`23dfb6c`)
 - 2026-09-08: attribution-core/declaration-attribution done (`c98c253`)
 - 2026-09-08: attribution-core complete; full library suite passed (663 tests)
+- 2026-09-08: dart-callables/body-spanning-functions done (`492f675`)
