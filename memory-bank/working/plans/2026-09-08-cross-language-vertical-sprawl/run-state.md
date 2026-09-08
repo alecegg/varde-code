@@ -7,3 +7,4 @@
 - 2026-09-08: attribution-core/declaration-attribution done (`c98c253`)
 - 2026-09-08: attribution-core complete; full library suite passed (663 tests)
 - 2026-09-08: dart-callables/body-spanning-functions done (`492f675`)
+- 2026-09-08: web-callables/generators-and-closures done (`c7affc3`)

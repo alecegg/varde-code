@@ -1,5 +1,5 @@
 ---
-status: backlog
+status: completed
 title: "Cover web-language callable declarations and closures"
 type: plan
 shape: single
@@ -52,11 +52,11 @@ Model named generator declarations. Cover language scopes required by shared ano
 
 ## Acceptance criteria
 
-- [ ] Given JavaScript or TypeScript generators
+- [x] Given JavaScript or TypeScript generators
       When their bodies cross foreign slices
       Then findings point at the generator
       (assert: cargo test -p varde-code --lib vertical_slice_sprawl → passes)
-- [ ] Given nested web closures
+- [x] Given nested web closures
       When they call foreign slices
       Then outer functions receive no leaked finding
       (assert: cargo test -p varde-code --lib vertical_slice_sprawl → passes)
