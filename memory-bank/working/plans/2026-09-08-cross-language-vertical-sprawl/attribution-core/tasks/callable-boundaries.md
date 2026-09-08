@@ -1,8 +1,8 @@
 ---
 type: task
 parent: 2026-09-08-cross-language-vertical-sprawl/attribution-core
-status: backlog
-verified: pending
+status: done
+verified: passed
 depends_on: []
 modifies:
   - crates/varde-code/src/model.rs
@@ -27,3 +27,4 @@ Add a stable entity representation for anonymous callable spans. Preserve existi
 
 #### Progress
 
+- Added a persisted callable-boundary entity with stable discriminant 19.

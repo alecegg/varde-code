@@ -68,6 +68,9 @@ pub enum EntityKind {
     /// fallback can't. Emitted only for the namespace-import languages that
     /// use it (see `resolve::resolves_imports_by_namespace`).
     TypeRef,
+    /// An anonymous callable span. It partitions a surrounding named
+    /// function without creating a separately reportable declaration.
+    CallableBoundary,
 }
 
 impl EntityKind {
@@ -94,6 +97,7 @@ impl EntityKind {
             EntityKind::Implements => 16,
             EntityKind::Decorator => 17,
             EntityKind::TypeRef => 18,
+            EntityKind::CallableBoundary => 19,
         }
     }
 
@@ -118,6 +122,7 @@ impl EntityKind {
             16 => EntityKind::Implements,
             17 => EntityKind::Decorator,
             18 => EntityKind::TypeRef,
+            19 => EntityKind::CallableBoundary,
             _ => return None,
         })
     }
@@ -145,6 +150,7 @@ impl EntityKind {
             EntityKind::Implements => "implements",
             EntityKind::Decorator => "decorator",
             EntityKind::TypeRef => "type_ref",
+            EntityKind::CallableBoundary => "callable_boundary",
         }
     }
 }
@@ -175,6 +181,7 @@ mod entity_kind_tests {
             EntityKind::Implements,
             EntityKind::Decorator,
             EntityKind::TypeRef,
+            EntityKind::CallableBoundary,
         ];
         for kind in all {
             assert_eq!(EntityKind::from_i64(kind.as_i64()), Some(kind));
@@ -186,6 +193,9 @@ mod entity_kind_tests {
         assert_eq!(EntityKind::from_i64(16), Some(EntityKind::Implements));
         assert_eq!(EntityKind::Decorator.as_i64(), 17);
         assert_eq!(EntityKind::from_i64(17), Some(EntityKind::Decorator));
+        assert_eq!(EntityKind::CallableBoundary.as_i64(), 19);
+        assert_eq!(EntityKind::from_i64(19), Some(EntityKind::CallableBoundary));
+        assert_eq!(EntityKind::CallableBoundary.as_str(), "callable_boundary");
 
         // Existing discriminants unchanged.
         assert_eq!(EntityKind::Function.as_i64(), 0);
