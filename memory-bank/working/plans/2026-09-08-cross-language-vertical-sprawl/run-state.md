@@ -1,0 +1,12 @@
+# Feature run state
+
+- worktree: `/Users/alec/source/varde-code-worktrees/orchestrate-2026-09-08-cross-language-vertical-sprawl`
+- branch: `worktree/orchestrate-2026-09-08-cross-language-vertical-sprawl`
+- 2026-09-08: feature worktree created
+- 2026-09-08: attribution-core/callable-boundaries done (`23dfb6c`)
+- 2026-09-08: attribution-core/declaration-attribution done (`c98c253`)
+- 2026-09-08: attribution-core complete; full library suite passed (663 tests)
+- 2026-09-08: dart-callables/body-spanning-functions done (`492f675`)
+- 2026-09-08: web-callables/generators-and-closures done (`c7affc3`)
+- 2026-09-08: jvm-swift-callables completed (`c23d5be`, `19da72e`, `72936e8`)
+- 2026-09-08: native-functional-closures completed (`9793068`, `22e5bae`)

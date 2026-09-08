@@ -1,5 +1,5 @@
 ---
-status: backlog
+status: completed
 title: "Establish declaration-safe vertical-sprawl attribution"
 type: plan
 shape: single
@@ -54,15 +54,15 @@ Use callable entity spans as function identity. Exclude nested callable spans fr
 
 ## Acceptance criteria
 
-- [ ] Given same-named C# declarations
+- [x] Given same-named C# declarations
       When each crosses different foreign slices
       Then findings remain declaration-specific
       (assert: cargo test -p varde-code --lib vertical_slice_sprawl → passes)
-- [ ] Given an anonymous nested callable
+- [x] Given an anonymous nested callable
       When it calls foreign slices
       Then its outer declaration receives no leaked finding
       (assert: cargo test -p varde-code --lib vertical_slice_sprawl → passes)
-- [ ] Given C# accessors
+- [x] Given C# accessors
       When extraction runs
       Then their Function spans include accessor bodies
       (assert: cargo test -p varde-code --lib cs → passes)

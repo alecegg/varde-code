@@ -19,11 +19,7 @@ use crate::model::{Entity, EntityKind};
 use ast_grep_core::tree_sitter::StrDoc;
 use ast_grep_language::SupportLang;
 
-pub const FUNCTION_SCOPES: &[&str] = &[
-    "function_declaration",
-    "method_declaration",
-    "function_literal",
-];
+pub const FUNCTION_SCOPES: &[&str] = &["function_declaration", "method_declaration"];
 
 pub const REQUIRED_KINDS: [EntityKind; 14] = [
     EntityKind::Function,
@@ -76,6 +72,7 @@ pub fn visit(
             ));
             maybe_export(node, &name, ctx);
         }
+        "func_literal" => ctx.push_callable_boundary(node),
         // ---- imports ----
         // `import "fmt"` or a grouped `import (...)` block both parse down to
         // one `import_spec` per imported package; the `path` field carries
@@ -503,6 +500,24 @@ mod tests {
             routes(src).is_empty(),
             "unexpected routes: {:?}",
             routes(src)
+        );
+    }
+
+    #[test]
+    fn function_literals_are_callable_boundaries() {
+        let parsed = parse_source(
+            &SupportLang::Go,
+            "package main\nfunc outer() { defer func() { remote() }() }\n",
+        );
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+        assert_eq!(
+            entities
+                .iter()
+                .filter(|e| e.kind == EntityKind::CallableBoundary)
+                .count(),
+            1,
+            "entities: {entities:?}"
         );
     }
 }

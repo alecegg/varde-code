@@ -43,6 +43,7 @@ pub const FUNCTION_SCOPES: &[&str] = &[
     "method_declaration",
     "constructor_declaration",
     "local_function_statement",
+    "accessor_declaration",
 ];
 
 /// Entity kinds the fixtures must produce.
@@ -93,13 +94,24 @@ pub fn visit(
         }
 
         // ---- structural ----
-        "method_declaration" | "constructor_declaration" | "local_function_statement" => {
+        "method_declaration"
+        | "constructor_declaration"
+        | "local_function_statement"
+        | "accessor_declaration" => {
             ctx.push(
                 EntityKind::Function,
-                field_name(node).unwrap_or_default(),
+                function_scope_name(node).unwrap_or_default(),
                 node,
             );
         }
+        "property_declaration" | "indexer_declaration" if is_expression_bodied_property(node) => {
+            ctx.push(
+                EntityKind::Function,
+                function_scope_name(node).unwrap_or_default(),
+                node,
+            );
+        }
+        "lambda_expression" | "anonymous_method_expression" => ctx.push_callable_boundary(node),
         // `record`/`record class`/`record struct` share class semantics: a
         // record can inherit one base record plus interfaces, so it reuses the
         // class heritage heuristic. Previously dropped entirely (audit S3: a
@@ -176,7 +188,14 @@ pub fn visit(
             if let Some(ty) = node.field("type") {
                 push_type_ref_for_var(ctx, &strip_generic_args(&ty.text()), &name, node);
             }
-            ctx.push(EntityKind::Variable, name, node);
+            ctx.push(EntityKind::Variable, name.clone(), node);
+            if is_expression_bodied_property(node) {
+                ctx.push(
+                    EntityKind::Function,
+                    function_scope_name(node).unwrap_or_default(),
+                    node,
+                );
+            }
         }
 
         // ---- variables / parameters ----
@@ -330,6 +349,46 @@ pub fn visit(
 
         _ => {}
     }
+}
+
+/// Stable display and scope name for a C# function declaration.
+///
+/// Accessors only name their operation (`get`, `set`, ...). Prefixing the
+/// declared property, event, or indexer owner prevents unrelated accessors
+/// from sharing the same diagnostic label and enclosing-function tag.
+pub fn function_scope_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    if is_expression_bodied_property(node) {
+        let name = field_name(node).unwrap_or_else(|| "this".to_string());
+        return Some(format!("{name}.get"));
+    }
+    if node.kind() != "accessor_declaration" {
+        return field_name(node);
+    }
+    let operation = field_name(node)?;
+    let owner = node.parent()?.parent()?;
+    let owner_name = field_name(&owner).unwrap_or_else(|| {
+        if owner.kind() == "indexer_declaration" {
+            "this".to_string()
+        } else {
+            String::new()
+        }
+    });
+    (!owner_name.is_empty()).then(|| format!("{owner_name}.{operation}"))
+}
+
+/// Whether `node` is a property whose getter is an arrow-expression body.
+pub fn is_expression_bodied_property(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> bool {
+    matches!(
+        node.kind().as_ref(),
+        "property_declaration" | "indexer_declaration"
+    ) && node
+        .field("value")
+        .is_some_and(|body| body.kind() == "arrow_expression_clause")
+}
+
+/// Whether this node introduces a C# function scope.
+pub fn is_function_scope(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>, kind: &str) -> bool {
+    FUNCTION_SCOPES.contains(&kind) || is_expression_bodied_property(node)
 }
 
 /// Emit a `TypeRef` entity linking a variable/parameter to its declared type:
@@ -650,6 +709,66 @@ mod tests {
                 .any(|e| e.kind == EntityKind::Implements && e.name == "IEquatable"),
             "struct interface as Implements: {entities:?}"
         );
+    }
+
+    #[test]
+    fn property_accessor_is_a_named_function_scope() {
+        let src = "class Catalog { int Count { get { return Load(); } } }";
+        let parsed = parse_source(&SupportLang::CSharp, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        assert!(
+            entities
+                .iter()
+                .any(|e| { e.kind == EntityKind::Function && e.name == "Count.get" }),
+            "accessor function: {entities:?}"
+        );
+        let call = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Call && e.name == "Load")
+            .expect("Load call captured");
+        assert_eq!(call.enclosing_function.as_deref(), Some("Count.get"));
+    }
+
+    #[test]
+    fn expression_bodied_property_is_a_named_function_scope() {
+        let src = "class Catalog { int Count => Load(); }";
+        let parsed = parse_source(&SupportLang::CSharp, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        assert!(
+            entities
+                .iter()
+                .any(|e| { e.kind == EntityKind::Function && e.name == "Count.get" }),
+            "property function: {entities:?}"
+        );
+        let call = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Call && e.name == "Load")
+            .expect("Load call captured");
+        assert_eq!(call.enclosing_function.as_deref(), Some("Count.get"));
+    }
+
+    #[test]
+    fn expression_bodied_indexer_and_anonymous_closures_are_callable_boundaries() {
+        let src = "class Catalog { int this[int index] => Load(index); void Run() { queue(() => Defer()); queue(delegate { Later(); }); } }";
+        let parsed = parse_source(&SupportLang::CSharp, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        assert!(
+            entities
+                .iter()
+                .any(|e| e.kind == EntityKind::Function && e.name == "this.get"),
+            "indexer function: {entities:?}"
+        );
+        let boundaries = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::CallableBoundary)
+            .count();
+        assert_eq!(boundaries, 2, "anonymous closures: {entities:?}");
     }
 
     #[test]

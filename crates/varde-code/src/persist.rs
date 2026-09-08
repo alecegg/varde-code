@@ -2823,6 +2823,49 @@ mod tests {
         }
 
         #[test]
+        fn callable_boundary_persists_for_containment_queries() {
+            let db_path = temp_db("callable-boundary");
+            let mut boundary = entity(0, "");
+            boundary.kind = EntityKind::CallableBoundary;
+            boundary.span = Span {
+                start_byte: 10,
+                end_byte: 42,
+                start_line: 2,
+                start_col: 4,
+                end_line: 4,
+                end_col: 5,
+            };
+            let output = vec![ExtractOutput {
+                entities: vec![boundary],
+                symbols: vec![],
+                diagnostics: vec![],
+                files: vec!["a.rs".to_string()],
+                file_meta: vec![dummy_meta()],
+            }];
+
+            persist(
+                &db_path,
+                &output,
+                &empty_graph(),
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+            )
+            .expect("persist succeeds");
+
+            let conn = rusqlite::Connection::open(&db_path).expect("db opens");
+            let row: (i64, String, i64, i64) = conn
+                .query_row(
+                    "SELECT kind, name, start_byte, end_byte FROM entities",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .expect("boundary reads");
+            assert_eq!(row.0, EntityKind::CallableBoundary.as_i64());
+            assert_eq!(row.1, "");
+            assert_eq!(row.2, 10);
+            assert_eq!(row.3, 42);
+        }
+
+        #[test]
         fn file_id_links_to_matching_files_row() {
             let db_path = temp_db("entities-file");
             let output = output(&["a.rs"]);

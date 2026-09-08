@@ -72,6 +72,7 @@ pub fn visit(
             ctx.push(EntityKind::Function, name.clone(), node);
             maybe_export(node, &name, ctx);
         }
+        "closure_expression" => ctx.push_callable_boundary(node),
         // structs and enums are both type declarations -> Class.
         "struct_item" | "enum_item" => {
             let name = field_name(node).unwrap_or_default();
@@ -391,5 +392,31 @@ fn rust_use_info(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> String 
             .map(|c| c.text().into_owned())
             .unwrap_or_default(),
         _ => arg.text().into_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::extract;
+    use crate::model::EntityKind;
+    use crate::parse::parse_source;
+    use ast_grep_language::SupportLang;
+
+    #[test]
+    fn closures_are_callable_boundaries() {
+        let parsed = parse_source(
+            &SupportLang::Rust,
+            "fn outer() { let callback = || remote(); }",
+        );
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+        assert_eq!(
+            entities
+                .iter()
+                .filter(|e| e.kind == EntityKind::CallableBoundary)
+                .count(),
+            1,
+            "entities: {entities:?}"
+        );
     }
 }

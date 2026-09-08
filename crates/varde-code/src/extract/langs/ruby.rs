@@ -101,6 +101,7 @@ pub fn visit(
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Function, name, node);
         }
+        "block" | "do_block" => ctx.push_callable_boundary(node),
         "class" => {
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Class, name.clone(), node);
@@ -522,5 +523,17 @@ mod tests {
             .find(|e| e.kind == EntityKind::Response)
             .expect("response entity");
         assert_eq!(resp.body_shape.as_deref(), Some("json"));
+    }
+
+    #[test]
+    fn blocks_are_callable_boundaries() {
+        let es = entities("def outer\n  each { remote }\n  each do\n    remote\n  end\nend\n");
+        assert_eq!(
+            es.iter()
+                .filter(|e| e.kind == EntityKind::CallableBoundary)
+                .count(),
+            2,
+            "{es:?}"
+        );
     }
 }

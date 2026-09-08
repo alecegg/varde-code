@@ -21,11 +21,10 @@
 # full write-up (from the same investigation that fixed cross-language
 # Import-entity coverage for circular-import/low-fan-in-high-fan-out-file).
 #
-# Query shape: join each Function entity (`fn`) to its call-site entities
-# via the same `enclosing_function` name-matching `function-complexity-
-# hotspot` already uses (and accepts the same same-name-collision caveat
-# documented there — two same-named functions in one file share a bucket).
-# Each call site's resolved Call edges are joined to their target file's
+# Query shape: join each Function entity (`fn`) to call-site entities whose
+# spans it contains. Declaration spans are stable identities even when C#
+# overloads, constructors, local functions, or accessors share a name. Each
+# call site's resolved Call edges are joined to their target file's
 # community; only targets in a *different* community than the function's
 # own file count (a function calling plenty of same-slice helpers is not
 # sprawl). `COUNT(DISTINCT ...)` on the target community id, not the raw
@@ -46,5 +45,5 @@ name = "Function spans multiple vertical slices"
 description = "A function's resolved calls reach into several different architectural communities — it crosses more slice boundaries than a single well-scoped function should."
 message = "function reaches across multiple unrelated parts of the codebase"
 remediation = "split this function along the slice boundaries it crosses, or move the cross-slice orchestration into a dedicated coordinator so each slice's internals stay encapsulated"
-query = "SELECT f.path AS file, MIN(fn.start_line) AS line, MIN(fn.start_byte) AS start_byte, MAX(fn.end_byte) AS end_byte, MIN(fn.start_col) AS start_col, MAX(fn.end_line) AS end_line, MAX(fn.end_col) AS end_col, fn.name, COUNT(DISTINCT tf.community_id) AS slices FROM entities fn JOIN files f ON f.id = fn.file_id JOIN entities call_ent ON call_ent.file_id = fn.file_id AND call_ent.enclosing_function = fn.name AND call_ent.kind = 6 JOIN resolved_edges e ON e.from_entity_id = call_ent.id AND e.kind = 0 AND e.resolved = 1 JOIN files tf ON tf.id = e.to_file_id AND tf.community_id != f.community_id WHERE fn.kind = 0 GROUP BY f.id, fn.name HAVING COUNT(DISTINCT tf.community_id) >= :min_foreign_slices"
+query = "SELECT f.path AS file, fn.start_line AS line, fn.start_byte, fn.end_byte, fn.start_col, fn.end_line, fn.end_col, fn.name, COUNT(DISTINCT tf.community_id) AS slices FROM entities fn JOIN files f ON f.id = fn.file_id JOIN entities call_ent ON call_ent.file_id = fn.file_id AND call_ent.kind = 6 AND call_ent.start_byte >= fn.start_byte AND call_ent.end_byte <= fn.end_byte AND NOT EXISTS (SELECT 1 FROM entities nested WHERE nested.kind IN (0, 19) AND nested.file_id = fn.file_id AND nested.id != fn.id AND nested.start_byte >= fn.start_byte AND nested.end_byte <= fn.end_byte AND call_ent.start_byte >= nested.start_byte AND call_ent.end_byte <= nested.end_byte) JOIN resolved_edges e ON e.from_entity_id = call_ent.id AND e.kind = 0 AND e.resolved = 1 JOIN files tf ON tf.id = e.to_file_id AND tf.community_id != f.community_id WHERE fn.kind = 0 GROUP BY fn.id HAVING COUNT(DISTINCT tf.community_id) >= :min_foreign_slices"
 thresholds = { min_foreign_slices = 3.0 }

@@ -27,6 +27,14 @@ pub struct ExtractCtx<'a> {
 }
 
 impl<'a> ExtractCtx<'a> {
+    /// Emit an anonymous callable span for containment-based rules.
+    ///
+    /// Boundaries intentionally have no name. They partition their enclosing
+    /// named declaration but must never produce an independent finding.
+    pub fn push_callable_boundary(&mut self, node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) {
+        self.push(EntityKind::CallableBoundary, String::new(), node);
+    }
+
     /// Build and push an entity for the current file/enclosing context.
     ///
     /// Collapses the repeated `ctx.out.push(entity(kind, name, ctx.file,

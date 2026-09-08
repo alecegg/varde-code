@@ -95,4 +95,30 @@ mod tests {
         assert_eq!(decorators[0].name, "Component");
         assert_eq!(decorators[0].enclosing_function.as_deref(), Some("Foo"));
     }
+
+    #[test]
+    fn delegated_visitor_emits_generator_and_closure_entities() {
+        let src = r#"
+            function* entries() { yield load(); }
+            function view() {
+                queue(function* () { yield deferred(); });
+                return <button onClick={() => remote()}>Run</button>;
+            }
+        "#;
+        let parsed = parse_source(&SupportLang::Tsx, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        assert!(
+            entities
+                .iter()
+                .any(|e| e.kind == EntityKind::Function && e.name == "entries"),
+            "{entities:?}"
+        );
+        let boundaries = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::CallableBoundary && e.name.is_empty())
+            .count();
+        assert_eq!(boundaries, 2, "{entities:?}");
+    }
 }

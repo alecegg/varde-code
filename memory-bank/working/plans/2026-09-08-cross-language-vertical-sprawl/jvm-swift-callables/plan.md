@@ -1,5 +1,5 @@
 ---
-status: backlog
+status: completed
 title: "Cover Java, Kotlin, and Swift callable bodies"
 type: plan
 shape: single
@@ -53,15 +53,15 @@ Emit body-spanning Functions for each reportable accessor and compact constructo
 
 ## Acceptance criteria
 
-- [ ] Given Kotlin property accessors
+- [x] Given Kotlin property accessors
       When their bodies cross foreign slices
       Then findings identify the accessor
       (assert: cargo test -p varde-code --lib vertical_slice_sprawl → passes)
-- [ ] Given Swift accessors and subscripts
+- [x] Given Swift accessors and subscripts
       When their bodies cross foreign slices
       Then findings identify the accessor
       (assert: cargo test -p varde-code --lib vertical_slice_sprawl → passes)
-- [ ] Given Java compact record constructors
+- [x] Given Java compact record constructors
       When their bodies cross foreign slices
       Then findings identify the constructor
       (assert: cargo test -p varde-code --lib vertical_slice_sprawl → passes)

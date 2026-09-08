@@ -69,12 +69,16 @@ fn drop_blank_named(result: &mut ExtractResult) {
     result.symbols.retain(|s| !s.name.trim().is_empty());
 }
 
-/// True for the entity kinds whose name may legitimately be empty (control-flow
-/// and error markers named after a caught/thrown value that need not exist).
+/// True for the entity kinds whose name may legitimately be empty.
+///
+/// Callable boundaries deliberately have no queryable declaration name.
 fn kind_allows_blank_name(kind: EntityKind) -> bool {
     matches!(
         kind,
-        EntityKind::ControlFlow | EntityKind::Catch | EntityKind::Throw
+        EntityKind::CallableBoundary
+            | EntityKind::ControlFlow
+            | EntityKind::Catch
+            | EntityKind::Throw
     )
 }
 
@@ -153,9 +157,10 @@ fn walk(
     }
 
     // Named functions/methods push onto the enclosing stack for children.
-    let is_scope = langs::function_scopes(ctx.lang).contains(&kind);
+    let is_scope = langs::is_function_scope(ctx.lang, node, kind);
     if is_scope {
-        ctx.enclosing.push(field_name(node).unwrap_or_default());
+        ctx.enclosing
+            .push(langs::function_scope_name(ctx.lang, node).unwrap_or_default());
     }
     // Named classes/interfaces/impl-blocks push onto the type-scope stack so
     // methods nested inside record their owning type (`Entity::owner_type`).

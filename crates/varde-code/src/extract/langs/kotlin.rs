@@ -43,7 +43,7 @@ pub const TYPE_SCOPES: &[&str] = &[
     "object_declaration",
     "companion_object",
 ];
-pub const FUNCTION_SCOPES: &[&str] = &["function_declaration"];
+pub const FUNCTION_SCOPES: &[&str] = &["function_declaration", "getter", "setter"];
 
 /// Entity kinds the fixtures must produce (all 14 expressible in Kotlin).
 pub const REQUIRED_KINDS: [EntityKind; 14] = [
@@ -88,6 +88,11 @@ pub fn visit(
             ctx.push(EntityKind::Function, name.clone(), node);
             maybe_export(node, &name, ctx);
         }
+        "getter" | "setter" => {
+            let name = function_scope_name(node).unwrap_or_default();
+            ctx.push(EntityKind::Function, name, node);
+        }
+        "lambda_literal" => ctx.push_callable_boundary(node),
         "class_declaration" => {
             let name = first_identifier(node).unwrap_or_default();
             let kind = if is_interface(node) {
@@ -403,6 +408,29 @@ fn member_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<St
         .map(|n| n.text().into_owned())
 }
 
+/// Stable display and scope name for a Kotlin callable node.
+///
+/// Accessor nodes only identify their operation. Prefix their property name
+/// so unrelated getters and setters do not share a diagnostic label.
+pub fn function_scope_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    if matches!(node.kind().as_ref(), "getter" | "setter") {
+        let property = node
+            .prev_all()
+            .find(|sibling| sibling.kind() == "property_declaration")?;
+        let property_name = property
+            .children()
+            .find(|child| child.kind() == "variable_declaration")
+            .and_then(|variable| first_identifier(&variable))?;
+        let operation = if node.kind() == "getter" {
+            "get"
+        } else {
+            "set"
+        };
+        return Some(format!("{property_name}.{operation}"));
+    }
+    first_identifier(node)
+}
+
 /// Kotlin exports are `public` top-level declarations: emit an Export entity
 /// alongside the primary entity.
 fn maybe_export(
@@ -665,5 +693,43 @@ mod tests {
         assert!(find("RestController", "Foo"), "decorators: {decorators:?}");
         assert!(find("RequestMapping", "Foo"), "decorators: {decorators:?}");
         assert!(find("GetMapping", "bar"), "decorators: {decorators:?}");
+    }
+
+    #[test]
+    fn property_accessors_are_named_function_scopes() {
+        let src = "class Settings {\n  var value: Int = 0\n    get() { return loadValue() }\n    set(next) { saveValue(next) }\n}\n";
+        let parsed = parse_source(&SupportLang::Kotlin, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        for (name, call_name) in [("value.get", "loadValue"), ("value.set", "saveValue")] {
+            let function = entities
+                .iter()
+                .find(|e| e.kind == EntityKind::Function && e.name == name)
+                .unwrap_or_else(|| panic!("missing {name}: {entities:?}"));
+            let call = entities
+                .iter()
+                .find(|e| e.kind == EntityKind::Call && e.name == call_name)
+                .unwrap_or_else(|| panic!("missing {call_name}: {entities:?}"));
+            assert!(
+                function.span.start_byte <= call.span.start_byte
+                    && function.span.end_byte >= call.span.end_byte,
+                "{name} must contain {call_name}: {entities:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lambda_literals_are_callable_boundaries() {
+        let src = "fun outer() { queue { deferred() } }";
+        let parsed = parse_source(&SupportLang::Kotlin, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+        assert!(
+            entities
+                .iter()
+                .any(|entity| entity.kind == EntityKind::CallableBoundary),
+            "lambda boundary: {entities:?}"
+        );
     }
 }

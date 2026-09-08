@@ -109,6 +109,7 @@ pub fn visit(
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Function, name, node);
         }
+        "anonymous_function" | "arrow_function" => ctx.push_callable_boundary(node),
         "class_declaration" => {
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Class, name.clone(), node);
@@ -647,6 +648,20 @@ mod tests {
                 |r| r.method.as_deref() == Some("POST") && r.path.as_deref() == Some("/nested")
             ),
             "{routes:?}"
+        );
+    }
+
+    #[test]
+    fn anonymous_functions_are_callable_boundaries() {
+        let es = entities(
+            "<?php\nfunction outer() {\n  $a = function () { remote(); };\n  $b = fn () => remote();\n}\n",
+        );
+        assert_eq!(
+            es.iter()
+                .filter(|e| e.kind == EntityKind::CallableBoundary)
+                .count(),
+            2,
+            "{es:?}"
         );
     }
 }
