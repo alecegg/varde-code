@@ -1,5 +1,5 @@
 ---
-status: backlog
+status: completed
 title: "Contain anonymous closures across remaining languages"
 type: plan
 shape: single
@@ -58,11 +58,11 @@ Mark every supported anonymous callable span as a non-reportable boundary.
 
 ## Acceptance criteria
 
-- [ ] Given the callable-boundary fixture table
+- [x] Given the callable-boundary fixture table
       When every fixture calls foreign slices
       Then outer functions receive no leaked finding
       (assert: cargo test -p varde-code --lib vertical_slice_sprawl → passes)
-- [ ] Given Haskell local value bindings
+- [x] Given Haskell local value bindings
       When they call foreign slices
       Then enclosing Functions receive no leaked finding
       (assert: cargo test -p varde-code --lib vertical_slice_sprawl → passes)

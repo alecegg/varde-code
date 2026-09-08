@@ -9,3 +9,4 @@
 - 2026-09-08: dart-callables/body-spanning-functions done (`492f675`)
 - 2026-09-08: web-callables/generators-and-closures done (`c7affc3`)
 - 2026-09-08: jvm-swift-callables completed (`c23d5be`, `19da72e`, `72936e8`)
+- 2026-09-08: native-functional-closures completed (`9793068`, `22e5bae`)
