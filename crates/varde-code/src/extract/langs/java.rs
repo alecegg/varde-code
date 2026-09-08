@@ -83,6 +83,7 @@ pub fn visit(
                 node,
             );
         }
+        "lambda_expression" => ctx.push_callable_boundary(node),
         "class_declaration" => {
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Class, name.clone(), node);
@@ -531,5 +532,19 @@ mod tests {
             .find(|entity| entity.kind == EntityKind::Call)
             .expect("compact constructor call");
         assert_eq!(call.enclosing_function.as_deref(), Some("Order"));
+    }
+
+    #[test]
+    fn lambda_expressions_are_callable_boundaries() {
+        let src = "class Jobs { void outer() { queue(() -> deferred()); } }";
+        let parsed = parse_source(&SupportLang::Java, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+        assert!(
+            entities
+                .iter()
+                .any(|entity| entity.kind == EntityKind::CallableBoundary),
+            "lambda boundary: {entities:?}"
+        );
     }
 }

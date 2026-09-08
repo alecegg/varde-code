@@ -61,7 +61,9 @@ pub fn visit(
         "function_declaration" | "generator_function_declaration" => {
             push_named(node, EntityKind::Function, ctx)
         }
-        "function_expression" | "arrow_function" => ctx.push_callable_boundary(node),
+        "function_expression" | "generator_function" | "arrow_function" => {
+            ctx.push_callable_boundary(node)
+        }
         // Class methods — previously invisible to extraction; `owner_type`
         // (set from `ctx.type_scope`) links each back to its class. See ts.rs.
         "method_definition" => push_named(node, EntityKind::Function, ctx),
@@ -447,6 +449,7 @@ mod tests {
             function outer() {
                 const callback = () => remote();
                 queue(function () { deferred(); });
+                queue(function* () { yield later(); });
             }
         "#;
         let parsed = parse_source(&SupportLang::JavaScript, src);
@@ -466,7 +469,7 @@ mod tests {
             .iter()
             .filter(|e| e.kind == EntityKind::CallableBoundary)
             .collect();
-        assert_eq!(boundaries.len(), 2, "{entities:?}");
+        assert_eq!(boundaries.len(), 3, "{entities:?}");
         assert!(boundaries.iter().all(|e| e.name.is_empty()));
     }
 }

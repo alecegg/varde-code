@@ -101,6 +101,7 @@ mod tests {
         let src = r#"
             function* entries() { yield load(); }
             function view() {
+                queue(function* () { yield deferred(); });
                 return <button onClick={() => remote()}>Run</button>;
             }
         "#;
@@ -114,11 +115,10 @@ mod tests {
                 .any(|e| e.kind == EntityKind::Function && e.name == "entries"),
             "{entities:?}"
         );
-        assert!(
-            entities
-                .iter()
-                .any(|e| e.kind == EntityKind::CallableBoundary && e.name.is_empty()),
-            "{entities:?}"
-        );
+        let boundaries = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::CallableBoundary && e.name.is_empty())
+            .count();
+        assert_eq!(boundaries, 2, "{entities:?}");
     }
 }

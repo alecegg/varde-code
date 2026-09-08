@@ -119,6 +119,7 @@ pub fn visit(
             let name = callable_name(node).unwrap_or_default();
             ctx.push(EntityKind::Function, name, node);
         }
+        "function_expression" => ctx.push_callable_boundary(node),
         // Abstract and redirecting declarations have no executable body.
         "function_signature"
         | "constructor_signature"
@@ -377,6 +378,16 @@ mod tests {
                 "a {function} Function must contain {call:?}: {es:?}",
             );
         }
+    }
+
+    #[test]
+    fn anonymous_function_expressions_are_callable_boundaries() {
+        let es = entities("void outer() { queue(() { deferred(); }); }");
+        assert!(
+            es.iter()
+                .any(|entity| entity.kind == EntityKind::CallableBoundary),
+            "anonymous function boundary: {es:?}"
+        );
     }
 
     #[test]

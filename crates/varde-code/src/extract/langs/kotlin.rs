@@ -92,6 +92,7 @@ pub fn visit(
             let name = function_scope_name(node).unwrap_or_default();
             ctx.push(EntityKind::Function, name, node);
         }
+        "lambda_literal" => ctx.push_callable_boundary(node),
         "class_declaration" => {
             let name = first_identifier(node).unwrap_or_default();
             let kind = if is_interface(node) {
@@ -716,5 +717,19 @@ mod tests {
                 "{name} must contain {call_name}: {entities:?}"
             );
         }
+    }
+
+    #[test]
+    fn lambda_literals_are_callable_boundaries() {
+        let src = "fun outer() { queue { deferred() } }";
+        let parsed = parse_source(&SupportLang::Kotlin, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+        assert!(
+            entities
+                .iter()
+                .any(|entity| entity.kind == EntityKind::CallableBoundary),
+            "lambda boundary: {entities:?}"
+        );
     }
 }

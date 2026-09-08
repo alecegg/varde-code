@@ -108,6 +108,7 @@ pub fn visit(
             ctx.push(EntityKind::Function, name.clone(), node);
             maybe_export(node, &name, ctx);
         }
+        "lambda_literal" => ctx.push_callable_boundary(node),
         "class_declaration" => {
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Class, name.clone(), node);
@@ -548,5 +549,19 @@ mod tests {
                 "{name} must contain {call_name}: {entities:?}"
             );
         }
+    }
+
+    #[test]
+    fn closure_expressions_are_callable_boundaries() {
+        let src = "func outer() { queue { deferred() } }";
+        let parsed = parse_source(&SupportLang::Swift, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+        assert!(
+            entities
+                .iter()
+                .any(|entity| entity.kind == EntityKind::CallableBoundary),
+            "closure boundary: {entities:?}"
+        );
     }
 }
