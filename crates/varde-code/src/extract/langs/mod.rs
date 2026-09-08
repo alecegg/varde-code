@@ -215,15 +215,15 @@ pub fn is_function_scope(
 
 /// Stable name for the function scope introduced by `node`.
 ///
-/// Most grammars expose a declaration's own `name` field. C# accessors need
-/// their containing member added because their direct name is only `get`,
-/// `set`, `add`, or `remove`.
+/// Most grammars expose a declaration's own `name` field. Accessors need
+/// their containing member added because their direct name is an operation.
 pub fn function_scope_name(
     lang: SupportLang,
     node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
 ) -> Option<String> {
     match lang {
         SupportLang::CSharp => cs::function_scope_name(node),
+        SupportLang::Kotlin => kotlin::function_scope_name(node),
         _ => crate::extract::field_name(node),
     }
 }

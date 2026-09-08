@@ -1,8 +1,8 @@
 ---
 type: task
 parent: 2026-09-08-cross-language-vertical-sprawl/jvm-swift-callables
-status: backlog
-verified: pending
+status: done
+verified: passed
 depends_on: []
 modifies:
   - crates/varde-code/src/extract/langs/kotlin.rs
@@ -25,3 +25,4 @@ Cover getters and setters with stable names and body spans.
 
 #### Progress
 
+- Emitted body-spanning getter and setter Functions with stable property names.
