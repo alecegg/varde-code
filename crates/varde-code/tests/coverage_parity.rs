@@ -419,7 +419,7 @@ fn load_resolve_fixture(
     Vec<String>,
 ) {
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/resolve_fixtures")
+        .join("resolve_fixtures")
         .join(rel);
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
         .expect("resolve fixture dir exists")

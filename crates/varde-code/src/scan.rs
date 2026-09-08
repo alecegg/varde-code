@@ -389,6 +389,27 @@ fn process_file(path: &Path, file_id: u32) -> ProcessedFile {
             };
         }
     };
+    // Minified/generated bundles (a checked-in webpack bundle, a protoc `.pb`
+    // stub, ...) are machine output, not source an agent navigates. Indexing
+    // one lets it dominate the graph — the audit found a single 490 KB
+    // `chat.js` supplying 74% of a repo's entities. Skip extraction: the file
+    // stays tracked (hash recorded, incremental stays correct) but contributes
+    // no entities/symbols, so it can't pollute orientation or the call graph.
+    if crate::query::noise_filter::is_minified_source(source) {
+        tracing::warn!(file = %path.display(), "minified/generated source — skipped");
+        return ProcessedFile {
+            content_hash,
+            result: FileResult::Extracted {
+                entities: Vec::new(),
+                symbols: Vec::new(),
+                diagnostic: Some(Diagnostic {
+                    file_id,
+                    message: "minified/generated source — skipped".to_string(),
+                    severity: "warning".to_string(),
+                }),
+            },
+        };
+    }
     let parsed = parse_source(&lang, source);
     let result = extract::extract(&parsed, file_id);
     // A syntax error is localized: tree-sitter's error recovery still parses

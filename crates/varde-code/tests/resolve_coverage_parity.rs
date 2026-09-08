@@ -2,7 +2,7 @@
 //!
 //! Custom harness (`harness = false`, like `coverage_parity.rs`): one
 //! assertion per resolution/graph capability over the shared fixture project
-//! under `tests/resolve_fixtures/`. Each capability mirrors a unit-test AC in
+//! under `resolve_fixtures/`. Each capability mirrors a unit-test AC in
 //! `src/resolve.rs`. Exits non-zero on any failure.
 
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use varde_code::model::{Entity, EntityKind, Symbol};
 use varde_code::parse::parse_source;
 use varde_code::resolve::{EdgeKind, EdgeTarget, ResolvedGraph};
 
-const FIXTURES: &str = "tests/resolve_fixtures";
+const FIXTURES: &str = "resolve_fixtures";
 
 fn fixture_dir(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

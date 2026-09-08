@@ -119,17 +119,20 @@ fn entity_info(conn: &Connection, entity_id: i64) -> Result<(String, String), Ap
 /// `entity_info` + `callees` query pair `expand` used to issue, which was an
 /// O(nodes) round-trip cost inside a recursive descent (the same shape
 /// `entrypoints::detect` was refactored away from).
+type FunctionKey = (i64, Option<String>, String);
+
 struct CallGraph {
     /// entity_id -> (file path, symbol name)
     entity_info: HashMap<i64, (String, String)>,
-    /// entity_id -> (file_id, name): the join key `resolved_edges`' call
-    /// sites match on via `enclosing_function`/`file_id`
+    /// entity_id -> (file_id, owner type, name): the join key
+    /// `resolved_edges`' call sites match on via
+    /// `owner_type`/`enclosing_function`/`file_id`
     /// ([`crate::resolve::resolve_calls`] stores the enclosing function by
     /// name, not id).
-    entity_key: HashMap<i64, (i64, String)>,
-    /// (file_id, enclosing function name) -> callee entity ids, in
-    /// deterministic (`resolved_edges.id`) order.
-    callees: HashMap<(i64, String), Vec<i64>>,
+    entity_key: HashMap<i64, FunctionKey>,
+    /// (file_id, owner type, enclosing function name) -> callee entity ids,
+    /// in deterministic (`resolved_edges.id`) order.
+    callees: HashMap<FunctionKey, Vec<i64>>,
 }
 
 impl CallGraph {
@@ -138,7 +141,10 @@ impl CallGraph {
         let mut entity_key = HashMap::new();
         {
             let mut stmt = conn
-                .prepare_cached("SELECT e.id, e.file_id, e.name, f.path FROM entities e JOIN files f ON f.id = e.file_id")
+                .prepare_cached(
+                    "SELECT e.id, e.file_id, e.name, e.owner_type, f.path
+                     FROM entities e JOIN files f ON f.id = e.file_id",
+                )
                 .map_err(db_err)?;
             let rows = stmt
                 .query_map([], |r| {
@@ -146,23 +152,25 @@ impl CallGraph {
                         r.get::<_, i64>(0)?,
                         r.get::<_, i64>(1)?,
                         r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
                     ))
                 })
                 .map_err(db_err)?;
             for row in rows {
-                let (id, file_id, name, path) = row.map_err(db_err)?;
+                let (id, file_id, name, owner_type, path) = row.map_err(db_err)?;
                 entity_info.insert(id, (path, name.clone()));
-                entity_key.insert(id, (file_id, name));
+                entity_key.insert(id, (file_id, owner_type, name));
             }
         }
 
         let call_kind = crate::resolve::EdgeKind::Call.as_i64();
-        let mut callees: HashMap<(i64, String), Vec<i64>> = HashMap::new();
+        let mut callees: HashMap<FunctionKey, Vec<i64>> = HashMap::new();
         {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT call_e.file_id, call_e.enclosing_function, re.to_entity_id
+                    "SELECT call_e.file_id, call_e.owner_type,
+                            call_e.enclosing_function, re.to_entity_id
                      FROM resolved_edges re
                      JOIN entities call_e ON call_e.id = re.from_entity_id
                      WHERE re.kind = ?1 AND re.resolved = 1 AND re.to_entity_id IS NOT NULL
@@ -174,14 +182,18 @@ impl CallGraph {
                     Ok((
                         r.get::<_, i64>(0)?,
                         r.get::<_, Option<String>>(1)?,
-                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)?,
                     ))
                 })
                 .map_err(db_err)?;
             for row in rows {
-                let (file_id, enclosing, to_id) = row.map_err(db_err)?;
+                let (file_id, owner_type, enclosing, to_id) = row.map_err(db_err)?;
                 if let Some(name) = enclosing {
-                    callees.entry((file_id, name)).or_default().push(to_id);
+                    callees
+                        .entry((file_id, owner_type, name))
+                        .or_default()
+                        .push(to_id);
                 }
             }
         }
@@ -422,6 +434,8 @@ mod flows_reachable_tree_tests {
             symbol: "handle_request".to_string(),
             role: RoleTag::RouteHandler,
             flow_root: true,
+            method: None,
+            path: None,
         };
 
         let trees =
@@ -482,6 +496,8 @@ mod flows_reachable_tree_tests {
                 symbol: "A".to_string(),
                 role: RoleTag::RouteHandler,
                 flow_root: true,
+                method: None,
+                path: None,
             },
             Entrypoint {
                 entity_id: b_id,
@@ -489,6 +505,8 @@ mod flows_reachable_tree_tests {
                 symbol: "B".to_string(),
                 role: RoleTag::RouteHandler,
                 flow_root: true,
+                method: None,
+                path: None,
             },
         ];
 
@@ -573,6 +591,8 @@ mod flows_reachable_tree_tests {
             symbol: "handle_request".to_string(),
             role: RoleTag::RouteHandler,
             flow_root: true,
+            method: None,
+            path: None,
         };
 
         let trees =
@@ -631,6 +651,8 @@ mod flows_reachable_tree_tests {
             symbol: "f0".to_string(),
             role: RoleTag::RouteHandler,
             flow_root: true,
+            method: None,
+            path: None,
         };
 
         let trees =

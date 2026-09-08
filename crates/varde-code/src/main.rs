@@ -705,9 +705,12 @@ fn run_nav_map(json: &str, format: &str) {
     }
 }
 
-/// Render the `nav_map` JSON envelope as plain text: one header + item
-/// count per section. On error (or unparseable input), fall back to the raw
-/// envelope so no information is lost.
+/// Render the `nav_map` JSON envelope as plain text, one section per header.
+/// Each section's items are rendered as concise, human-readable lines (symbol
+/// names, file paths, call trees) — not a bare item count — because this text
+/// is injected verbatim into a session at start and a count alone orients
+/// nobody. On error (or unparseable input), fall back to the raw envelope so no
+/// information is lost.
 fn render_nav_map_text(envelope: &str) -> String {
     const SECTIONS: [&str; 7] = [
         "entrypoints",
@@ -729,12 +732,30 @@ fn render_nav_map_text(envelope: &str) -> String {
         .get("data")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let truncated = data
+        .pointer("/guide/truncated")
+        .and_then(|value| value.as_object());
     let mut out = String::new();
     for section in SECTIONS {
         out.push_str(&format!("## {section}\n"));
         match data.get(section) {
+            Some(serde_json::Value::Array(items)) if items.is_empty() => {
+                if let Some(info) = truncated.and_then(|sections| sections.get(section)) {
+                    let total = info.get("total").and_then(|value| value.as_u64()).unwrap_or(0);
+                    let more = info.get("more").and_then(|value| value.as_str()).unwrap_or("");
+                    out.push_str(&format!("(truncated: 0/{total} shown; {more})\n\n"));
+                } else {
+                    out.push_str("(none)\n\n");
+                }
+            }
             Some(serde_json::Value::Array(items)) => {
-                out.push_str(&format!("{} item(s)\n\n", items.len()));
+                for item in items {
+                    out.push_str(&render_nav_map_item(section, item));
+                }
+                out.push('\n');
+            }
+            Some(serde_json::Value::Object(_)) if section == "module_layers" => {
+                out.push_str(&render_module_layers(&data[section]));
             }
             Some(other) => {
                 out.push_str(&format!("{other}\n\n"));
@@ -744,7 +765,7 @@ fn render_nav_map_text(envelope: &str) -> String {
     }
     // Truncation guide (F1): tell the reader what the token budget cut and how
     // to get the rest.
-    if let Some(truncated) = data.pointer("/guide/truncated").and_then(|t| t.as_object())
+    if let Some(truncated) = truncated
         && !truncated.is_empty()
     {
         out.push_str("## truncated (token budget)\n");
@@ -756,6 +777,205 @@ fn render_nav_map_text(envelope: &str) -> String {
         }
         out.push('\n');
     }
+    out
+}
+
+/// String field lookup helper for the nav_map item renderers.
+fn str_field<'a>(item: &'a serde_json::Value, key: &str) -> &'a str {
+    item.get(key).and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// Integer field lookup helper for the nav_map item renderers.
+fn u64_field(item: &serde_json::Value, key: &str) -> u64 {
+    item.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+/// Render one item of an array-valued nav_map section as a concise line.
+/// Each section has a known shape (see `query/nav_map.rs`); unknown shapes
+/// fall back to compact JSON so nothing is silently dropped.
+fn render_nav_map_item(section: &str, item: &serde_json::Value) -> String {
+    match section {
+        "entrypoints" => {
+            let role = str_field(item, "role");
+            let role = if role.is_empty() {
+                String::new()
+            } else {
+                format!("  [{role}]")
+            };
+            // Route verb+path (annotation/decorator handlers carry these while
+            // keeping the handler name as `symbol`); shown as `(GET /path)`
+            // unless the symbol already *is* the route string (call-based
+            // routes), to avoid `- GET /x  (GET /x)` duplication.
+            let symbol = str_field(item, "symbol");
+            let method = str_field(item, "method");
+            let path = str_field(item, "path");
+            let route = match (method.is_empty(), path.is_empty()) {
+                (false, false) => format!("{method} {path}"),
+                (true, false) => path.to_string(),
+                _ => String::new(),
+            };
+            let route = if route.is_empty() || route == symbol {
+                String::new()
+            } else {
+                format!("  ({route})")
+            };
+            format!(
+                "- {}{}  {}{}\n",
+                symbol,
+                route,
+                str_field(item, "file"),
+                role
+            )
+        }
+        "foundational_files" => format!(
+            "- {}  ({} dependents, {} refs)\n",
+            str_field(item, "file"),
+            u64_field(item, "dependents"),
+            u64_field(item, "count"),
+        ),
+        "subsystems" => {
+            let name = str_field(item, "name");
+            let members: Vec<&str> = item
+                .get("members")
+                .and_then(|m| m.as_array())
+                .map(|a| a.iter().filter_map(|m| m.as_str()).collect())
+                .unwrap_or_default();
+            let omitted = u64_field(item, "membersOmitted");
+            let more = if omitted > 0 {
+                format!(" (+{omitted} more)")
+            } else {
+                String::new()
+            };
+            format!("- {name}: {}{more}\n", members.join(", "))
+        }
+        "symbols" => {
+            let owner = str_field(item, "owner");
+            let qualified = if owner.is_empty() {
+                str_field(item, "symbol").to_string()
+            } else {
+                format!("{owner}::{}", str_field(item, "symbol"))
+            };
+            format!(
+                "- {}  {}  ({} callers)\n",
+                qualified,
+                str_field(item, "file"),
+                u64_field(item, "callers"),
+            )
+        }
+        "hotspots" => format!(
+            "- {}  (score {}, complexity {}, churn {})\n",
+            str_field(item, "file"),
+            u64_field(item, "score"),
+            u64_field(item, "complexity"),
+            u64_field(item, "churn"),
+        ),
+        "flows" => {
+            // nav_map already ranks flows biggest-first and embeds a bounded
+            // summary per flow (`nodeCount` = full size, `root` = capped tree,
+            // `more` = the explore query for the whole tree). The renderer just
+            // pretty-prints that summary; it does no bounding of its own beyond
+            // a recursion-depth safety guard.
+            let node_count = u64_field(item, "nodeCount");
+            let mut out = format!(
+                "- {}  ({} nodes)\n",
+                str_field(item, "entrypoint"),
+                node_count
+            );
+            if let Some(root) = item.get("root") {
+                render_flow_node(root, 1, &mut out);
+            }
+            let more = str_field(item, "more");
+            if !more.is_empty() {
+                out.push_str(&format!("  → full tree: {more}\n"));
+            }
+            out
+        }
+        _ => format!("- {item}\n"),
+    }
+}
+
+/// Hard recursion-depth guard for the flow renderer. The JSON it renders is
+/// already depth-bounded by nav_map's `summarize_flow`, so this only protects
+/// against a pathological hand-built envelope — not a normal cap.
+const FLOW_RENDER_MAX_DEPTH: usize = 12;
+
+/// Render one node of a (pre-bounded) flow call-tree as an indented line,
+/// recursing into `children`. A `recurses` node (cycle back-edge, marked by
+/// nav_map) is shown as a leaf. A `childrenOmitted` count (nav_map dropped the
+/// subtree at its size/depth cap) is shown as a trailing marker so the reader
+/// knows the call tree continues.
+fn render_flow_node(node: &serde_json::Value, depth: usize, out: &mut String) {
+    if depth > FLOW_RENDER_MAX_DEPTH {
+        return;
+    }
+    let indent = "  ".repeat(depth);
+    let symbol = str_field(node, "symbol");
+    let file = str_field(node, "file");
+    let recurses = node
+        .get("recurses")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || node.get("backref_to").is_some();
+    if recurses {
+        // nav_map collapses N repeated sibling backrefs to the same target into
+        // one node carrying `recursesCount`; surface the multiplier.
+        let count = node
+            .get("recursesCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+        let marker = if count > 1 {
+            format!("(↑ recurses, ×{count})")
+        } else {
+            "(↑ recurses)".to_string()
+        };
+        out.push_str(&format!("{indent}{symbol}  {file}  {marker}\n"));
+        return;
+    }
+    out.push_str(&format!("{indent}{symbol}  {file}\n"));
+    if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
+        for child in children {
+            render_flow_node(child, depth + 1, out);
+        }
+    }
+    if let Some(omitted) = node
+        .get("childrenOmitted")
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n > 0)
+    {
+        out.push_str(&format!(
+            "{}… {omitted} more call(s) below\n",
+            "  ".repeat(depth + 1)
+        ));
+    }
+}
+
+/// Render the `module_layers` object: dependency cycles and a summary of the
+/// resolved cross-module import edges.
+fn render_module_layers(layers: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let cycles = layers.get("cycles").and_then(|c| c.as_array());
+    if let Some(cycles) = cycles.filter(|c| !c.is_empty()) {
+        out.push_str("cycles:\n");
+        for cycle in cycles {
+            let members: Vec<&str> = cycle
+                .as_array()
+                .map(|a| a.iter().filter_map(|m| m.as_str()).collect())
+                .unwrap_or_default();
+            out.push_str(&format!("- {}\n", members.join(" → ")));
+        }
+    }
+    if let Some(edges) = layers.get("edges").and_then(|e| e.as_array()) {
+        out.push_str(&format!("edges ({}):\n", edges.len()));
+        for edge in edges {
+            out.push_str(&format!(
+                "- {} → {}  ({} files)\n",
+                str_field(edge, "from_module"),
+                str_field(edge, "to_module"),
+                u64_field(edge, "crossing_files"),
+            ));
+        }
+    }
+    out.push('\n');
     out
 }
 
@@ -884,6 +1104,109 @@ mod nav_map_text_tests {
                 "text rendering missing section {section:?}: {text}"
             );
         }
+    }
+
+    /// Naturally empty sections remain `(none)`, while an empty section named
+    /// in `guide.truncated` tells the reader what the budget withheld.
+    #[test]
+    fn text_rendering_distinguishes_empty_from_budget_truncated_sections() {
+        let envelope = serde_json::json!({
+            "ok": true,
+            "data": {
+                "entrypoints": [],
+                "foundational_files": [],
+                "module_layers": {"edges": [], "cycles": []},
+                "subsystems": [],
+                "symbols": [],
+                "flows": [],
+                "hotspots": [],
+                "guide": {
+                    "truncated": {
+                        "symbols": {
+                            "shown": 0,
+                            "total": 12,
+                            "more": "code_query mode=filter_symbols for the full symbol list",
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let text = render_nav_map_text(&envelope);
+
+        assert!(text.contains("## entrypoints\n(none)"), "{text}");
+        assert!(
+            text.contains(
+                "## symbols\n(truncated: 0/12 shown; code_query mode=filter_symbols for the full symbol list)"
+            ),
+            "{text}"
+        );
+    }
+
+    /// Regression: array sections must render their actual item content
+    /// (symbol names, files, call trees) — not a bare `N item(s)` count,
+    /// which is what shipped and made the injected symbols/flows sections
+    /// useless. Nested flow trees render indented, bounded, and back-edges
+    /// are marked rather than followed.
+    #[test]
+    fn text_rendering_emits_item_content_not_just_counts() {
+        let envelope = serde_json::json!({
+            "ok": true,
+            "data": {
+                "entrypoints": [{"symbol": "main", "file": "src/main.rs", "role": "process_main"}],
+                "foundational_files": [{"file": "src/model.rs", "dependents": 57, "count": 198}],
+                "module_layers": {"edges": [{"from_module": "a", "to_module": "b", "crossing_files": 3}], "cycles": [["a", "b"]]},
+                "subsystems": [{"id": 1, "name": "core", "members": ["src/a.rs", "src/b.rs"]}],
+                "symbols": [{"symbol": "parse_source", "file": "src/parse.rs", "callers": 39, "owner": null}],
+                "flows": [{"entrypoint": "main", "file": "src/main.rs", "nodeCount": 42,
+                    "more": "code_query mode=explore {\"input\":\"main\",\"direction\":\"outgoing\"} for the full call tree",
+                    "root": {"symbol": "main", "file": "src/main.rs",
+                    "children": [{"symbol": "helper", "file": "src/util.rs", "children": []}], "childrenOmitted": 7}}],
+                "hotspots": [{"file": "src/resolve.rs", "score": 632, "complexity": 158, "churn": 4}],
+            }
+        })
+        .to_string();
+
+        let text = render_nav_map_text(&envelope);
+
+        // No section renders as a bare item count anymore.
+        assert!(
+            !text.contains("item(s)"),
+            "sections must render content, not counts: {text}"
+        );
+        // Representative content from each section is present.
+        assert!(text.contains("main  src/main.rs  [process_main]"), "{text}");
+        assert!(
+            text.contains("src/model.rs  (57 dependents, 198 refs)"),
+            "{text}"
+        );
+        assert!(text.contains("core: src/a.rs, src/b.rs"), "{text}");
+        assert!(
+            text.contains("parse_source  src/parse.rs  (39 callers)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("resolve.rs  (score 632, complexity 158, churn 4)"),
+            "{text}"
+        );
+        // Flow renders its size, the indented tree, an omitted-children
+        // marker, and the explore follow-up handle for the full tree.
+        assert!(text.contains("main  (42 nodes)"), "flow size: {text}");
+        assert!(
+            text.contains("    helper  src/util.rs"),
+            "flow child indented: {text}"
+        );
+        assert!(
+            text.contains("… 7 more call(s) below"),
+            "omitted marker: {text}"
+        );
+        assert!(
+            text.contains("→ full tree: code_query mode=explore"),
+            "flow follow-up handle: {text}"
+        );
+        // module_layers renders cycles + edges, not raw JSON.
+        assert!(text.contains("a → b"), "module_layers rendered: {text}");
     }
 
     /// An error envelope falls back to the raw envelope rather than

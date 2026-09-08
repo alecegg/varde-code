@@ -281,6 +281,69 @@ CREATE INDEX idx_entities_name ON entities(name);
 CREATE INDEX idx_symbols_name ON symbols(name);
 "#;
 
+/// Pure-Rust mirror of the `files.is_test_path` generated column (see the
+/// schema in [`schema_ddl`]). The SQL column is the authoritative definition
+/// and every *query-time* consumer reads it directly; this function exists for
+/// the one *pre-DB* consumer — call resolution ([`crate::resolve`]) runs on the
+/// in-memory entity/file lists before anything is persisted, so it cannot join
+/// against the column and needs the same predicate as a plain path test.
+///
+/// Kept bug-for-bug aligned with the SQL clauses (one `contains`/`ends_with`/
+/// `starts_with`/`==` per `LIKE`), verified against the shared corpus by
+/// [`tests::path_is_test_matches_sql_generated_column`]. The only intentional
+/// divergence: SQLite `LIKE` is ASCII-case-insensitive, this is case-sensitive
+/// — every real path convention here is canonically cased, and case-sensitive
+/// matching is if anything less prone to false positives (`MyTEST.java`).
+pub(crate) fn path_is_test(path: &str) -> bool {
+    // Directory-segment conventions (test/tests/spec/fixtures under any depth,
+    // or at the repo root).
+    path.contains("/test/")
+        || path.contains("/tests/")
+        || path.contains("/__tests__/")
+        || path.contains("/spec/")
+        || path.contains("/specs/")
+        || path.contains("/fixture/")
+        || path.contains("/fixtures/")
+        || path.contains(".test.")
+        || path.contains(".spec.")
+        || path.starts_with("test/")
+        || path.starts_with("tests/")
+        // Go: `foo_test.go` beside the code it tests.
+        || path.ends_with("_test.go")
+        // Python: `test_foo.py` / `foo_test.py` at any depth.
+        || (path.ends_with(".py") && (path.contains("/test_") || path.starts_with("test_")))
+        || path.ends_with("_test.py")
+        // Java/Kotlin: `FooTest(s).java` / `.kt` in flat layouts.
+        || path.ends_with("Test.java")
+        || path.ends_with("Tests.java")
+        || path.ends_with("Test.kt")
+        || path.ends_with("Tests.kt")
+        // C#/.NET: `FooTests.cs` plus the `<Project>.Tests/` project layout.
+        || path.ends_with("Test.cs")
+        || path.ends_with("Tests.cs")
+        || path.contains(".Test/")
+        || path.contains(".Tests/")
+        || path.contains(".UnitTests/")
+        || path.contains(".IntegrationTests/")
+        || path.contains(".FunctionalTests/")
+        || path.contains(".AcceptanceTests/")
+        // C++ GoogleTest: `foo_test.cc/.cpp/.cxx` beside the code.
+        || path.ends_with("_test.cc")
+        || path.ends_with("_test.cpp")
+        || path.ends_with("_test.cxx")
+        // Solidity Foundry `.t.sol`; Bash Bats `.bats`.
+        || path.ends_with(".t.sol")
+        || path.ends_with(".bats")
+        // Ruby RSpec/Minitest flat files.
+        || path.ends_with("_spec.rb")
+        || path.ends_with("_test.rb")
+        // Rust file-based unit-test submodule (`mod test(s);` -> sibling file).
+        || path.ends_with("/test.rs")
+        || path.ends_with("/tests.rs")
+        || path == "test.rs"
+        || path == "tests.rs"
+}
+
 /// Open the database at `path` without touching the schema.
 ///
 /// Pragmas trade durability for write throughput: `synchronous=OFF` skips
@@ -604,6 +667,101 @@ mod schema_scaffold {
                 )
                 .expect("read is_test_path");
             assert_eq!(got, *expected, "is_test_path for {path}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pure-Rust [`path_is_test`] used by pre-DB call resolution must agree
+    /// with the authoritative `files.is_test_path` generated column on every
+    /// path the SQL-side tests cover — otherwise the resolver's test-def
+    /// exclusion would drift out of sync with every scan rule's exclusion.
+    #[test]
+    fn path_is_test_matches_sql_generated_column() {
+        let dir = std::env::temp_dir().join(format!(
+            "varde-schema-{}-testpath-parity",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir creates");
+        let db_path = dir.join("tp_parity.db");
+        let _ = std::fs::remove_file(&db_path);
+        let conn = open_or_rebuild(&db_path).expect("open succeeds");
+
+        // Union of every case the three SQL-side corpora exercise, plus the
+        // segment/prefix conventions those corpora don't spell out.
+        let paths: &[&str] = &[
+            "/repo/Src/Newtonsoft.Json.Tests/BsonReaderTests.cs",
+            "/repo/src/App.UnitTests/Helpers.cs",
+            "/repo/src/Foo.IntegrationTests/Bar.cs",
+            "/repo/src/Widget.Test/WidgetTest.cs",
+            "/repo/Src/Newtonsoft.Json/JsonReader.cs",
+            "/repo/src/Contests/Leaderboard.cs",
+            "/repo/src/GreatestHits.cs",
+            "/repo/src/widget_test.cc",
+            "/repo/src/widget_test.cpp",
+            "/repo/src/widget_test.cxx",
+            "/repo/src/latest.cpp",
+            "/repo/src/widget.cc",
+            "/repo/test/Counter.t.sol",
+            "/repo/src/Counter.t.sol",
+            "/repo/script/Deploy.s.sol",
+            "/repo/src/Counter.sol",
+            "/repo/cli/install.bats",
+            "/repo/cli/install.sh",
+            "/repo/lib/user_spec.rb",
+            "/repo/lib/user_test.rb",
+            "/repo/lib/latest.rb",
+            "/repo/lib/user.rb",
+            "/repo/src/print/colored_print/test.rs",
+            "/repo/src/core/matcher/tests.rs",
+            "/repo/src/latest.rs",
+            "/repo/src/fastest.rs",
+            "/repo/src/contest.rs",
+            "/repo/src/matcher.rs",
+            "/repo/src/test_utils.rs",
+            // Segment/prefix/extension conventions the SQL corpora omit.
+            "/repo/app/test/Foo.java",
+            "/repo/app/tests/Foo.java",
+            "/repo/web/__tests__/foo.ts",
+            "/repo/lib/spec/foo.rb",
+            "/repo/lib/specs/foo.rb",
+            "/repo/e2e/fixture/data.json",
+            "/repo/e2e/fixtures/data.json",
+            "/repo/src/foo.test.ts",
+            "/repo/src/foo.spec.ts",
+            "tests/main.rs",
+            "test/main.rs",
+            "/repo/pkg/svc_test.go",
+            "/repo/pkg/svc.go",
+            "/repo/api/test_client.py",
+            "test_client.py",
+            "/repo/api/client_test.py",
+            "/repo/api/client.py",
+            "/repo/domain/OrderTest.kt",
+            "/repo/domain/OrderTests.kt",
+            "test.rs",
+            "tests.rs",
+        ];
+        let mut insert = conn
+            .prepare("INSERT INTO files (path) VALUES (?1)")
+            .expect("prepare insert");
+        for path in paths {
+            insert
+                .execute(rusqlite::params![path])
+                .unwrap_or_else(|e| panic!("insert {path}: {e}"));
+        }
+        for path in paths {
+            let sql: bool = conn
+                .query_row(
+                    "SELECT is_test_path FROM files WHERE path = ?1",
+                    rusqlite::params![path],
+                    |r| r.get(0),
+                )
+                .expect("read is_test_path");
+            assert_eq!(
+                path_is_test(path),
+                sql,
+                "path_is_test disagrees with SQL is_test_path for {path}"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

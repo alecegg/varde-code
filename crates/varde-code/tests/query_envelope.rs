@@ -55,7 +55,7 @@ fn success_is_ok_true_with_data() {
     std::fs::create_dir_all(&db_dir).expect("temp dir creates");
     let db = db_dir.join("index.db");
     let fixture = format!(
-        "{}/tests/resolve_fixtures/rust/graph/a.rs",
+        "{}/resolve_fixtures/rust/graph/a.rs",
         env!("CARGO_MANIFEST_DIR")
     );
     let source = std::fs::read_to_string(&fixture).expect("fixture reads");

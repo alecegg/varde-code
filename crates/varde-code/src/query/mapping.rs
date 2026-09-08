@@ -17,11 +17,47 @@ use crate::query::graph::Graph;
 use crate::query::noise_filter::{is_generated_or_vendored_path, is_non_source_path};
 use crate::query::simple::{file_id, matches_path};
 
+/// Distinct dependent-file and dependency-file counts for a single file id.
+///
+/// `files.fan_in`/`files.fan_out` count resolved *edges* — every import plus
+/// every cross-file call site — so one file that references a target many
+/// times inflates both. That over-counts "how many files depend on / are
+/// depended on by this one", the same mismatch [`super::foundational_files`]
+/// corrects for its leaderboard. These are the honest distinct-file counts:
+/// how many *other* files have at least one resolved edge into (`fan_in`) or
+/// out of (`fan_out`) the target, deduped by the far-end file id and excluding
+/// self-edges. Reads the same `resolved_edges` set the fan columns are built
+/// from.
+fn distinct_fan_files(conn: &Connection, fid: i64) -> Result<(i64, i64), ApiError> {
+    let dependents: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT from_file_id) FROM resolved_edges
+             WHERE resolved = 1 AND to_file_id = ?1 AND from_file_id != to_file_id",
+            [fid],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    let dependencies: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT to_file_id) FROM resolved_edges
+             WHERE resolved = 1 AND from_file_id = ?1 AND to_file_id IS NOT NULL
+               AND from_file_id != to_file_id",
+            [fid],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    Ok((dependents, dependencies))
+}
+
 /// map_file — persisted node info for a file.
 ///
 /// Inputs: `filePath` (required). Output: `{path, complexity, churn,
-/// fan_in, fan_out, community_id, community_label}`. `not_found` for an
-/// unknown file.
+/// fan_in, fan_out, fan_in_files, fan_out_files, community_id,
+/// community_label}`. `fan_in`/`fan_out` are resolved-edge (reference) totals;
+/// `fan_in_files`/`fan_out_files` are the distinct *file* counts (how many
+/// other files depend on / are depended on by this one) — the intuitive "fan"
+/// answer, matching the distinct-dependent counting in
+/// [`super::foundational_files`]. `not_found` for an unknown file.
 pub fn map_file(input: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
     freshen_for_mode("map_file", input)?;
     let conn = open_db(input)?;
@@ -44,6 +80,7 @@ pub fn map_file(input: &serde_json::Value) -> Result<serde_json::Value, ApiError
             },
         )
         .map_err(db_err)?;
+    let (fan_in_files, fan_out_files) = distinct_fan_files(&conn, fid)?;
     let community_label: Option<String> = if let Some(cid) = row.5 {
         conn.query_row("SELECT label FROM communities WHERE id = ?1", [cid], |r| {
             r.get(0)
@@ -59,6 +96,8 @@ pub fn map_file(input: &serde_json::Value) -> Result<serde_json::Value, ApiError
         "churn": row.2,
         "fan_in": row.3,
         "fan_out": row.4,
+        "fan_in_files": fan_in_files,
+        "fan_out_files": fan_out_files,
         "community_id": row.5,
         "community_label": community_label,
     }))
@@ -482,22 +521,37 @@ pub fn hotspots_on(conn: &Connection, limit: Option<usize>) -> Result<serde_json
 /// `community_members` tables) as partitions rather than point-to-point
 /// traversals — no new analysis, just a read path over existing state.
 ///
-/// Inputs: `minSize?` (drop clusters below N files — a noise filter),
-/// `maxClusters?` (cap output, ranked by cohesion desc then size desc),
-/// `seedPath?` (return only the cluster containing this file, instead of the
-/// whole partition). Output: `{"clusters": [{id, files, label, cohesion},
-/// ...]}`. `label` is always `null` — naming a cluster ("auth", "billing")
-/// is a judgment call left to the caller. `cohesion` is the fraction of
-/// edges touching the cluster that stay inside it (0.0..=1.0, 0.0 for an
-/// edgeless singleton); a low score means the boundary is likely an
-/// artifact rather than a real domain.
+/// Inputs: `minSize?` (drop clusters below N files — **defaults to 2**, since a
+/// lone file is a caller artifact, not a domain; pass `1` to include
+/// singletons), `minCohesion?` (drop clusters whose internal-edge fraction is
+/// below this 0.0..=1.0 floor — the code-graph signal for "is this a real
+/// semantic group or a random caller set"; defaults to `0.0`), `maxClusters?`
+/// (cap output, ranked by cohesion desc then size desc), `seedPath?` (return
+/// only the cluster containing this file, unfiltered). Output: `{"clusters":
+/// [{id, files, label, cohesion}, ...]}`. `label` is always `null` — naming a
+/// cluster ("auth", "billing") is a judgment call left to the caller.
+/// `cohesion` is the fraction of edges touching the cluster that stay inside it
+/// (0.0..=1.0, 0.0 for an edgeless singleton); a low score means the boundary
+/// is likely an artifact rather than a real domain. The `minSize`/`minCohesion`
+/// defaults exist because on real repos most communities are singletons — e.g.
+/// a 2116-file .NET repo yields 858 communities, 583 (68%) of them lone files
+/// that are all cohesion 0.0 — so an unfiltered partition buries the real
+/// multi-file domains under caller-artifact noise.
 pub fn clusters(input: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
     freshen_for_mode("clusters", input)?;
     let conn = open_db(input)?;
+    // A lone file is not a semantic group; default the floor to 2 so callers
+    // get real (multi-file) domains without opting in. `minSize: 1` restores
+    // the full partition.
     let min_size = input
         .get("minSize")
         .and_then(|v| v.as_u64())
-        .map(|n| n as usize);
+        .map(|n| n as usize)
+        .unwrap_or(2);
+    let min_cohesion = input
+        .get("minCohesion")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
     let max_clusters = input
         .get("maxClusters")
         .and_then(|v| v.as_u64())
@@ -587,8 +641,9 @@ pub fn clusters(input: &serde_json::Value) -> Result<serde_json::Value, ApiError
 
     let mut result: Vec<serde_json::Value> = members
         .iter()
-        .filter(|(_, m)| min_size.is_none_or(|min| m.len() >= min))
+        .filter(|(_, m)| m.len() >= min_size)
         .map(|(cid, m)| build_cluster(*cid, m))
+        .filter(|c| c["cohesion"].as_f64().unwrap_or(0.0) >= min_cohesion)
         .collect();
 
     result.sort_by(|a, b| {
@@ -957,6 +1012,152 @@ mod tests {
         );
     }
 
+    /// In-memory DB with the real schema, seeded with a community partition
+    /// and resolved edges, for exercising [`super::clusters_on`]-style filtering
+    /// through the public `clusters` entrypoint (via `dbPath`).
+    fn clusters_db() -> (rusqlite::Connection, std::path::PathBuf) {
+        // clusters() opens by dbPath, so persist to a temp file.
+        let path = std::env::temp_dir().join(format!(
+            "varde-clusters-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = crate::db::open_or_rebuild(&path).expect("schema");
+        (conn, path)
+    }
+
+    fn add_file(conn: &rusqlite::Connection, path: &str) -> i64 {
+        conn.execute("INSERT INTO files (path) VALUES (?1)", [path])
+            .expect("insert file");
+        conn.last_insert_rowid()
+    }
+
+    fn add_member(conn: &rusqlite::Connection, community_id: i64, file_id: i64) {
+        conn.execute(
+            "INSERT INTO community_members (community_id, file_id) VALUES (?1, ?2)",
+            rusqlite::params![community_id, file_id],
+        )
+        .expect("insert member");
+    }
+
+    fn add_edge(conn: &rusqlite::Connection, from: i64, to: i64) {
+        conn.execute(
+            "INSERT INTO resolved_edges (from_file_id, to_file_id, kind, resolved)
+             VALUES (?1, ?2, 0, 1)",
+            rusqlite::params![from, to],
+        )
+        .expect("insert edge");
+    }
+
+    fn cluster_files(out: &serde_json::Value) -> Vec<Vec<String>> {
+        out["clusters"]
+            .as_array()
+            .expect("clusters array")
+            .iter()
+            .map(|c| {
+                c["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|f| f.as_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The dominant real-repo noise (68% of communities on a 2116-file .NET
+    /// repo) is singleton communities — one file, always cohesion 0.0. By
+    /// default `clusters` drops them: a lone file is a caller artifact, not a
+    /// semantic group. `minSize: 1` restores them.
+    #[test]
+    fn clusters_drops_singleton_communities_by_default() {
+        let (conn, path) = clusters_db();
+        // Community 1: a real 2-file group with an internal edge.
+        let a = add_file(&conn, "src/auth/login.rs");
+        let b = add_file(&conn, "src/auth/session.rs");
+        add_member(&conn, 1, a);
+        add_member(&conn, 1, b);
+        add_edge(&conn, a, b);
+        // Community 2: a lone file (singleton) — cohesion 0.0.
+        let c = add_file(&conn, "src/util/orphan.rs");
+        add_member(&conn, 2, c);
+        drop(conn);
+
+        let input = serde_json::json!({ "dbPath": path.to_str().unwrap() });
+        let out = super::clusters(&input).expect("clusters");
+        let files = cluster_files(&out);
+        assert_eq!(
+            files,
+            vec![vec![
+                "src/auth/login.rs".to_string(),
+                "src/auth/session.rs".to_string()
+            ]],
+            "singleton dropped by default: {out}"
+        );
+
+        // Opt back in with minSize: 1.
+        let input_all = serde_json::json!({ "dbPath": path.to_str().unwrap(), "minSize": 1 });
+        let out_all = super::clusters(&input_all).expect("clusters minSize=1");
+        assert_eq!(
+            cluster_files(&out_all).len(),
+            2,
+            "minSize:1 restores the singleton: {out_all}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `minCohesion` prunes loosely-bound "random caller" groups — a multi-file
+    /// community whose edges mostly leave it (low internal fraction) — while
+    /// keeping tightly-knit domains.
+    #[test]
+    fn clusters_min_cohesion_prunes_loose_groups() {
+        let (conn, path) = clusters_db();
+        // Tight community 1: two files, one internal edge, no edges leaving it —
+        // cohesion 1.0. Survives the floor.
+        let a = add_file(&conn, "src/core/a.rs");
+        let b = add_file(&conn, "src/core/b.rs");
+        add_member(&conn, 1, a);
+        add_member(&conn, 1, b);
+        add_edge(&conn, a, b);
+        // Loose community 2: one internal edge (c->d) but three edges out to a
+        // separate sink community 3 — internal 1, external 3, cohesion 0.25.
+        // (Its external edges target community 3, not community 1, so community
+        // 1 stays at cohesion 1.0.)
+        let c = add_file(&conn, "src/misc/c.rs");
+        let d = add_file(&conn, "src/misc/d.rs");
+        add_member(&conn, 2, c);
+        add_member(&conn, 2, d);
+        let e = add_file(&conn, "src/sink/e.rs");
+        let f = add_file(&conn, "src/sink/f.rs");
+        add_member(&conn, 3, e);
+        add_member(&conn, 3, f);
+        add_edge(&conn, e, f); // community 3 internal
+        add_edge(&conn, c, d); // community 2 internal
+        add_edge(&conn, c, e);
+        add_edge(&conn, d, e);
+        add_edge(&conn, d, f);
+        drop(conn);
+
+        let input = serde_json::json!({ "dbPath": path.to_str().unwrap(), "minCohesion": 0.5 });
+        let out = super::clusters(&input).expect("clusters minCohesion");
+        let files = cluster_files(&out);
+        assert_eq!(
+            files,
+            vec![vec![
+                "src/core/a.rs".to_string(),
+                "src/core/b.rs".to_string()
+            ]],
+            "only the tight group clears the cohesion floor: {out}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn hotspots_exclude_test_files() {
         // A complex, churny test file (`src/core.test.ts`) must not surface as
@@ -1030,6 +1231,17 @@ mod build_on_read_tests {
             assert_eq!(
                 first["fan_in"], 2,
                 "x.ts fan_in counts a.ts's import + call: {first}"
+            );
+            // ...but only ONE distinct file (a.ts) depends on x.ts — the "fan"
+            // answer callers actually want, not the raw reference total.
+            assert_eq!(
+                first["fan_in_files"], 1,
+                "x.ts fan_in_files dedups a.ts's two edges to one file: {first}"
+            );
+            // x.ts depends on no other file, so fan_out_files is 0.
+            assert_eq!(
+                first["fan_out_files"], 0,
+                "x.ts has no outgoing file dependencies: {first}"
             );
 
             // Retarget a.ts away from x.ts (add y.ts); no manual rebuild.

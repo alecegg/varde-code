@@ -428,7 +428,7 @@ pub enum HooksCommand {
     #[command(name = "list")]
     List,
     /// Install session-start hooks for the given agents (default: all 4)
-    /// that shell out to `varde-code report nav_map` at session start.
+    /// that shell out to `varde-code nav_map` at session start.
     /// Existing entries are left untouched unless `--force`. Undo with
     /// `hooks remove` (same `--agent`/`--dir`/`--force`).
     /// (see `hooks install` help)
@@ -597,6 +597,29 @@ mod tests {
             Command::NavMap { format, .. } => assert_eq!(format, "text"),
             _ => panic!("expected Command::NavMap"),
         }
+    }
+
+    /// Regression: the command injected into every session-start hook must
+    /// name a subcommand this CLI actually recognizes. It shipped as
+    /// `varde-code report nav_map ...` since 0.1.0 — but there is no `report`
+    /// subcommand, so injection failed with "unrecognized subcommand" and
+    /// never produced output for any agent. Guard the subcommand name by
+    /// parsing it with clap.
+    #[test]
+    fn injected_session_start_command_names_a_valid_subcommand() {
+        let cmd = crate::hooks::CLAUDE_SESSION_START_COMMAND;
+        assert!(
+            !cmd.contains("report"),
+            "injected command must not reference the non-existent `report` subcommand: {cmd}"
+        );
+        let subcommand = cmd
+            .strip_prefix("varde-code ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("injected command starts with `varde-code <subcommand>`");
+        assert_eq!(subcommand, "nav_map", "injected command invokes nav_map");
+        Cli::try_parse_from(["varde-code", subcommand, "--json", "{}"]).unwrap_or_else(|e| {
+            panic!("injected subcommand {subcommand:?} must parse as a valid CLI subcommand: {e}")
+        });
     }
 
     #[test]

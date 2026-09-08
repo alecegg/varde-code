@@ -1,7 +1,7 @@
 // Injected by varde-code (see `varde-code hooks install --agent opencode`).
 //
-// opencode plugin: on session start, shells out to `varde-code report
-// nav_map` and injects the result into the session as context so the
+// opencode plugin: on session start, shells out to `varde-code nav_map`
+// and injects the result into the session as context so the
 // coding agent starts oriented in the repo. Follows opencode's documented
 // plugin function shape: an async function receiving the plugin context
 // (`project`, `client`, `$`, `directory`, `worktree`) and returning an
@@ -18,7 +18,7 @@ export const VardeCodeNavMap = async ({ $, directory }) => {
 
       let navMap;
       try {
-        navMap = await $`varde-code report nav_map --json ${JSON.stringify({
+        navMap = await $`varde-code nav_map --json ${JSON.stringify({
           repoRoot: directory,
         })} --format text`.cwd(directory).text();
       } catch (err) {

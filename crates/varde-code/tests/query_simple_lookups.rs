@@ -13,7 +13,7 @@ use varde_code::persist;
 use varde_code::query;
 use varde_code::resolve;
 
-const FIXTURES: &str = "tests/resolve_fixtures";
+const FIXTURES: &str = "resolve_fixtures";
 
 fn fixture_dir(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

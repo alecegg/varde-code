@@ -236,14 +236,16 @@ pub fn visit(
             // `enclosing_function` is the annotated class/interface/method's
             // own name (nearest declaration ancestor).
             if let Some(owner) = annotation_owner_name(node) {
+                let ann_name = field_name(node).unwrap_or_default();
+                let (method, path) = java_route_meta(node, &ann_name);
                 ctx.out.push(Entity {
                     kind: EntityKind::Decorator,
-                    name: field_name(node).unwrap_or_default(),
+                    name: ann_name,
                     file_id: ctx.file_id,
                     span: crate::extract::span_of(node),
                     enclosing_function: Some(owner),
-                    method: None,
-                    path: None,
+                    method,
+                    path,
                     status: None,
                     body_shape: None,
                     body_minhash: None,
@@ -310,6 +312,27 @@ fn spring_route_of(
     let args = node.field("arguments")?;
     let path = first_string_literal(&args)?;
     Some((method.to_string(), path))
+}
+
+/// Route `(method, path)` carried by a Spring/JAX-RS annotation, for stamping
+/// onto its `Decorator` entity so `entrypoints::detect` can render the handler
+/// as `"<VERB> <path>"`. The verb comes from the annotation name
+/// (`@GetMapping` -> GET); a prefix annotation (`@RequestMapping("/api")`) has
+/// no verb but still contributes its base path. `(None, None)` for a
+/// non-route annotation (`@Override`, ...).
+fn java_route_meta(
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+    name: &str,
+) -> (Option<String>, Option<String>) {
+    let verb = super::http_verb_for_annotation(name);
+    if verb.is_none() && !super::is_route_prefix_annotation(name) {
+        return (None, None);
+    }
+    let path = node
+        .field("arguments")
+        .as_ref()
+        .and_then(first_string_literal);
+    (verb.map(|v| v.to_string()), path)
 }
 
 /// First string-literal argument of an annotation, either directly in the

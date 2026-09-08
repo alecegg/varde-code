@@ -934,11 +934,14 @@ mod test_util {
     use crate::extract;
     use crate::parse::parse_file;
 
-    /// Parse + extract every fixture file under
-    /// `tests/resolve_fixtures/<rel>` (recursive, sorted).
+    /// Parse + extract every fixture file under `resolve_fixtures/<rel>`
+    /// (recursive, sorted). The fixtures live *outside* the crate's `tests/`
+    /// directory on purpose: their absolute paths must not match
+    /// [`crate::db::path_is_test`], or the repo-wide call fallback would treat
+    /// every fixture definition as test code and refuse to resolve through it.
     pub fn load_project(rel: &str) -> (Vec<Entity>, Vec<Symbol>, Vec<String>) {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/resolve_fixtures")
+            .join("resolve_fixtures")
             .join(rel);
         let mut paths = Vec::new();
         collect_paths(&root, &mut paths);
@@ -1294,9 +1297,69 @@ fn resolves_calls_by_repo_wide_fallback(lang: ast_grep_language::SupportLang) ->
 /// they don't collide with their own class's entry: `new Foo()` normalizes to
 /// `Foo`, which must resolve to the `Foo` *class* entity, not be knocked out
 /// as ambiguous by the same-named constructor method (Finding #2).
-fn build_repo_wide_unique_index(entities: &[Entity]) -> HashMap<&str, Option<u32>> {
+/// Object-protocol method names whose real definition lives on a framework
+/// base class outside the repo (`System.Object`, `java.lang.Object`, ...), so
+/// an in-repo override must never win the repo-wide single-definition fallback
+/// (see [`build_repo_wide_unique_index`]). Covers the C# (PascalCase) and
+/// Java/Kotlin/Scala (camelCase) spellings.
+fn is_ubiquitous_object_method(name: &str) -> bool {
+    matches!(
+        name,
+        // C# / .NET (System.Object + IDisposable/IComparable/ICloneable)
+        "ToString"
+            | "Equals"
+            | "GetHashCode"
+            | "GetType"
+            | "Clone"
+            | "CompareTo"
+            | "Dispose"
+            | "DisposeAsync"
+            | "Finalize"
+            | "MemberwiseClone"
+            // Java / Kotlin / Scala (java.lang.Object + Comparable/AutoCloseable)
+            | "toString"
+            | "equals"
+            | "hashCode"
+            | "clone"
+            | "compareTo"
+            | "finalize"
+            | "close"
+            // Swift protocol requirements whose canonical definition is the
+            // compiler-synthesized/stdlib one: `hash(into:)` (Hashable),
+            // `encode(to:)` (Encodable), and the Equatable/Comparable operators.
+            // A single in-repo override otherwise captured every matching call
+            // (e.g. `widget.hash(into:)` resolving to an unrelated `Report.hash`).
+            | "hash"
+            | "encode"
+            | "=="
+            | "!="
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+    )
+}
+
+fn build_repo_wide_unique_index<'a>(
+    entities: &'a [Entity],
+    test_file: &[bool],
+) -> HashMap<&'a str, Option<u32>> {
     let mut index: HashMap<&str, Option<u32>> = HashMap::new();
     for (i, e) in entities.iter().enumerate() {
+        // Definitions living in test/fixture files never participate in the
+        // repo-wide uniqueness index. Without this, a name defined *only* in a
+        // test double (e.g. a test-double `next` or a mock repository method)
+        // is "unique across the repo" and the fallback binds every production
+        // caller of that name to the test definition — one observed case had a
+        // single test `next` capturing 82 production call sites. Excluding test
+        // defs is strictly a precision gain: a name defined once in production
+        // and once in a test flips from ambiguous (unresolved) to the correct
+        // production definition, and a test-only name is left unresolved rather
+        // than injecting a production→test false edge. `test_file` is the
+        // per-file-id `db::path_is_test` mirror (resolution runs pre-persist).
+        if test_file.get(e.file_id as usize).copied().unwrap_or(false) {
+            continue;
+        }
         let callable = matches!(
             e.kind,
             crate::model::EntityKind::Function
@@ -1311,6 +1374,19 @@ fn build_repo_wide_unique_index(entities: &[Entity]) -> HashMap<&str, Option<u32
         if e.kind == crate::model::EntityKind::Function
             && e.owner_type.as_deref() == Some(e.name.as_str())
         {
+            continue;
+        }
+        // Skip object-protocol methods (`ToString`/`Equals`/`GetHashCode`,
+        // `toString`/`equals`/`hashCode`, ...). Their canonical definition lives
+        // on the framework base class (`System.Object`, `java.lang.Object`),
+        // not in the repo, so the "defined exactly once" test the uniqueness
+        // index relies on is systematically wrong for them: a single in-repo
+        // override captures every `.ToString()` call in the codebase. On
+        // eShopOnWeb this resolved every `ToString()` to `ErrorDetails.ToString`,
+        // injecting a false call edge into flows and the call graph. Leave them
+        // unresolved (an override is still reachable via type-directed Pass 4
+        // when the receiver type is known).
+        if is_ubiquitous_object_method(&e.name) {
             continue;
         }
         index
@@ -1437,6 +1513,31 @@ impl<'a> TypeResolveCtx<'a> {
         }
         found
     }
+
+    /// True when the call is `recv.method` and `recv` is a *variable* whose
+    /// declared type is known and is not defined in this repo — positive
+    /// evidence the receiver is a library/framework object (an injected ORM
+    /// repository, an SDK client, ...). Used to veto the repo-wide name-unique
+    /// fallback (Pass 3): a call on a library receiver must not bind to a
+    /// coincidentally same-named in-repo definition (`_repo.FindOne()` ->
+    /// some unrelated `FindOne`). Since an external receiver's real method
+    /// cannot be the in-repo one, vetoing only ever drops a false edge — never
+    /// a correct one.
+    ///
+    /// Deliberately conservative: it fires only when the type is *known and
+    /// external*. A receiver with no recorded type (the common case, e.g. an
+    /// inherited `obj.getId()` whose variable the extractor didn't type) is
+    /// left to the fallback, so those keep resolving. A receiver typed as an
+    /// in-repo class/interface is handled by the type-directed pass instead.
+    fn receiver_is_known_external(&self, from: u32, call_name: &str) -> bool {
+        let Some(recv) = call_receiver_var(call_name) else {
+            return false;
+        };
+        match self.var_type.get(&(from, recv)) {
+            Some(&ty) => !self.type_names.contains(ty),
+            None => false,
+        }
+    }
 }
 
 /// The receiver variable of a member-access call name: the simple identifier
@@ -1481,8 +1582,20 @@ fn resolve_calls(
 
     let (callables, exports) = build_call_and_export_indexes(entities);
     let imports_by = build_import_targets(import_edges);
-    let repo_wide = build_repo_wide_unique_index(entities);
+    // Per-file-id test/fixture flag (the pure-path `db::path_is_test` mirror,
+    // since resolution runs pre-persist). Drives two guards: test-file defs are
+    // kept out of the repo-wide uniqueness index, and a production caller is
+    // never allowed to resolve to a test-file definition (see the post-filter
+    // below).
+    let test_file: Vec<bool> = files.iter().map(|p| crate::db::path_is_test(p)).collect();
+    let repo_wide = build_repo_wide_unique_index(entities, &test_file);
     let type_ctx = TypeResolveCtx::build(entities);
+    // Receiver-aware module-binding resolution (Python `import x` /
+    // `from pkg import x`): per file, the local module-binding names the
+    // extractor stashed on `Import.owner_type`; and a stem→files index so a
+    // call `x.method()` resolves to the sibling module `x` that defines it.
+    let module_bindings = build_module_bindings(entities);
+    let stem_files = build_stem_to_files(files);
 
     // Files whose language needs the repo-wide single-definition fallback
     // because the path-based cross-file import pass can't fire: imports name a
@@ -1533,6 +1646,24 @@ fn resolve_calls(
                 None
             };
 
+            // Pass 2.5: receiver-aware module-binding call. A qualified call
+            // `recv.method()` where `recv` is a module the file imported
+            // (`import recv` / `from pkg import recv`) resolves to the sibling
+            // module `recv` that defines `method` — disambiguating cases the
+            // last-segment cross-file pass drops as ambiguous (`users.create`
+            // vs `items.create`). Only fires when Pass 1/2 found nothing.
+            let recv = if same.is_none() && cross.is_none() {
+                resolve_receiver_module_call(
+                    &e.name,
+                    from,
+                    &module_bindings,
+                    &stem_files,
+                    &exports,
+                )
+            } else {
+                None
+            };
+
             // Pass 3: repo-wide single-definition fallback, only for files
             // whose imports name namespaces rather than files (C#), where
             // Pass 2 cannot fire. Resolves only when the callee name has
@@ -1542,7 +1673,17 @@ fn resolve_calls(
                 .get(from as usize)
                 .copied()
                 .unwrap_or(false);
-            let repo = if same.is_none() && cross.is_none() && namespace_import {
+            let repo = if same.is_none()
+                && cross.is_none()
+                && recv.is_none()
+                && namespace_import
+                // A call on a receiver positively typed as a library object must
+                // not bind to a coincidentally same-named in-repo definition
+                // (`_repo.FindOne()` -> unrelated `FindOne`). Unknown-type
+                // receivers still fall through, so inherited `obj.getId()`
+                // resolves as before.
+                && !type_ctx.receiver_is_known_external(from, &e.name)
+            {
                 repo_wide.get(key).copied().flatten()
             } else {
                 None
@@ -1551,13 +1692,33 @@ fn resolve_calls(
             // Pass 4: type-directed resolution. When the name-uniqueness
             // fallback can't decide (an ambiguous method name), use the
             // receiver's declared type to pick the one matching method.
-            let typed = if same.is_none() && cross.is_none() && repo.is_none() && namespace_import {
+            let typed = if same.is_none()
+                && cross.is_none()
+                && recv.is_none()
+                && repo.is_none()
+                && namespace_import
+            {
                 type_ctx.resolve(from, &e.name)
             } else {
                 None
             };
 
-            let target = same.or(cross).or(repo).or(typed);
+            let target = same.or(cross).or(recv).or(repo).or(typed);
+            // A production caller must never resolve to a definition that lives
+            // in a test/fixture file: production code depending on test code is
+            // almost always a coincidental name/type collision (e.g. the
+            // type-directed pass reaching a test-only subtype override of an
+            // external base — `TimeProvider`'s only in-repo `GetUtcNow` being a
+            // unit-test fake), never a real edge. Caller-aware so a test caller
+            // still resolves to test code; only ever drops a false edge.
+            let caller_is_test = test_file.get(from as usize).copied().unwrap_or(false);
+            let target = target.filter(|&t| {
+                caller_is_test
+                    || !test_file
+                        .get(entities[t as usize].file_id as usize)
+                        .copied()
+                        .unwrap_or(false)
+            });
             if target.is_none() {
                 // debug, not warn — see the import-resolution
                 // unresolved-reference comment above; calls are the
@@ -1617,6 +1778,85 @@ fn cross_file_call_target<'a>(
         }
     }
     first
+}
+
+/// Per-file set of local module-binding names — the receiver a
+/// `recv.method()` call uses — recorded on `Import.owner_type` by the Python
+/// extractor (`import x as y` -> `y`; `from pkg import a, b` -> `a`,`b`).
+/// Other languages leave `owner_type` unset on imports, so this map is empty
+/// for them and the receiver-aware pass never fires.
+fn build_module_bindings(entities: &[Entity]) -> HashMap<u32, std::collections::HashSet<String>> {
+    let mut map: HashMap<u32, std::collections::HashSet<String>> = HashMap::new();
+    for e in entities {
+        if e.kind == crate::model::EntityKind::Import
+            && let Some(bindings) = e.owner_type.as_deref()
+        {
+            let set = map.entry(e.file_id).or_default();
+            for name in bindings.split(',') {
+                let n = name.trim();
+                if !n.is_empty() {
+                    set.insert(n.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// File path stem -> file ids, so a call whose receiver names a module can be
+/// mapped to that module's file(s) (`crud` -> `app/crud.py`). A stem shared by
+/// more than one file yields multiple candidates; the caller resolves only
+/// when exactly one candidate defines the called method.
+fn build_stem_to_files(files: &[String]) -> HashMap<String, Vec<u32>> {
+    let mut map: HashMap<String, Vec<u32>> = HashMap::new();
+    for (i, p) in files.iter().enumerate() {
+        if let Some(stem) = std::path::Path::new(p).file_stem().and_then(|s| s.to_str()) {
+            map.entry(stem.to_string()).or_default().push(i as u32);
+        }
+    }
+    map
+}
+
+/// Resolve a receiver-qualified call `recv.method()` to the module `recv`
+/// binds. `recv` must be a module binding of the calling file (guards against
+/// resolving arbitrary `obj.method()`); the target is the file whose path stem
+/// equals `recv` and that exports `method`. Ambiguity (more than one such
+/// file/definition) stays unresolved, so no false edge is invented.
+fn resolve_receiver_module_call(
+    call_name: &str,
+    from: u32,
+    module_bindings: &HashMap<u32, std::collections::HashSet<String>>,
+    stem_files: &HashMap<String, Vec<u32>>,
+    exports: &ExportIndex<'_>,
+) -> Option<u32> {
+    let trimmed = call_name.trim();
+    let trimmed = trimmed.strip_suffix("()").map(str::trim).unwrap_or(trimmed);
+    let (recv_path, method) = trimmed.rsplit_once('.')?;
+    let recv = recv_path
+        .rsplit(['.', ':'])
+        .next()
+        .unwrap_or(recv_path)
+        .trim();
+    if recv.is_empty() || method.is_empty() {
+        return None;
+    }
+    if !module_bindings.get(&from).is_some_and(|s| s.contains(recv)) {
+        return None;
+    }
+    let method_key = callee_key(method);
+    let mut found: Option<u32> = None;
+    for &fid in stem_files.get(recv)? {
+        if let Some(indices) = exports.normalized.get(&fid).and_then(|m| m.get(method_key)) {
+            for &idx in indices {
+                match found {
+                    Some(seen) if seen != idx => return None,
+                    None => found = Some(idx),
+                    _ => {}
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Resolve `Extends`/`Implements` entities into type-hierarchy edges.
@@ -1796,6 +2036,54 @@ mod call_resolution_cross_file {
         assert_eq!(call_edges[0].to, EdgeTarget::Entity(helper));
     }
 
+    /// Pass 2.5 (receiver-aware module binding, Python): a `crud.authenticate()`
+    /// call where `crud` is bound by `from app import crud` resolves to the
+    /// sibling module `app/crud.py`, and `users.create()`/`items.create()`
+    /// (both an ambiguous bare `create`) each resolve to the module their
+    /// receiver names — a disambiguation the last-segment cross-file pass
+    /// cannot make.
+    #[test]
+    fn python_receiver_qualified_module_calls_resolve() {
+        let (entities, symbols, files) = load_project("python/module_calls");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+
+        let entity_at = |target: &EdgeTarget| -> (&str, u32) {
+            match target {
+                EdgeTarget::Entity(idx) => (entities[*idx as usize].name.as_str(), *idx),
+                _ => panic!("expected entity target"),
+            }
+        };
+        let call_target = |call_name: &str| -> String {
+            let e = entities
+                .iter()
+                .position(|e| e.kind == crate::model::EntityKind::Call && e.name == call_name)
+                .unwrap_or_else(|| panic!("call {call_name} exists")) as u32;
+            let edge = graph
+                .edges
+                .iter()
+                .find(|ed| ed.kind == EdgeKind::Call && ed.from_entity == Some(e))
+                .unwrap_or_else(|| panic!("edge for {call_name} exists"));
+            assert!(edge.resolved, "{call_name} must resolve: {edge:?}");
+            let (name, idx) = entity_at(&edge.to);
+            let file = &files[entities[idx as usize].file_id as usize];
+            format!("{name}@{file}")
+        };
+
+        assert!(
+            call_target("crud.authenticate").ends_with("app/crud.py"),
+            "crud.authenticate -> app/crud.py"
+        );
+        assert!(call_target("crud.get_user").ends_with("app/crud.py"));
+        assert!(
+            call_target("users.create").ends_with("svc/users.py"),
+            "users.create -> svc/users.py"
+        );
+        assert!(
+            call_target("items.create").ends_with("svc/items.py"),
+            "items.create -> svc/items.py (receiver disambiguates the ambiguous `create`)"
+        );
+    }
+
     #[test]
     fn unresolved_after_both_passes() {
         let (entities, symbols, files) = load_project("rust/calls");
@@ -1878,6 +2166,207 @@ mod call_resolution_cross_file {
             "constructor call must resolve to the class: {ctor_call:?}"
         );
         assert_eq!(ctor_call.to, EdgeTarget::Entity(widget_class));
+    }
+
+    /// Object-protocol methods (`ToString`, `Equals`, ...) whose real
+    /// definition lives on `System.Object` must never be captured by the
+    /// repo-wide single-definition fallback: a lone in-repo override
+    /// (`Report.ToString`) previously swallowed every `.ToString()` call in the
+    /// codebase (`item.ToString()` where `item` is a plain `object`), a false
+    /// edge that polluted flows and the call graph.
+    #[test]
+    fn csharp_object_protocol_method_is_not_captured_by_repo_wide_fallback() {
+        let (entities, symbols, files) = load_project("csharp/object_methods");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+
+        let report_tostring = entities
+            .iter()
+            .position(|e| {
+                e.kind == crate::model::EntityKind::Function
+                    && e.name == "ToString"
+                    && e.owner_type.as_deref() == Some("Report")
+            })
+            .expect("Report.ToString defined") as u32;
+
+        // No resolved Call edge may target the in-repo ToString override.
+        let captured = graph.edges.iter().any(|e| {
+            e.kind == EdgeKind::Call && e.resolved && e.to == EdgeTarget::Entity(report_tostring)
+        });
+        assert!(
+            !captured,
+            "object-protocol override must not capture foreign .ToString() calls: {:?}",
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Call && e.to == EdgeTarget::Entity(report_tostring))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A callee defined *only* in a test/fixture file must not be reachable
+    /// through the repo-wide single-definition fallback: it is "unique across
+    /// the repo" but binding a production caller to a test double is a false
+    /// edge (one observed run had a single test `next` capturing 82 production
+    /// call sites). The exclusion is by path (`db::path_is_test`) since
+    /// resolution runs pre-persist. A method that *is* uniquely defined in
+    /// production still resolves — the exclusion must not over-fire.
+    #[test]
+    fn repo_wide_fallback_excludes_test_file_definitions() {
+        let (entities, symbols, files) = load_project("csharp/test_double_exclusion");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+
+        let call_edge = |name: &str| -> &ResolvedEdge {
+            let call_idx = entities
+                .iter()
+                .position(|e| e.kind == crate::model::EntityKind::Call && e.name == name)
+                .unwrap_or_else(|| panic!("call `{name}` present"))
+                as u32;
+            graph
+                .edges
+                .iter()
+                .find(|e| e.kind == EdgeKind::Call && e.from_entity == Some(call_idx))
+                .unwrap_or_else(|| panic!("call edge for `{name}` present"))
+        };
+
+        // Positive control: `Compute` is defined once, in production, so the
+        // repo-wide fallback resolves it (the exclusion must not over-fire).
+        let compute = entities
+            .iter()
+            .position(|e| {
+                e.kind == crate::model::EntityKind::Function
+                    && e.name == "Compute"
+                    && e.owner_type.as_deref() == Some("Helper")
+            })
+            .expect("production Helper.Compute defined") as u32;
+        let compute_call = call_edge("Compute");
+        assert!(
+            compute_call.resolved && compute_call.to == EdgeTarget::Entity(compute),
+            "a uniquely-in-production callee must still resolve: {compute_call:?}"
+        );
+
+        // The regression: `RunOnce` is defined only in the `.Tests/` double, so
+        // the fallback must leave the production call unresolved rather than
+        // binding it to the test fake.
+        let run_once = call_edge("RunOnce");
+        assert!(
+            !run_once.resolved,
+            "a test-only callee must not capture a production caller: {run_once:?}"
+        );
+    }
+
+    /// A call on a receiver whose declared type is a *library* type (not
+    /// defined in the repo) must not bind to a coincidentally same-named
+    /// in-repo method via the repo-wide fallback (`_repo.FindOne()` where
+    /// `_repo : IWidgetRepository` is external). The veto is targeted: the
+    /// *same* method name called through an *in-repo*-typed receiver
+    /// (`_catalog : Catalog`) still resolves via the type-directed pass.
+    #[test]
+    fn repo_wide_fallback_vetoes_library_receiver_calls() {
+        let (entities, symbols, files) = load_project("csharp/library_receiver");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+
+        let catalog_findone = entities
+            .iter()
+            .position(|e| {
+                e.kind == crate::model::EntityKind::Function
+                    && e.name == "FindOne"
+                    && e.owner_type.as_deref() == Some("Catalog")
+            })
+            .expect("Catalog.FindOne defined") as u32;
+
+        let call_edge_via = |recv: &str| -> &ResolvedEdge {
+            let idx = entities
+                .iter()
+                .position(|e| {
+                    e.kind == crate::model::EntityKind::Call
+                        && e.name.contains("FindOne")
+                        && e.name.contains(recv)
+                })
+                .unwrap_or_else(|| panic!("call via `{recv}` present"))
+                as u32;
+            graph
+                .edges
+                .iter()
+                .find(|e| e.kind == EdgeKind::Call && e.from_entity == Some(idx))
+                .unwrap_or_else(|| panic!("call edge via `{recv}` present"))
+        };
+
+        // Library receiver: the fallback is vetoed, so the call does not bind
+        // to the in-repo Catalog.FindOne (it stays unresolved — no false edge).
+        let external = call_edge_via("_repo");
+        assert!(
+            !(external.resolved && external.to == EdgeTarget::Entity(catalog_findone)),
+            "library-receiver call must not bind to the coincidental in-repo method: {external:?}"
+        );
+
+        // In-repo-typed receiver: the type-directed pass resolves it to the
+        // real method — the veto must not suppress this.
+        let internal = call_edge_via("_catalog");
+        assert!(
+            internal.resolved && internal.to == EdgeTarget::Entity(catalog_findone),
+            "in-repo-typed receiver must still resolve to the matching method: {internal:?}"
+        );
+    }
+
+    /// A production caller must not resolve to a definition in a test file,
+    /// even when the *type-directed* pass reaches it: here `_dep : ExternalBase`
+    /// (an external base) has one in-repo subtype, a unit-test fake, so Pass 4
+    /// would bind `_dep.Fetch()` to the test `FakeDep.Fetch`. The production→test
+    /// guard drops that edge. (Observed on semantic-kernel: `TimeProvider`'s only
+    /// in-repo `GetUtcNow` was a test `FixedUtcTimeProvider`.)
+    #[test]
+    fn production_caller_does_not_resolve_to_test_definition() {
+        let (entities, symbols, files) = load_project("csharp/prod_to_test_type_dispatch");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+
+        let fake_fetch = entities
+            .iter()
+            .position(|e| {
+                e.kind == crate::model::EntityKind::Function
+                    && e.name == "Fetch"
+                    && e.owner_type.as_deref() == Some("FakeDep")
+            })
+            .expect("test FakeDep.Fetch defined") as u32;
+
+        // No resolved call edge may target the test-file method.
+        let captured = graph.edges.iter().any(|e| {
+            e.kind == EdgeKind::Call && e.resolved && e.to == EdgeTarget::Entity(fake_fetch)
+        });
+        assert!(
+            !captured,
+            "a production call must not resolve to a test-file definition: {:?}",
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Call && e.to == EdgeTarget::Entity(fake_fetch))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Swift companion to the C# object-protocol test: `hash(into:)` (a
+    /// `Hashable` requirement) defined exactly once in the repo must not be
+    /// captured by the repo-wide fallback for a call on an unrelated type.
+    #[test]
+    fn swift_object_protocol_method_is_not_captured_by_repo_wide_fallback() {
+        let (entities, symbols, files) = load_project("swift/object_methods");
+        let graph = resolve(&entities, &symbols, &files).expect("resolve succeeds");
+
+        let report_hash = entities
+            .iter()
+            .position(|e| {
+                e.kind == crate::model::EntityKind::Function
+                    && e.name == "hash"
+                    && e.owner_type.as_deref() == Some("Report")
+            })
+            .expect("Report.hash defined") as u32;
+
+        let captured = graph.edges.iter().any(|e| {
+            e.kind == EdgeKind::Call && e.resolved && e.to == EdgeTarget::Entity(report_hash)
+        });
+        assert!(
+            !captured,
+            "Swift Hashable.hash override must not capture foreign .hash(into:) calls"
+        );
     }
 
     /// Pass 4 (type-directed): an *ambiguous* method name (`Process` defined on

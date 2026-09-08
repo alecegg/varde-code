@@ -102,7 +102,7 @@ import-resolution quality question. Capture anything that generalizes.
 
 > **Phase 0 status: ✅ complete (Ruby).** Landed as a full extraction/indexing language:
 > `src/extract/langs/ruby.rs` + dispatch/parse-gate wiring, `tests/fixtures/ruby/`,
-> `tests/resolve_fixtures/ruby/imports/`, and a `ruby import resolution` check in the
+> `resolve_fixtures/ruby/imports/`, and a `ruby import resolution` check in the
 > resolve harness. Verified: coverage-parity green for all 13 non-carved kinds, resolve
 > harness green, and an end-to-end `build` + `dependencies` CLI smoke resolves
 > `require_relative` across files. Generalizable learnings for Phases 1–3:

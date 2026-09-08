@@ -308,14 +308,15 @@ pub fn visit(
                 let owner = field_name(&owner_node).unwrap_or_default();
                 for attr in node.children().filter(|c| c.kind() == "attribute") {
                     let name = field_name(&attr).unwrap_or_default();
+                    let (method, path) = cs_route_meta(&attr, &name);
                     ctx.out.push(Entity {
                         kind: EntityKind::Decorator,
                         name,
                         file_id: ctx.file_id,
                         span: crate::extract::span_of(&attr),
                         enclosing_function: Some(owner.clone()),
-                        method: None,
-                        path: None,
+                        method,
+                        path,
                         status: None,
                         body_shape: None,
                         body_minhash: None,
@@ -465,6 +466,51 @@ fn minimal_api_route_of(
         return None;
     }
     Some((method.to_string(), super::unquote(&path, false)))
+}
+
+/// Route `(method, path)` carried by an ASP.NET MVC attribute, for stamping
+/// onto its `Decorator` entity so `entrypoints::detect` can render the action
+/// as `"<VERB> <path>"`. The verb comes from the attribute name
+/// (`[HttpGet]` -> GET); a prefix attribute (`[Route("api/[controller]")]`)
+/// has no verb but contributes its base path. `(None, None)` for a non-route
+/// attribute (`[ApiController]`, `[Serializable]`, ...).
+fn cs_route_meta(
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+    name: &str,
+) -> (Option<String>, Option<String>) {
+    let verb = super::http_verb_for_annotation(name);
+    if verb.is_none() && !super::is_route_prefix_annotation(name) {
+        return (None, None);
+    }
+    (verb.map(|v| v.to_string()), cs_attribute_first_string(node))
+}
+
+/// First string-literal argument of a C# `attribute` node
+/// (`[HttpGet("{id}")]` -> `"{id}"`), searched within its
+/// `attribute_argument_list` so both plain and verbatim string literals are
+/// found regardless of intervening wrapper nodes.
+fn cs_attribute_first_string(
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+) -> Option<String> {
+    let args = node
+        .children()
+        .find(|c| c.kind() == "attribute_argument_list")?;
+    first_string_literal_deep(&args)
+}
+
+/// First string-literal descendant of `node` (depth-first), unquoted.
+fn first_string_literal_deep(
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+) -> Option<String> {
+    for child in node.children() {
+        if child.kind().as_ref().contains("string_literal") {
+            return Some(super::unquote(&child.text(), false));
+        }
+        if let Some(found) = first_string_literal_deep(&child) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// ASP.NET minimal API result: `Results.Ok(...)` / `Results.Json(...)` ->

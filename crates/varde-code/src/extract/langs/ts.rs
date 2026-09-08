@@ -85,10 +85,13 @@ pub fn visit(
             // children of class_declaration, preceding the `class` keyword.
             // `name` is the decorator expression text (callee for a call-style
             // decorator factory, otherwise the bare expression).
-            for decorator in node.children().filter(|c| c.kind() == "decorator") {
-                if let Some(dec_name) = decorator_name(&decorator) {
-                    push_type_ref(ctx, EntityKind::Decorator, dec_name, &name, &decorator);
-                }
+            ts_emit_decorators(node, &name, ctx);
+            // `@Controller('x') export class Foo {}` — when the class is
+            // exported, the grammar hangs the decorator off the wrapping
+            // `export_statement`, not the `class_declaration`. Sweep the parent
+            // too so an exported NestJS controller's decorators aren't dropped.
+            if let Some(parent) = node.parent().filter(|p| p.kind() == "export_statement") {
+                ts_emit_decorators(&parent, &name, ctx);
             }
         }
         "interface_declaration" => push_named(node, EntityKind::Interface, ctx),
@@ -106,12 +109,41 @@ pub fn visit(
         // class-membership queries (SOLID interface-coverage/fat-interface
         // rules) had no method to count. `owner_type` (set from `ctx.type_scope`
         // inside `entity()`/`push_named`) links each method back to its class.
-        "method_definition" => push_named(node, EntityKind::Function, ctx),
+        "method_definition" => {
+            push_named(node, EntityKind::Function, ctx);
+            // Method-level decorators (`@Get(':id')`, `@Post()`) — the NestJS
+            // route verbs. Unlike class decorators these are *siblings* in the
+            // `class_body` immediately preceding the `method_definition`, not
+            // children, so walk the contiguous preceding `decorator` run.
+            // Owner is the method's own name so `entrypoints` role-tags the
+            // action and picks up its verb+path.
+            if let Some(name) = field_name(node) {
+                for decorator in node.prev_all().take_while(|c| c.kind() == "decorator") {
+                    ts_emit_decorator(&decorator, &name, ctx);
+                }
+            }
+        }
         // Interface method member (`method_signature`, e.g. `foo(): void;`
         // inside `interface Foo { ... }`) — same class-membership need as
         // `method_definition`, just for the interface side of a
         // coverage/ISP comparison.
         "method_signature" => push_named(node, EntityKind::Function, ctx),
+        // Class field/property (`email: string;`, `@Column() id: number;`) and
+        // its interface counterpart (`property_signature`). Previously dropped,
+        // so `symbols_in_file` showed no data model for a TS entity/DTO (audit:
+        // TS class fields missing, unlike C#/Python). Emit a Variable — the
+        // same kind C# fields use — so it surfaces as a declared member;
+        // `ctx.push` stamps `owner_type` from the enclosing class scope.
+        "public_field_definition" | "property_signature" => {
+            let name = node
+                .field("name")
+                .or_else(|| node.children().find(|c| c.kind() == "property_identifier"))
+                .map(|n| n.text().into_owned())
+                .unwrap_or_default();
+            if !name.is_empty() {
+                ctx.push(EntityKind::Variable, name, node);
+            }
+        }
 
         // ---- imports ----
         // `import ... from "spec"` -> one Import entity named after the
@@ -307,6 +339,77 @@ fn push_named(
             ..Default::default()
         },
     ));
+}
+
+/// Emit a `Decorator` entity for each `@decorator` child of `node`, owned by
+/// `owner` (the decorated class or method name). Route decorators
+/// (`@Controller('x')`, `@Get(':id')`) additionally carry the HTTP verb+path
+/// so `entrypoints::detect` can surface the NestJS handler as a route.
+fn ts_emit_decorators(
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+    owner: &str,
+    ctx: &mut ExtractCtx,
+) {
+    for decorator in node.children().filter(|c| c.kind() == "decorator") {
+        ts_emit_decorator(&decorator, owner, ctx);
+    }
+}
+
+/// Emit one `Decorator` entity for a `decorator` node, owned by `owner`.
+fn ts_emit_decorator(
+    decorator: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+    owner: &str,
+    ctx: &mut ExtractCtx,
+) {
+    if let Some(dec_name) = decorator_name(decorator) {
+        let (method, path) = ts_route_meta(decorator, &dec_name);
+        ctx.out.push(Entity {
+            kind: EntityKind::Decorator,
+            name: dec_name,
+            file_id: ctx.file_id,
+            span: crate::extract::span_of(decorator),
+            enclosing_function: Some(owner.to_string()),
+            method,
+            path,
+            status: None,
+            body_shape: None,
+            body_minhash: None,
+            is_async: None,
+            is_test: false,
+            owner_type: None,
+        });
+    }
+}
+
+/// Route `(method, path)` carried by a NestJS decorator, for stamping onto its
+/// `Decorator` entity. Verb from the decorator name (`@Get` -> GET); a prefix
+/// decorator (`@Controller('cats')`) contributes only its base path.
+/// `(None, None)` for a non-route decorator (`@Injectable()`, ...).
+fn ts_route_meta(
+    decorator: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+    dec_name: &str,
+) -> (Option<String>, Option<String>) {
+    let verb = super::http_verb_for_annotation(dec_name);
+    if verb.is_none() && !super::is_route_prefix_annotation(dec_name) {
+        return (None, None);
+    }
+    (
+        verb.map(|v| v.to_string()),
+        ts_decorator_first_string(decorator),
+    )
+}
+
+/// First string-literal argument of a call-style decorator
+/// (`@Get(':id')` -> `:id`), or `None` for a bare decorator / non-string arg.
+fn ts_decorator_first_string(
+    decorator: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+) -> Option<String> {
+    let call = decorator
+        .children()
+        .find(|c| c.kind() == "call_expression")?;
+    let arg = first_arg_text(&call)?;
+    (arg.starts_with('"') || arg.starts_with('\'') || arg.starts_with('`'))
+        .then(|| super::unquote(&arg, true))
 }
 
 /// Name of the declaration wrapped by an export statement, if it has one
@@ -505,5 +608,58 @@ mod tests {
         assert_eq!(decorators.len(), 1, "entities: {entities:?}");
         assert_eq!(decorators[0].name, "Component");
         assert_eq!(decorators[0].enclosing_function.as_deref(), Some("Foo"));
+    }
+
+    /// Class fields (`public_field_definition`) and interface properties
+    /// (`property_signature`) must be captured as `Variable` entities owned by
+    /// their type — previously dropped, so a TS entity/DTO's data model was
+    /// invisible to `symbols_in_file` (unlike C#/Python).
+    #[test]
+    fn ts_class_fields_and_interface_properties_captured() {
+        let src = "export class User {\n  @Column()\n  email: string;\n  bio: string = \"\";\n}\ninterface Dto {\n  id: number;\n}\n";
+        let parsed = parse_source(&SupportLang::TypeScript, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        let field = |name: &str, owner: &str| {
+            assert!(
+                entities.iter().any(|e| e.kind == EntityKind::Variable
+                    && e.name == name
+                    && e.owner_type.as_deref() == Some(owner)),
+                "field {name} of {owner} must be a Variable: {entities:?}"
+            );
+        };
+        field("email", "User");
+        field("bio", "User");
+        field("id", "Dto");
+    }
+
+    /// NestJS: a decorator on an *exported* class hangs off the wrapping
+    /// `export_statement` (not the `class_declaration`), and a *method*
+    /// decorator is a preceding sibling in the class body (not a child). Both
+    /// must be captured, and route decorators must carry verb+path.
+    #[test]
+    fn nestjs_exported_class_and_method_decorators_captured() {
+        let src = "@Controller('cats')\nexport class CatsController {\n  @Get(':id')\n  findOne(id: string): string { return id; }\n}\n";
+        let parsed = parse_source(&SupportLang::TypeScript, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        let dec = |name: &str| -> &Entity {
+            entities
+                .iter()
+                .find(|e| e.kind == EntityKind::Decorator && e.name == name)
+                .unwrap_or_else(|| panic!("decorator {name} missing: {entities:?}"))
+        };
+        let controller = dec("Controller");
+        assert_eq!(
+            controller.enclosing_function.as_deref(),
+            Some("CatsController")
+        );
+        assert_eq!(controller.path.as_deref(), Some("cats"));
+        let get = dec("Get");
+        assert_eq!(get.enclosing_function.as_deref(), Some("findOne"));
+        assert_eq!(get.method.as_deref(), Some("GET"));
+        assert_eq!(get.path.as_deref(), Some(":id"));
     }
 }

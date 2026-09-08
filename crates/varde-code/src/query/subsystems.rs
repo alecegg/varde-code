@@ -57,7 +57,7 @@ pub fn name_clusters(
     clusters: &[Community],
     role_tags: &HashMap<String, RoleTag>,
 ) -> Vec<NamedCluster> {
-    clusters
+    let named: Vec<NamedCluster> = clusters
         .iter()
         .filter_map(|cluster| {
             let members: Vec<String> = cluster
@@ -76,7 +76,74 @@ pub fn name_clusters(
                 members,
             })
         })
-        .collect()
+        .collect();
+    disambiguate_names(named)
+}
+
+/// Directory-based naming is not injective: several distinct communities can
+/// share a dominant/modal directory and so end up with the same bare name
+/// (a real .NET repo produced five separate `CatalogItemEndpoints` subsystems,
+/// plus repeated `Models`/`Interfaces`). Identically-named subsystems are
+/// useless for orientation — the agent can't tell them apart — so qualify every
+/// collision with a representative member (`CatalogItemEndpoints/CatalogItemDto`)
+/// and, in the rare case that is still not unique, with the community id
+/// (`name #id`, guaranteed distinct). Non-colliding names are left untouched.
+fn disambiguate_names(mut named: Vec<NamedCluster>) -> Vec<NamedCluster> {
+    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    for c in &named {
+        *name_counts.entry(c.name.as_str()).or_insert(0) += 1;
+    }
+    let colliding: std::collections::HashSet<String> = name_counts
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(name, _)| name.to_string())
+        .collect();
+
+    // First pass: qualify each collision with a representative member stem.
+    for c in named.iter_mut() {
+        if !colliding.contains(&c.name) {
+            continue;
+        }
+        if let Some(stem) = representative_stem(&c.members).filter(|s| *s != c.name) {
+            c.name = format!("{}/{stem}", c.name);
+        }
+    }
+
+    // Second pass: anything still sharing a name (two clusters whose
+    // representative stem matched, or where no stem could be derived) gets the
+    // community id appended — always unique, deterministic.
+    let mut still: HashMap<&str, usize> = HashMap::new();
+    for c in &named {
+        *still.entry(c.name.as_str()).or_insert(0) += 1;
+    }
+    let still_colliding: std::collections::HashSet<String> = still
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(name, _)| name.to_string())
+        .collect();
+    for c in named.iter_mut() {
+        if still_colliding.contains(&c.name) {
+            c.name = format!("{} #{}", c.name, c.id);
+        }
+    }
+    named
+}
+
+/// A short, human-meaningful token that distinguishes one cluster from another
+/// sharing its directory name: the file stem of its lexicographically-first
+/// member (deterministic regardless of the caller's member ordering). C# nested
+/// types embed the outer type in the filename
+/// (`CreateCatalogItemEndpoint.CreateCatalogItemRequest.cs`); taking the first
+/// dot-segment yields the meaningful `CreateCatalogItemEndpoint`.
+fn representative_stem(members: &[String]) -> Option<String> {
+    let lead = members.iter().min()?;
+    let file = lead.rsplit('/').next().unwrap_or(lead);
+    let stem = file.split('.').next().unwrap_or(file);
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem.to_string())
+    }
 }
 
 fn name_for_members(members: &[String], role_tags: &HashMap<String, RoleTag>) -> String {
@@ -284,6 +351,77 @@ mod subsystems_clustering_tests {
         assert_eq!(
             named[0].name, "utils",
             "scattered cluster names after its modal directory: {named:?}"
+        );
+    }
+
+    #[test]
+    fn subsystems_clustering_disambiguates_colliding_directory_names() {
+        // Three distinct communities all dominated by the same directory
+        // (`.../CatalogItemEndpoints/`) must not all render as the bare
+        // `CatalogItemEndpoints` — each collision is qualified so the agent can
+        // tell them apart, and every resulting name is unique.
+        let dir = "src/PublicApi/CatalogItemEndpoints";
+        let clusters = vec![
+            Community {
+                id: 10,
+                members: vec![
+                    format!("{dir}/CreateCatalogItemEndpoint.cs"),
+                    format!("{dir}/CreateCatalogItemEndpoint.Request.cs"),
+                ],
+            },
+            Community {
+                id: 11,
+                members: vec![
+                    format!("{dir}/DeleteCatalogItemEndpoint.cs"),
+                    format!("{dir}/DeleteCatalogItemEndpoint.Request.cs"),
+                ],
+            },
+            Community {
+                id: 12,
+                members: vec![
+                    format!("{dir}/UpdateCatalogItemEndpoint.cs"),
+                    format!("{dir}/UpdateCatalogItemEndpoint.Request.cs"),
+                ],
+            },
+        ];
+        let named = name_clusters(&clusters, &HashMap::new());
+
+        assert_eq!(named.len(), 3);
+        let names: Vec<&str> = named.iter().map(|c| c.name.as_str()).collect();
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "all subsystem names must be unique: {names:?}"
+        );
+        assert!(
+            names.iter().all(|n| n.starts_with("CatalogItemEndpoints/")),
+            "collisions qualify off the shared directory name: {names:?}"
+        );
+    }
+
+    #[test]
+    fn subsystems_clustering_leaves_unique_names_unqualified() {
+        let clusters = vec![
+            Community {
+                id: 0,
+                members: vec!["src/auth/a.rs".to_string(), "src/auth/b.rs".to_string()],
+            },
+            Community {
+                id: 1,
+                members: vec![
+                    "src/billing/a.rs".to_string(),
+                    "src/billing/b.rs".to_string(),
+                ],
+            },
+        ];
+        let named = name_clusters(&clusters, &HashMap::new());
+        let names: std::collections::HashSet<&str> =
+            named.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains("auth"), "unique names stay bare: {names:?}");
+        assert!(
+            names.contains("billing"),
+            "unique names stay bare: {names:?}"
         );
     }
 

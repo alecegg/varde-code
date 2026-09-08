@@ -75,6 +75,15 @@ pub fn visit(
             for name_node in node.field_children("name") {
                 if let Some(spec) = python_dotted_path(&name_node) {
                     ctx.push(EntityKind::Import, spec, node);
+                    // Record the local module-binding name (`import x as y` -> y,
+                    // `import a.b.c` -> c) on `owner_type` so resolve.rs can
+                    // resolve a receiver-qualified call (`y.fn()` / `c.fn()`) to
+                    // the bound module's file.
+                    if let Some(binding) = python_import_binding(&name_node)
+                        && let Some(last) = ctx.out.last_mut()
+                    {
+                        last.owner_type = Some(binding);
+                    }
                     mark_if_type_checking_only(node, ctx);
                 }
             }
@@ -104,7 +113,21 @@ pub fn visit(
                     spec.push_str(&first_name);
                 }
                 if !spec.is_empty() {
+                    // Local binding names introduced by this `from PKG import a, b`
+                    // — the receiver used at call sites (`a.fn()`). Comma-joined
+                    // on `owner_type` (one edge per statement is preserved) so
+                    // resolve.rs can resolve `a.fn()` to the sibling module `a`
+                    // that defines `fn` (e.g. FastAPI `from app import crud`).
+                    let bindings: Vec<String> = node
+                        .field_children("name")
+                        .filter_map(|n| python_import_binding(&n))
+                        .collect();
                     ctx.push(EntityKind::Import, spec, node);
+                    if !bindings.is_empty()
+                        && let Some(last) = ctx.out.last_mut()
+                    {
+                        last.owner_type = Some(bindings.join(","));
+                    }
                     mark_if_type_checking_only(node, ctx);
                 }
             }
@@ -174,14 +197,20 @@ pub fn visit(
                 let owner = field_name(&definition).unwrap_or_default();
                 for decorator in node.children().filter(|c| c.kind() == "decorator") {
                     if let Some(dec_name) = python_decorator_name(&decorator) {
+                        // Stamp method+path onto route decorators (FastAPI
+                        // `@app.get("/x")`, Flask `@bp.route("/x", methods=...)`)
+                        // so `entrypoints::detect` can surface the handler as
+                        // `"<VERB> <path>"`; `enclosing_function` already names
+                        // the decorated function (`owner`).
+                        let (method, path) = python_route_meta(&decorator, &dec_name);
                         ctx.out.push(Entity {
                             kind: EntityKind::Decorator,
                             name: dec_name,
                             file_id: ctx.file_id,
                             span: crate::extract::span_of(&decorator),
                             enclosing_function: Some(owner.clone()),
-                            method: None,
-                            path: None,
+                            method,
+                            path,
                             status: None,
                             body_shape: None,
                             body_minhash: None,
@@ -452,6 +481,36 @@ fn methods_kwarg(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<
     None
 }
 
+/// Route `(method, path)` carried by a single `@decorator` node, for stamping
+/// onto its `Decorator` entity. Recognizes FastAPI/router verb decorators
+/// (`@app.get("/x")`, `@router.post("/x")`) via the shared verb map, and Flask
+/// `@<obj>.route("/x", methods=[...])` (verb from the kwarg, `GET` default).
+/// Returns `(None, None)` for a non-route decorator (`@staticmethod`, ...).
+fn python_route_meta(
+    decorator: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+    dec_name: &str,
+) -> (Option<String>, Option<String>) {
+    let call = decorator.children().find(|c| c.kind() == "call");
+    let path = call.as_ref().and_then(|c| {
+        let p = first_arg_text(c)?;
+        (p.starts_with('"') || p.starts_with('\'')).then(|| super::unquote(&p, false))
+    });
+    let method = match super::http_verb_for_annotation(dec_name) {
+        Some(v) => Some(v.to_string()),
+        // Flask `@<obj>.route` — the verb lives in the `methods=[...]` kwarg.
+        None if dec_name.ends_with(".route") => Some(
+            call.as_ref()
+                .and_then(methods_kwarg)
+                .unwrap_or_else(|| "GET".to_string()),
+        ),
+        None => None,
+    };
+    if method.is_none() {
+        return (None, None);
+    }
+    (method, path)
+}
+
 /// Flask-style response: a call to one of Flask's response-producing
 /// functions -> body_shape is the function name.
 fn response_of(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
@@ -465,6 +524,23 @@ fn response_of(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<St
     } else {
         None
     }
+}
+
+/// The local name a single import clause binds — the receiver used at call
+/// sites: the alias for `x as y` (-> `y`), else the last dotted segment
+/// (`a.b.c` -> `c`, `crud` -> `crud`). Used to populate `Import.owner_type`
+/// for receiver-aware call resolution in resolve.rs.
+fn python_import_binding(
+    name_node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+) -> Option<String> {
+    if name_node.kind() == "aliased_import"
+        && let Some(alias) = name_node.field("alias")
+    {
+        return Some(alias.text().into_owned());
+    }
+    let text = name_node.text();
+    let last = text.rsplit('.').next().unwrap_or(&text).trim();
+    (!last.is_empty()).then(|| last.to_owned())
 }
 
 /// Slash-normalized dotted path from a `dotted_name` (or the `dotted_name`

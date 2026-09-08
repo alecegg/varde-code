@@ -272,14 +272,15 @@ pub fn visit(
             if let (Some(name), Some(owner)) =
                 (annotation_type_name(node), annotation_owner_name(node))
             {
+                let (method, path) = kotlin_route_meta(node, &name);
                 ctx.out.push(Entity {
                     kind: EntityKind::Decorator,
                     name,
                     file_id: ctx.file_id,
                     span: crate::extract::span_of(node),
                     enclosing_function: Some(owner),
-                    method: None,
-                    path: None,
+                    method,
+                    path,
                     status: None,
                     body_shape: None,
                     body_minhash: None,
@@ -292,6 +293,44 @@ pub fn visit(
 
         _ => {}
     }
+}
+
+/// Route `(method, path)` carried by a Kotlin Spring/Micronaut annotation, for
+/// stamping onto its `Decorator` entity so `entrypoints::detect` can render the
+/// handler as `"<VERB> <path>"`. Verb from the annotation name
+/// (`@GetMapping` -> GET); a prefix annotation (`@RequestMapping("/api")`)
+/// contributes only its base path. `(None, None)` for non-route annotations.
+fn kotlin_route_meta(
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+    name: &str,
+) -> (Option<String>, Option<String>) {
+    let verb = super::http_verb_for_annotation(name);
+    if verb.is_none() && !super::is_route_prefix_annotation(name) {
+        return (None, None);
+    }
+    (
+        verb.map(|v| v.to_string()),
+        kotlin_annotation_first_string(node),
+    )
+}
+
+/// First string-literal argument of a Kotlin `annotation` node
+/// (`@GetMapping("/{id}")` -> `/{id}`), searched depth-first so it is found
+/// under the `constructor_invocation`/`value_arguments` wrappers. The Kotlin
+/// grammar wraps the text in `string_literal` with `"` delimiters, stripped
+/// by `unquote`.
+fn kotlin_annotation_first_string(
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+) -> Option<String> {
+    for child in node.children() {
+        if child.kind().as_ref().contains("string_literal") {
+            return Some(super::unquote(&child.text(), false));
+        }
+        if let Some(found) = kotlin_annotation_first_string(&child) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// The annotation's type name: the first `type_identifier` in pre-order under

@@ -1006,8 +1006,9 @@ pub(crate) fn persist_global_graph(
     let tx = conn.unchecked_transaction()?;
 
     let mut edge_stmt = tx.prepare(
-        "INSERT INTO resolved_edges (from_file_id, to_file_id, kind, resolved)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO resolved_edges
+            (from_file_id, to_file_id, kind, resolved, from_entity_id, to_entity_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     for edge in &graph.edges {
         let from = state.file_ids[edge.from as usize];
@@ -1023,11 +1024,26 @@ pub(crate) fn persist_global_graph(
         } else {
             None
         };
+        let from_entity_id = edge
+            .from_entity
+            .and_then(|entity_id| entity_id_at(&state.entity_ids, entity_id as usize));
+        let to_entity_id = if edge.resolved {
+            match edge.to {
+                EdgeTarget::Entity(entity_id) => {
+                    entity_id_at(&state.entity_ids, entity_id as usize)
+                }
+                EdgeTarget::File(_) | EdgeTarget::Unknown => None,
+            }
+        } else {
+            None
+        };
         edge_stmt.execute(rusqlite::params![
             from,
             to,
             edge.kind.as_i64(),
-            edge.resolved as i64
+            edge.resolved as i64,
+            from_entity_id,
+            to_entity_id
         ])?;
     }
     drop(edge_stmt);
@@ -3600,13 +3616,13 @@ mod tests {
 
         #[test]
         fn churn_written_to_matching_files_row() {
-            // A real fixture file inside this git repo: it has a known
-            // non-zero history, and the value must land on ITS files row.
+            // A real, long-lived, git-tracked file in this crate: it has a
+            // known non-zero commit history and the value must land on ITS
+            // files row. Deliberately NOT a resolve fixture — those get moved
+            // around, and an uncommitted rename shows zero history at the new
+            // path, which would flake this test.
             let db_path = temp_db("churn");
-            let file = format!(
-                "{}/tests/resolve_fixtures/rust/graph/a.rs",
-                env!("CARGO_MANIFEST_DIR")
-            );
+            let file = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
             let mut e = entity(0, "fn_a");
             e.kind = EntityKind::Function;
             let output = vec![ExtractOutput {

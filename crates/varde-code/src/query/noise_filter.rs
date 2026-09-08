@@ -77,10 +77,20 @@ const EXCLUDED_DIR_COMPONENTS: &[&str] = &[
 /// in many apps) is not excluded. Phoenix serves compiled JS/CSS from
 /// `priv/static/` (the audit found 87% of one repo's findings cited
 /// `priv/static/phoenix.*.js` bundles).
-const EXCLUDED_DIR_SEQUENCES: &[&[&str]] = &[&["priv", "static"]];
+/// - `alembic/versions`, `migrations/versions`: auto-generated DB migration
+///   revisions (SQLAlchemy/Alembic) — boilerplate `op.create_table(...)` the
+///   cross-language audit flagged as `duplicate-code-clone` false positives.
+const EXCLUDED_DIR_SEQUENCES: &[&[&str]] = &[
+    &["priv", "static"],
+    &["alembic", "versions"],
+    &["migrations", "versions"],
+];
 
-/// Filename suffixes that mark a file as a minified/bundled asset rather than
-/// source a human edits (`app.min.js`, `vendor.bundle.js`, ...).
+/// Filename suffixes that mark a file as a minified/bundled/generated asset
+/// rather than source a human edits (`app.min.js`, `vendor.bundle.js`,
+/// `helloworld.pb.go`, `client.gen.ts`, ...). `.pb.go` is protoc-generated Go;
+/// `.gen.*` is the widespread codegen convention (OpenAPI clients, etc.) — both
+/// surfaced as scan false positives in the cross-language audit.
 const GENERATED_FILE_SUFFIXES: &[&str] = &[
     ".min.js",
     ".min.mjs",
@@ -88,6 +98,13 @@ const GENERATED_FILE_SUFFIXES: &[&str] = &[
     ".min.css",
     ".bundle.js",
     ".bundle.mjs",
+    ".pb.go",
+    ".gen.go",
+    ".gen.ts",
+    ".gen.tsx",
+    ".gen.js",
+    ".gen.mjs",
+    ".gen.cjs",
 ];
 
 /// Web front-end asset source extensions — the JS/TS/CSS family. Under an
@@ -161,6 +178,54 @@ pub fn is_generated_or_vendored_path(path: &str) -> bool {
     false
 }
 
+/// A line at/above this length is a strong minification signal — hand-written
+/// source virtually never sustains lines this long.
+const MINIFIED_MAX_LINE: usize = 2000;
+/// A line this long counts as "long" for the fraction test below.
+const MINIFIED_LONG_LINE: usize = 500;
+/// Fraction of lines that must be "long" for the file to read as minified.
+/// This distinguishes a genuinely minified/bundled file (predominantly long
+/// lines) from ordinary source that merely holds ONE long data/base64 line
+/// (a tiny fraction of its lines).
+const MINIFIED_LONG_FRACTION: f64 = 0.5;
+
+/// Returns `true` if `source` looks machine-generated/minified from its
+/// CONTENT (used at index time to skip a file entirely, unlike the path-based
+/// [`is_generated_or_vendored_path`]). Two signals:
+///
+/// 1. A codegen marker in the first few lines — the `Code generated ... DO NOT
+///    EDIT` stamp emitted by protoc, stringer, and many other tools.
+/// 2. Minified/bundled layout: a very long max line *and* a high average line
+///    length. The audit found a single 490 KB webpack bundle (`chat.js`, not
+///    named `*.min.js`) supplying 74% of a Kotlin repo's entities and 93% of
+///    its call edges, corrupting `foundational_files`/`symbols`/`hotspots` and
+///    the module graph. Requiring both a long max *and* high average avoids
+///    false-positiving ordinary source that has one long embedded string.
+pub fn is_minified_source(source: &str) -> bool {
+    for line in source.lines().take(5) {
+        if line.contains("Code generated") && line.contains("DO NOT EDIT") {
+            return true;
+        }
+    }
+    let mut max_len = 0usize;
+    let mut long_lines = 0usize;
+    let mut count = 0usize;
+    for line in source.lines() {
+        let n = line.len();
+        if n > max_len {
+            max_len = n;
+        }
+        if n >= MINIFIED_LONG_LINE {
+            long_lines += 1;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return false;
+    }
+    max_len >= MINIFIED_MAX_LINE && (long_lines as f64 / count as f64) >= MINIFIED_LONG_FRACTION
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +255,49 @@ mod tests {
         assert!(is_generated_or_vendored_path("grammars/kotlin/parser.c"));
         assert!(is_generated_or_vendored_path("vendor/lib/dep.go"));
         assert!(is_generated_or_vendored_path("third_party/x/y.cc"));
+    }
+
+    #[test]
+    fn true_for_cross_language_audit_generated_files() {
+        // Go protoc, codegen `.gen.*`, and Alembic/DB migration revisions —
+        // the specific scan false positives found auditing Go/TS/Python repos.
+        assert!(is_generated_or_vendored_path(
+            "grpc/example1/gen/helloworld/v1/helloworld.pb.go"
+        ));
+        assert!(is_generated_or_vendored_path(
+            "frontend/src/client/sdk.gen.ts"
+        ));
+        assert!(is_generated_or_vendored_path("src/client/core.gen.js"));
+        assert!(is_generated_or_vendored_path(
+            "backend/app/alembic/versions/1a31ce608336_init.py"
+        ));
+        assert!(is_generated_or_vendored_path(
+            "db/migrations/versions/abc.py"
+        ));
+        // Lookalikes that are real source must stay included.
+        assert!(!is_generated_or_vendored_path("src/protobuf_helpers.go"));
+        assert!(!is_generated_or_vendored_path("src/generator.ts"));
+        assert!(!is_generated_or_vendored_path("app/versions/policy.py"));
+    }
+
+    #[test]
+    fn is_minified_source_detects_generated_and_minified_content() {
+        // Codegen marker (protoc/stringer/etc.) in the header.
+        assert!(is_minified_source(
+            "// Code generated by protoc-gen-go. DO NOT EDIT.\npackage v1\n"
+        ));
+        // A minified/bundled file: consistently very long lines.
+        let bundle = format!("!function(t,n){{{}}}();", "a=1;".repeat(1000));
+        assert!(is_minified_source(&bundle));
+        // Ordinary source with ONE long embedded string is NOT minified
+        // (low average line length).
+        let normal = format!(
+            "fn main() {{\n    let s = \"{}\";\n    println!(\"{{s}}\");\n}}\n",
+            "x".repeat(3000)
+        );
+        assert!(!is_minified_source(&normal));
+        assert!(!is_minified_source("fn a() {}\nfn b() {}\n"));
+        assert!(!is_minified_source(""));
     }
 
     #[test]

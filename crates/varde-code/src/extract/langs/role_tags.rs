@@ -674,7 +674,7 @@ pub const TS_RULES: &[RoleTagRule] = &[
     },
     RoleTagRule {
         decorator: Some("Injectable"),
-        base_class: None,
+        base_class: Some("NestMiddleware"),
         path_glob: None,
         role: RoleTag::Middleware,
     },
@@ -764,6 +764,16 @@ pub const RUBY_RULES: &[RoleTagRule] = &[
     RoleTagRule {
         decorator: None,
         base_class: Some("ActionController::API"),
+        path_glob: None,
+        role: RoleTag::RouteHandler,
+    },
+    // A class extending *any* `…Controller` — Devise engine controllers
+    // (`< Devise::SessionsController`), Rails engines, and app-specific base
+    // controllers (`< Api::BaseController`, `< Admin::BaseController`) that the
+    // exact-base rules above miss. Suffix match on the base's final segment.
+    RoleTagRule {
+        decorator: None,
+        base_class: Some("*Controller"),
         path_glob: None,
         role: RoleTag::RouteHandler,
     },
@@ -958,7 +968,16 @@ pub fn match_role_tag(
             };
             let base_class_ok = match rule.base_class {
                 None => true,
-                Some(want) => base_class == Some(want) || matches_qualified(want, base_class),
+                Some(want) => match want.strip_prefix('*') {
+                    // Suffix rule: match when the base class's final segment
+                    // ends with the literal after `*`, so `*Controller` matches
+                    // `Devise::SessionsController`, `Admin::BaseController`, and
+                    // any app-specific `< Api::BaseController` — the Rails
+                    // convention that a class extending *something*-Controller
+                    // is itself a controller.
+                    Some(suffix) => base_class.is_some_and(|b| last_segment(b).ends_with(suffix)),
+                    None => base_class == Some(want) || matches_qualified(want, base_class),
+                },
             };
             let path_ok = match rule.path_glob {
                 None => true,
@@ -1060,6 +1079,34 @@ mod tests {
         assert_eq!(
             match_role_tag(PYTHON_RULES, Some("click.option"), None, None),
             None
+        );
+    }
+
+    #[test]
+    fn ruby_controller_suffix_rule_matches_engine_and_namespaced_bases() {
+        // The `*Controller` suffix rule catches Devise/engine and app-specific
+        // base controllers the exact-name rules miss.
+        for base in [
+            "Devise::SessionsController",
+            "Admin::BaseController",
+            "Api::V1::BaseController",
+            "ApplicationController",
+        ] {
+            assert_eq!(
+                match_role_tag(RUBY_RULES, None, Some(base), None),
+                Some(RoleTag::RouteHandler),
+                "class extending {base} must be a route handler"
+            );
+        }
+        // A non-controller base must not match the suffix rule (and jobs still
+        // route to BackgroundJob, not RouteHandler).
+        assert_eq!(
+            match_role_tag(RUBY_RULES, None, Some("SomeService"), None),
+            None
+        );
+        assert_eq!(
+            match_role_tag(RUBY_RULES, None, Some("ApplicationJob"), None),
+            Some(RoleTag::BackgroundJob)
         );
     }
 
@@ -1296,6 +1343,24 @@ mod tests {
                 "@{dec} must be an event listener"
             );
         }
+    }
+
+    #[test]
+    fn ts_nest_middleware_requires_injectable_and_nest_middleware() {
+        assert_eq!(
+            match_role_tag(TS_RULES, Some("Injectable"), Some("NestMiddleware"), None),
+            Some(RoleTag::Middleware)
+        );
+        assert_eq!(
+            match_role_tag(TS_RULES, Some("Injectable"), None, None),
+            None,
+            "ordinary Nest services are not middleware"
+        );
+        assert_eq!(
+            match_role_tag(TS_RULES, None, Some("NestMiddleware"), None),
+            None,
+            "the interface alone is not a middleware entrypoint"
+        );
     }
 
     #[test]

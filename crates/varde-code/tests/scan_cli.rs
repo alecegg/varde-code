@@ -127,6 +127,59 @@ fn omitted_output_prints_envelope_to_stdout() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// Ruby `module`/`include` is mixin composition, not interface
+/// implementation, so the interface-contract SOLID rules (solid-lsp,
+/// too-many-interfaces) and fat-interface-on-a-module must NOT fire on Ruby —
+/// while a genuine Ruby *class* with too many methods still can.
+#[test]
+fn ruby_mixins_do_not_trigger_interface_solid_rules() {
+    let home = tempdir("ruby-solid-home");
+    let repo = tempdir("ruby-solid-repo");
+    // A fat mixin module (16 methods) + a class including 4 mixins: under the
+    // old rules this produced fat-interface, too-many-interfaces, and 4×
+    // solid-lsp findings. All are Ruby-idiom false positives.
+    let mut big = String::from("module BigHelpers\n");
+    for i in 0..16 {
+        big.push_str(&format!("  def m{i}; end\n"));
+    }
+    big.push_str("end\n");
+    write(&repo.join("big.rb"), &big);
+    write(
+        &repo.join("widget.rb"),
+        "module A; def a; end; end\nmodule B; def b; end; end\nmodule C; def c; end; end\nmodule D; def d; end; end\nclass Widget\n  include A\n  include B\n  include C\n  include D\n  def own; end\nend\n",
+    );
+    let build = Command::new(bin())
+        .args(["build", "--repo-root"])
+        .arg(&repo)
+        .env("HOME", &home)
+        .output()
+        .expect("build runs");
+    assert!(build.status.success(), "build fails: {:?}", build.status);
+
+    let out = scan(&home, &[&format!(r#"{{"repoRoot":"{}"}}"#, repo.display())]);
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("envelope JSON");
+    let findings = payload["data"]["findings"]
+        .as_array()
+        .expect("findings array");
+    let interface_rules = [
+        "solid-lsp",
+        "solid-isp",
+        "fat-interface",
+        "too-many-interfaces",
+    ];
+    let offenders: Vec<&str> = findings
+        .iter()
+        .filter_map(|f| f["rule_id"].as_str())
+        .filter(|id| interface_rules.contains(id))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "Ruby mixins must not trigger interface SOLID rules, got: {offenders:?}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
 #[test]
 fn unwritable_output_emits_error_envelope_and_exits_nonzero() {
     let (home, repo) = build_fixture("unwritable", "warning");

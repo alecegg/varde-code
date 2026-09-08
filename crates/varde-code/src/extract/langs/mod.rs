@@ -377,6 +377,48 @@ pub(super) fn decorator_name(
     }
 }
 
+/// Map a framework route annotation/decorator `name` to its concrete HTTP
+/// verb, or `None` for a *prefix-only* annotation whose verb is unknown or
+/// carried elsewhere (`RequestMapping`, `Route`, `Controller`, Flask
+/// `*.route`). Recognizes, on the last dotted/`::` segment:
+///   - Spring/JVM `*Mapping` (`GetMapping` → `GET`; `RequestMapping` → `None`),
+///   - ASP.NET `Http*` attributes (`HttpGet` → `GET`),
+///   - JAX-RS / NestJS bare verbs (`GET`, `Get`, `Post`, ...),
+///   - Express/FastAPI receiver-dotted verbs (`app.get`/`router.post` → the
+///     verb; `app.route` → `None`).
+///
+/// Used by the per-language extractors to stamp `method` onto a route-carrying
+/// `Decorator` entity so [`crate::query::entrypoints::detect`] can surface the
+/// handler as `"<VERB> <path>"`.
+pub(super) fn http_verb_for_annotation(name: &str) -> Option<&'static str> {
+    let seg = name.rsplit(['.', ':']).next().unwrap_or(name);
+    let core = seg
+        .strip_prefix("Http")
+        .or_else(|| seg.strip_suffix("Mapping"))
+        .unwrap_or(seg);
+    match core.to_ascii_uppercase().as_str() {
+        "GET" => Some("GET"),
+        "POST" => Some("POST"),
+        "PUT" => Some("PUT"),
+        "DELETE" => Some("DELETE"),
+        "PATCH" => Some("PATCH"),
+        "HEAD" => Some("HEAD"),
+        "OPTIONS" => Some("OPTIONS"),
+        _ => None,
+    }
+}
+
+/// Whether a route annotation/decorator `name` (last segment) is a *prefix*
+/// annotation — one that contributes a base path shared by the sibling actions
+/// of its class rather than defining a route itself (`@RequestMapping("/api")`,
+/// `[Route("api/[controller]")]`, NestJS `@Controller("cats")`). The extractor
+/// stamps its path onto the class's `Decorator` so `detect` can prepend it to
+/// each action's method-level path.
+pub(super) fn is_route_prefix_annotation(name: &str) -> bool {
+    let seg = name.rsplit(['.', ':']).next().unwrap_or(name);
+    matches!(seg, "RequestMapping" | "Route" | "Controller")
+}
+
 /// Walk a JS/TS member-call chain from `fn_node` looking for a `.status(<arg>)`
 /// call, returning its first argument's text (the HTTP status literal).
 pub(super) fn chain_status(

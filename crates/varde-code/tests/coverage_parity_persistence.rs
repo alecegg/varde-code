@@ -2,7 +2,7 @@
 //!
 //! One checklist capability per persisted concern. Every check drives the
 //! REAL pipeline end-to-end — `extract()` → `resolve()` → `persist()` — over
-//! the fixture sources under `tests/resolve_fixtures`; nothing is stubbed.
+//! the fixture sources under `resolve_fixtures`; nothing is stubbed.
 //! Pass/fail is decided by self-contained assertions on the persisted DB
 //! state (no diffing against varde's TS output).
 
@@ -15,7 +15,7 @@ use varde_code::parse::parse_source;
 use varde_code::persist;
 use varde_code::resolve;
 
-const FIXTURES: &str = "tests/resolve_fixtures";
+const FIXTURES: &str = "resolve_fixtures";
 
 type Check = Result<(), String>;
 type CheckFn = fn() -> Check;

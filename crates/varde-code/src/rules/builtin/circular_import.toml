@@ -19,7 +19,7 @@
 # Test-path exclusion: `files.is_test_path` (generated column, see db.rs)
 # filters both sides of the cycle out. Fixtures that deliberately exercise
 # cycle detection (e.g. this repo's own
-# tests/resolve_fixtures/rust/communities/{d,e,f}.rs) aren't a real
+# resolve_fixtures/rust/communities/{d,e,f}.rs) aren't a real
 # initialization-order risk — they're test data for the resolver, not
 # production import structure.
 #

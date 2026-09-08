@@ -66,6 +66,12 @@ SELECT file, line, start_byte, end_byte, start_col, end_line, end_col,
   JOIN files f ON f.id = imp.file_id
   WHERE imp.kind = 16
     AND f.is_test_path = 0
+    -- Ruby `include SomeModule` is mixin composition, not interface
+    -- implementation: the module's methods are copied into the includer, so a
+    -- 0/N "required methods implemented" score is expected, not an LSP
+    -- violation. Ruby has no interface construct, so this contract rule
+    -- doesn't apply — exclude `.rb`.
+    AND f.path NOT LIKE '%.rb'
     AND EXISTS (SELECT 1 FROM entities iface WHERE iface.kind = 2 AND iface.name = imp.name)
 )
 WHERE iface_methods > 0 AND CAST(class_methods AS REAL) / iface_methods < threshold
@@ -113,6 +119,9 @@ SELECT file, line, start_byte, end_byte, start_col, end_line, end_col,
   JOIN files f ON f.id = imp.file_id
   WHERE imp.kind = 16
     AND f.is_test_path = 0
+    -- Ruby mixins (`include`) aren't implemented interfaces (see solid-lsp);
+    -- excluded so a mixin's methods aren't scored as empty-stub obligations.
+    AND f.path NOT LIKE '%.rb'
     AND (SELECT COUNT(*) FROM entities m WHERE m.kind = 0 AND m.owner_type = imp.name) > :method_threshold
 )
 WHERE class_methods > 0 AND CAST(empty_stubs AS REAL) / class_methods > threshold
@@ -160,6 +169,11 @@ SELECT file, line, start_byte, end_byte, start_col, end_line, end_col,
   FROM entities c
   JOIN files f ON f.id = c.file_id
   WHERE c.kind IN (1, 2) AND f.is_test_path = 0
+    -- A Ruby `module` (kind 2) is a mixin, not a client-facing interface, and
+    -- idiomatically groups many related helpers (e.g. an ActiveSupport
+    -- concern) — not a "fat interface" smell. Ruby *classes* (kind 1) stay
+    -- eligible as fat classes.
+    AND NOT (c.kind = 2 AND f.path LIKE '%.rb')
     AND c.name NOT LIKE '%Builder' AND c.name NOT LIKE '%Facade'
     -- .NET DI-registration classes: a `DependencyInjection` class or an
     -- `*Extensions` static class (the `IServiceCollection.AddX` idiom), and
@@ -200,6 +214,10 @@ SELECT f.path AS file, MIN(imp.start_line) AS line, imp.enclosing_function AS cl
 FROM entities imp
 JOIN files f ON f.id = imp.file_id
 WHERE imp.kind = 16 AND f.is_test_path = 0
+  -- Ruby `include`s are mixin composition (the recommended Ruby idiom), not
+  -- interface implementation — counting them as "implements N interfaces"
+  -- misapplies an OOP-interface smell. Ruby has no interface construct.
+  AND f.path NOT LIKE '%.rb'
   AND imp.name NOT IN (
     'Debug', 'Display', 'Clone', 'Copy', 'PartialEq', 'Eq', 'Hash', 'Default',
     'From', 'Into', 'TryFrom', 'TryInto', 'FromStr', 'AsRef', 'AsMut',

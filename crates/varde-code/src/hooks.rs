@@ -62,7 +62,7 @@ pub const CLAUDE_AGENT: &str = "claude";
 /// resolved by the shell at hook-run time (not baked in statically), so the
 /// `repoRoot` always reflects the session's actual working directory.
 pub const CLAUDE_SESSION_START_COMMAND: &str =
-    "varde-code report nav_map --json \"{\\\"repoRoot\\\":\\\"$(pwd)\\\"}\" --format text";
+    "varde-code nav_map --json \"{\\\"repoRoot\\\":\\\"$(pwd)\\\"}\" --format text";
 
 /// Bare agent name for the Codex CLI hook target.
 pub const CODEX_AGENT: &str = "codex";
@@ -76,7 +76,7 @@ pub const OPENCODE_AGENT: &str = "opencode";
 
 /// The embedded opencode plugin JS, written verbatim to
 /// `~/.config/opencode/plugin/varde-code-nav-map.js` (user-level default).
-/// Shells out to `varde-code report nav_map` via opencode's `$` executor on
+/// Shells out to `varde-code nav_map` via opencode's `$` executor on
 /// `session.start` and injects the result into session context. Best-effort
 /// per opencode's documented plugin API — see the plan's Assumptions
 /// section; no live opencode install was available to verify against.
@@ -87,7 +87,7 @@ pub const PI_AGENT: &str = "pi";
 
 /// The embedded Pi native extension JS, written verbatim to
 /// `~/.pi/agent/extensions/pi-extension.js` (user-level default). Shells
-/// out to `varde-code report nav_map` on Pi's `session_start` event and
+/// out to `varde-code nav_map` on Pi's `session_start` event and
 /// returns `{ systemPrompt: ... }` to inject the result into session
 /// context. Uses Pi's native first-party `ExtensionAPI` factory function
 /// directly (`export default function(pi) {...}`) — no third-party
@@ -960,7 +960,7 @@ mod tests {
             .as_str()
             .expect("command string");
         assert!(
-            command.contains("varde-code report nav_map"),
+            command.contains("varde-code nav_map"),
             "command invokes nav_map: {command}"
         );
         assert_eq!(
@@ -988,7 +988,7 @@ mod tests {
         let command = doc["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .expect("command string");
-        assert!(command.contains("varde-code report nav_map"));
+        assert!(command.contains("varde-code nav_map"));
     }
 
     #[test]
@@ -1052,7 +1052,7 @@ mod tests {
             .as_str()
             .expect("command string");
         assert!(
-            command.contains("varde-code report nav_map"),
+            command.contains("varde-code nav_map"),
             "command invokes nav_map: {command}"
         );
         assert_eq!(
@@ -1090,7 +1090,7 @@ mod tests {
         let command = doc["hooks"]["session_start"]["command"]
             .as_str()
             .expect("command string");
-        assert!(command.contains("varde-code report nav_map"));
+        assert!(command.contains("varde-code nav_map"));
     }
 
     #[test]
@@ -1181,7 +1181,7 @@ mod tests {
         let text = fs::read_to_string(&path).expect("file exists");
         assert_eq!(text, OPENCODE_PLUGIN_JS);
         assert!(
-            text.contains("varde-code report nav_map"),
+            text.contains("varde-code nav_map"),
             "plugin shells out to nav_map: {text}"
         );
     }

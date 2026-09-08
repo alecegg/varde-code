@@ -53,7 +53,7 @@ Three rules sharing one signal (cyclomatic complexity, `1 + count(ControlFlow en
 ### 9. `circular-import` — **shipped** ✅ (`rules/builtin/circular_import.toml`)
 - **Query shape:** self-join on `resolved_edges` — `A imports B AND B imports A` (`kind = 1` = import, `resolved = 1`), deduped to one row per cycle via `e1.from_file_id < e1.to_file_id`.
 - **Why:** sourced from a comparison against the [fallow](../reference-repos/fallow) reference repo's `CircularDependency`/`ReExportCycle` finding kinds — a direct import cycle makes initialization order load-order-dependent and, in some module systems, exposes a partially-populated module to one side. No new extraction or schema work: `resolved_edges` already persists every resolved import edge.
-- **Scope:** direct (2-file) cycles only. Verified against this repo's own indexed fixtures — the query correctly found 3 real cycles in `tests/resolve_fixtures/rust/communities/`. Transitive N-file cycles would need a recursive CTE with a depth guard to avoid path explosion on dense graphs; deferred, not needed for the common case.
+- **Scope:** direct (2-file) cycles only. Verified against this repo's own indexed fixtures — the query correctly found 3 real cycles in `resolve_fixtures/rust/communities/`. Transitive N-file cycles would need a recursive CTE with a depth guard to avoid path explosion on dense graphs; deferred, not needed for the common case.
 - **Risk:** low — a direct cycle either exists in the resolved graph or it doesn't, no threshold to mis-tune.
 
 ### Considered from the fallow comparison, not shipped

@@ -28,7 +28,12 @@ use crate::model::EntityKind;
 use super::noise_filter::{
     is_frontend_asset_path, is_generated_or_vendored_path, is_scaffold_template_path,
 };
-use super::{ApiError, db_err};
+use super::{db_err, ApiError};
+
+/// Route metadata (`method`, `path`) stamped on `Decorator` entities, keyed by
+/// the decorated declaration `(file_id, enclosing_function)` — an action
+/// method's own name, or a controller class's name for a base-path prefix.
+type RouteMetaByOwner = HashMap<(i64, String), (Option<String>, Option<String>)>;
 
 /// One detected semantic entrypoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +47,14 @@ pub struct Entrypoint {
     /// path-only route (registration site with no resolvable handler) is
     /// `false` and is excluded from flow-tree building.
     pub flow_root: bool,
+    /// HTTP verb for a route entrypoint (`"GET"`), when known. For an
+    /// annotation/decorator handler this is recovered from the route decorator
+    /// (`@GetMapping` -> `GET`); the `symbol` stays the handler name so it
+    /// remains a valid `explore` target and flow-tree root.
+    pub method: Option<String>,
+    /// HTTP path for a route entrypoint (`"/api/catalog/{id}"`), when known —
+    /// the method-level path combined with any class-level base path.
+    pub path: Option<String>,
 }
 
 impl RoleTag {
@@ -60,12 +73,20 @@ impl RoleTag {
 
 impl Entrypoint {
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "entity_id": self.entity_id,
             "file": self.file,
             "symbol": self.symbol,
             "role": self.role.as_str(),
-        })
+        });
+        let map = obj.as_object_mut().expect("json object");
+        if let Some(method) = &self.method {
+            map.insert("method".into(), serde_json::Value::String(method.clone()));
+        }
+        if let Some(path) = &self.path {
+            map.insert("path".into(), serde_json::Value::String(path.clone()));
+        }
+        obj
     }
 }
 
@@ -119,6 +140,9 @@ struct Candidate {
     file_id: i64,
     path: String,
     name: String,
+    /// Entity kind (`EntityKind::as_i64`): `Function` or `Class`. Used to gate
+    /// a class candidate on actually owning methods (see [`detect`]).
+    kind: i64,
     /// The owning type's name for a method entity, else NULL/empty. A
     /// constructor is a method whose name equals its `owner_type` — used to
     /// drop constructors from candidacy so they don't inherit their class's
@@ -156,7 +180,7 @@ pub fn detect(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
             // also neutralizes decorator collisions with test tooling — e.g.
             // `@patch` / `@mock.patch` (unittest.mock) shares its final
             // segment with the HTTP verb `patch`, but lives in test files.
-            "SELECT e.id, e.file_id, f.path, e.name, e.owner_type
+            "SELECT e.id, e.file_id, f.path, e.name, e.kind, e.owner_type
              FROM entities e
              JOIN files f ON f.id = e.file_id
              WHERE e.kind IN (?1, ?2) AND f.is_test_path = 0",
@@ -171,7 +195,8 @@ pub fn detect(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
                     r.get::<_, i64>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
-                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             },
         )
@@ -179,14 +204,36 @@ pub fn detect(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?
         .into_iter()
-        .map(|(entity_id, file_id, path, name, owner_type)| Candidate {
-            entity_id,
-            file_id,
-            path,
-            name,
-            owner_type,
-            decorators: Vec::new(),
-            base_classes: Vec::new(),
+        .map(
+            |(entity_id, file_id, path, name, kind, owner_type)| Candidate {
+                entity_id,
+                file_id,
+                path,
+                name,
+                kind,
+                owner_type,
+                decorators: Vec::new(),
+                base_classes: Vec::new(),
+            },
+        )
+        .collect();
+
+    // A class becomes an entrypoint via a type-level signal (`extends
+    // ControllerBase`, `[ApiController]`, ...) — but a controller/handler class
+    // with *no methods of its own* has no routes to serve and is not a real
+    // entrypoint. eShopOnWeb's `BaseApiController` (an empty `{ }` body,
+    // commented "No longer used") was surfaced purely on its base class. Gate
+    // class candidates on owning at least one method: a method carries its
+    // class name in `owner_type` (same file), so a class with no matching
+    // method row is empty. Keyed by (file_id, class name).
+    let classes_with_methods: std::collections::HashSet<(i64, String)> = candidates
+        .iter()
+        .filter(|c| c.kind == EntityKind::Function.as_i64())
+        .filter_map(|c| {
+            c.owner_type
+                .as_deref()
+                .filter(|o| !o.is_empty())
+                .map(|o| (c.file_id, o.to_string()))
         })
         .collect();
 
@@ -203,6 +250,13 @@ pub fn detect(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
             EntityKind::Implements.as_i64(),
         ],
     )?;
+    // HTTP method+path stamped onto route `Decorator` entities by the
+    // extractors (`@app.get("/x")`, `[HttpGet("{id}")]`, `@GetMapping(...)`,
+    // ...), keyed by the decorated declaration `(file_id, name)` — a method's
+    // own name for an action decorator, the class's name for a class-level
+    // prefix (`@RequestMapping("/api")`). Lets a decorator/annotation handler
+    // be surfaced as `"<VERB> <path>"` like the call-based routes are.
+    let route_meta_by_owner = route_meta_by_owner(conn)?;
 
     let mut results = Vec::new();
     for mut candidate in candidates {
@@ -225,6 +279,15 @@ pub fn detect(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
             .owner_type
             .as_deref()
             .is_some_and(|owner| !owner.is_empty() && owner == candidate.name)
+        {
+            continue;
+        }
+
+        // Drop class candidates that own no methods: an empty controller/
+        // handler class serves no routes and only bloats the (highest-priority)
+        // entrypoints section. Method candidates are unaffected.
+        if candidate.kind == EntityKind::Class.as_i64()
+            && !classes_with_methods.contains(&(candidate.file_id, candidate.name.clone()))
         {
             continue;
         }
@@ -283,17 +346,97 @@ pub fn detect(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
             continue;
         }
 
+        // Attach the HTTP verb+path when this is a decorator/annotation route
+        // handler (combining any class-level base path). The symbol stays the
+        // handler name so it remains a valid `explore` target and flow root.
+        let (method, path) = route_fields(&candidate, &route_meta_by_owner);
         results.push(Entrypoint {
             entity_id: candidate.entity_id,
             file: candidate.path,
             symbol: candidate.name,
             role,
             flow_root: true,
+            method,
+            path,
         });
     }
 
     results.sort_by(|a, b| a.file.cmp(&b.file).then(a.symbol.cmp(&b.symbol)));
     Ok(results)
+}
+
+/// The `(method, path)` route fields for a decorator/annotation handler
+/// `candidate`, from the route metadata stamped on its `Decorator` entities.
+/// Only method/function candidates carry a route (a class contributes just a
+/// base-path prefix, prepended here via the method's `owner_type`). Returns
+/// `(None, None)` when the candidate is a class or carries no route metadata,
+/// and drops a verb with no path anywhere (not informative on its own).
+fn route_fields(
+    candidate: &Candidate,
+    meta: &RouteMetaByOwner,
+) -> (Option<String>, Option<String>) {
+    if candidate.kind != EntityKind::Function.as_i64() {
+        return (None, None);
+    }
+    let Some((method, sub_path)) = meta.get(&(candidate.file_id, candidate.name.clone())) else {
+        return (None, None);
+    };
+    let prefix = candidate
+        .owner_type
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .and_then(|c| meta.get(&(candidate.file_id, c.to_string())))
+        .and_then(|(_, p)| p.as_deref());
+    let full = join_route_path(prefix, sub_path.as_deref());
+    match full {
+        Some(p) => (method.as_ref().map(|m| m.to_uppercase()), Some(p)),
+        None => (None, None),
+    }
+}
+
+/// Join a class-level base path and a method-level sub-path into one
+/// slash-normalized route (`Some("/api")` + `Some("{id}")` -> `"/api/{id}"`),
+/// trimming stray slashes and dropping empty segments. `None` when neither
+/// contributes a segment.
+fn join_route_path(prefix: Option<&str>, sub: Option<&str>) -> Option<String> {
+    let mut segs: Vec<&str> = Vec::new();
+    for part in [prefix, sub].into_iter().flatten() {
+        let trimmed = part.trim().trim_matches('/');
+        if !trimmed.is_empty() {
+            segs.push(trimmed);
+        }
+    }
+    (!segs.is_empty()).then(|| format!("/{}", segs.join("/")))
+}
+
+/// Load route metadata (`method`, `path`) stamped on `Decorator` entities,
+/// keyed by the decorated declaration `(file_id, enclosing_function)`. The
+/// first decorator seen per owner wins — an action method carries at most one
+/// route decorator, and a class its one base-path annotation.
+fn route_meta_by_owner(conn: &Connection) -> Result<RouteMetaByOwner, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT file_id, enclosing_function, method, path FROM entities
+             WHERE kind = ?1 AND enclosing_function IS NOT NULL
+               AND (method IS NOT NULL OR path IS NOT NULL)",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([EntityKind::Decorator.as_i64()], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(db_err)?;
+    let mut map: RouteMetaByOwner = HashMap::new();
+    for row in rows {
+        let (file_id, owner, method, path) = row.map_err(db_err)?;
+        map.entry((file_id, owner)).or_insert((method, path));
+    }
+    Ok(map)
 }
 
 /// File extensions whose HTTP routes are registered through *calls* rather
@@ -387,9 +530,13 @@ pub fn detect_routes(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
         let Some(path) = route_path.filter(|p| !p.is_empty()) else {
             continue;
         };
-        let symbol = match method.as_deref() {
-            Some(m) if !m.is_empty() && m != "*" => format!("{} {path}", m.to_uppercase()),
-            _ => path,
+        let verb = match method.as_deref() {
+            Some(m) if !m.is_empty() && m != "*" => Some(m.to_uppercase()),
+            _ => None,
+        };
+        let symbol = match &verb {
+            Some(m) => format!("{m} {path}"),
+            None => path.clone(),
         };
         // Root the route at its handler function when we can name and resolve
         // it, so the entrypoint carries a real call graph.
@@ -408,6 +555,8 @@ pub fn detect_routes(conn: &Connection) -> Result<Vec<Entrypoint>, ApiError> {
                 symbol,
                 role: RoleTag::RouteHandler,
                 flow_root,
+                method: verb,
+                path: Some(path),
             });
         }
     }
@@ -450,7 +599,8 @@ pub fn detect_process_mains(conn: &Connection) -> Result<Vec<Entrypoint>, ApiErr
             "SELECT e.id, f.path, e.name
              FROM entities e
              JOIN files f ON f.id = e.file_id
-             WHERE e.kind = ?1 AND f.is_test_path = 0 AND e.name IN ('main', 'Main')",
+             WHERE e.kind = ?1 AND f.is_test_path = 0
+               AND e.owner_type IS NULL AND e.name IN ('main', 'Main')",
         )
         .map_err(db_err)?;
     let rows = stmt
@@ -485,6 +635,8 @@ pub fn detect_process_mains(conn: &Connection) -> Result<Vec<Entrypoint>, ApiErr
             symbol: name,
             role: RoleTag::ProcessMain,
             flow_root: true,
+            method: None,
+            path: None,
         });
     }
 
@@ -710,10 +862,10 @@ mod semantic_entrypoint_tests {
         });
     }
 
-    /// S9: language process mains (`fn main`, `func main`, C# `Main`) are
-    /// surfaced by [`detect_process_mains`] with the `ProcessMain` role — even
-    /// though [`detect`] excludes them as bootstrap — while a non-main function,
-    /// a wrong-case name for the language, and a test-file main are not.
+    /// S9: language process mains (`fn main`, `func main`) are surfaced by
+    /// [`detect_process_mains`] with the `ProcessMain` role — even though
+    /// [`detect`] excludes them as bootstrap — while an owned C# method, a
+    /// wrong-case name, and a test-file main are not.
     #[test]
     fn detect_process_mains_surfaces_named_program_entrypoints() {
         with_isolated_home("entrypoints", "process-mains", || {
@@ -761,8 +913,8 @@ mod semantic_entrypoint_tests {
             assert!(files.contains(&("main.rs", "main")), "rust main: {mains:?}");
             assert!(files.contains(&("cmd.go", "main")), "go main: {mains:?}");
             assert!(
-                files.contains(&("Program.cs", "Main")),
-                "c# Main: {mains:?}"
+                !mains.iter().any(|e| e.file.ends_with("Program.cs")),
+                "owned c# Main must be excluded: {mains:?}"
             );
             assert!(
                 !mains.iter().any(|e| e.file.ends_with("other.rs")),
@@ -905,6 +1057,61 @@ mod semantic_entrypoint_tests {
             assert_eq!(
                 controller_count, 1,
                 "controller must appear once, not duplicated by its constructor: {entrypoints:?}"
+            );
+
+            let _ = std::fs::remove_file(&db);
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    /// An empty controller class — the `[ApiController]`/`ControllerBase`
+    /// signals are present but the body has no action methods — is not a real
+    /// entrypoint (it serves no routes) and must be dropped, while a sibling
+    /// controller that *does* declare an action is still surfaced. Mirrors
+    /// eShopOnWeb's `BaseApiController` (an empty `{ }` reference stub).
+    #[test]
+    fn semantic_entrypoint_empty_controller_class_is_not_an_entrypoint() {
+        with_isolated_home("entrypoints", "cs-empty-controller", || {
+            let root = temp_root("cs-empty-controller");
+            std::fs::write(
+                root.join("BaseApiController.cs"),
+                "using Microsoft.AspNetCore.Mvc;\n\n\
+                 [ApiController]\n\
+                 [Route(\"api/[controller]/[action]\")]\n\
+                 public class BaseApiController : ControllerBase\n{ }\n",
+            )
+            .expect("write BaseApiController.cs");
+            std::fs::write(
+                root.join("CatalogController.cs"),
+                "using Microsoft.AspNetCore.Mvc;\n\n\
+                 [ApiController]\n\
+                 public class CatalogController : ControllerBase\n\
+                 {\n\
+                 \x20\x20\x20\x20[HttpGet]\n\
+                 \x20\x20\x20\x20public int List() { return 0; }\n\
+                 }\n",
+            )
+            .expect("write CatalogController.cs");
+
+            crate::build::run_with_force(root.to_str().unwrap(), true).expect("full build");
+            let db = crate::db::path::repo_db_path(&root);
+            let conn = Connection::open(&db).expect("open db");
+
+            let entrypoints = detect(&conn).expect("detect computes");
+
+            assert!(
+                !entrypoints.iter().any(|e| e.symbol == "BaseApiController"),
+                "empty controller class must NOT be an entrypoint: {entrypoints:?}"
+            );
+            assert!(
+                entrypoints
+                    .iter()
+                    .any(|e| e.symbol == "CatalogController" && e.role == RoleTag::RouteHandler),
+                "non-empty controller class must still be an entrypoint: {entrypoints:?}"
+            );
+            assert!(
+                entrypoints.iter().any(|e| e.symbol == "List"),
+                "the action method itself must still be an entrypoint: {entrypoints:?}"
             );
 
             let _ = std::fs::remove_file(&db);
@@ -1222,6 +1429,248 @@ mod semantic_entrypoint_tests {
                     .any(|e| e.symbol == "HardWorker" && e.role == RoleTag::BackgroundJob),
                 "Sidekiq worker (include Sidekiq::Job) must be a background_job: {entrypoints:?}"
             );
+
+            let _ = std::fs::remove_file(&db);
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    /// Route method+path plumbing (annotation/decorator frameworks): a handler
+    /// keeps its function name as `symbol` (still a valid `explore` target /
+    /// flow root) but now carries the HTTP `method` and full `path`, combining
+    /// the class-level base path (`@RequestMapping`/`[Route]`) with the
+    /// method-level path. Covers FastAPI (module-level, no prefix), Spring
+    /// (Java), ASP.NET MVC (C#), and Kotlin Spring in one repo.
+    #[test]
+    fn route_method_and_path_captured_for_annotation_handlers() {
+        with_isolated_home("entrypoints", "route-method-path", || {
+            let root = temp_root("route-method-path");
+            std::fs::write(
+                root.join("api.py"),
+                "from fastapi import FastAPI\n\
+                 app = FastAPI()\n\n\
+                 @app.get(\"/items\")\n\
+                 def list_items():\n\
+                 \x20\x20\x20\x20return []\n\n\
+                 @app.post(\"/items\")\n\
+                 def create_item(x):\n\
+                 \x20\x20\x20\x20return x\n",
+            )
+            .expect("write api.py");
+            std::fs::write(
+                root.join("UserController.java"),
+                "@RestController\n\
+                 @RequestMapping(\"/users\")\n\
+                 public class UserController {\n\
+                 \x20\x20\x20\x20@GetMapping(\"/{id}\")\n\
+                 \x20\x20\x20\x20public String getUser(int id) { return \"\"; }\n\
+                 \x20\x20\x20\x20@PostMapping\n\
+                 \x20\x20\x20\x20public String create() { return \"\"; }\n\
+                 }\n",
+            )
+            .expect("write UserController.java");
+            std::fs::write(
+                root.join("CatalogController.cs"),
+                "using Microsoft.AspNetCore.Mvc;\n\n\
+                 [ApiController]\n\
+                 [Route(\"api/catalog\")]\n\
+                 public class CatalogController : ControllerBase\n\
+                 {\n\
+                 \x20\x20\x20\x20[HttpGet(\"{id}\")]\n\
+                 \x20\x20\x20\x20public int GetById(int id) { return id; }\n\
+                 }\n",
+            )
+            .expect("write CatalogController.cs");
+            std::fs::write(
+                root.join("PetController.kt"),
+                "@RestController\n\
+                 @RequestMapping(\"/pets\")\n\
+                 class PetController {\n\
+                 \x20\x20\x20\x20@GetMapping(\"/{id}\")\n\
+                 \x20\x20\x20\x20fun getPet(id: Int): String { return \"\" }\n\
+                 }\n",
+            )
+            .expect("write PetController.kt");
+
+            crate::build::run_with_force(root.to_str().unwrap(), true).expect("full build");
+            let db = crate::db::path::repo_db_path(&root);
+            let conn = Connection::open(&db).expect("open db");
+
+            let eps = detect(&conn).expect("detect computes");
+            let route = |symbol: &str| -> (Option<String>, Option<String>) {
+                let e = eps
+                    .iter()
+                    .find(|e| e.symbol == symbol)
+                    .unwrap_or_else(|| panic!("{symbol} entrypoint missing: {eps:?}"));
+                (e.method.clone(), e.path.clone())
+            };
+
+            // FastAPI: module-level, no class prefix.
+            assert_eq!(
+                route("list_items"),
+                (Some("GET".into()), Some("/items".into()))
+            );
+            assert_eq!(
+                route("create_item"),
+                (Some("POST".into()), Some("/items".into()))
+            );
+            // Spring: class @RequestMapping("/users") + method path; a bare
+            // @PostMapping (no path) still yields the class prefix.
+            assert_eq!(
+                route("getUser"),
+                (Some("GET".into()), Some("/users/{id}".into()))
+            );
+            assert_eq!(
+                route("create"),
+                (Some("POST".into()), Some("/users".into()))
+            );
+            // ASP.NET MVC: [Route("api/catalog")] + [HttpGet("{id}")].
+            assert_eq!(
+                route("GetById"),
+                (Some("GET".into()), Some("/api/catalog/{id}".into()))
+            );
+            // Kotlin Spring: @RequestMapping("/pets") + @GetMapping("/{id}").
+            assert_eq!(
+                route("getPet"),
+                (Some("GET".into()), Some("/pets/{id}".into()))
+            );
+            // The controller *class* entries carry no route (prefix only).
+            for cls in ["UserController", "CatalogController", "PetController"] {
+                let e = eps.iter().find(|e| e.symbol == cls).expect("class present");
+                assert_eq!(
+                    (e.method.as_deref(), e.path.as_deref()),
+                    (None, None),
+                    "class {cls} must not carry a route"
+                );
+            }
+
+            let _ = std::fs::remove_file(&db);
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    /// NestJS (TS): both the `@Controller('cats')` class (its decorator hangs
+    /// off the wrapping `export_statement`) and the `@Get(':id')` method (its
+    /// decorator is a preceding sibling in the class body, not a child) must be
+    /// role-tagged, and the action must carry the combined `GET /cats/:id`.
+    #[test]
+    fn semantic_entrypoint_nestjs_controller_routes() {
+        with_isolated_home("entrypoints", "nestjs", || {
+            let root = temp_root("nestjs");
+            std::fs::write(
+                root.join("cats.controller.ts"),
+                "@Controller('cats')\n\
+                 export class CatsController {\n\
+                 \x20\x20@Get(':id')\n\
+                 \x20\x20findOne(id: string): string { return id; }\n\
+                 \x20\x20@Post()\n\
+                 \x20\x20create(): void {}\n\
+                 }\n",
+            )
+            .expect("write cats.controller.ts");
+
+            crate::build::run_with_force(root.to_str().unwrap(), true).expect("full build");
+            let db = crate::db::path::repo_db_path(&root);
+            let conn = Connection::open(&db).expect("open db");
+
+            let eps = detect(&conn).expect("detect computes");
+            assert!(
+                eps.iter()
+                    .any(|e| e.symbol == "CatsController" && e.role == RoleTag::RouteHandler),
+                "@Controller class must be a route_handler: {eps:?}"
+            );
+            let find_one = eps
+                .iter()
+                .find(|e| e.symbol == "findOne")
+                .unwrap_or_else(|| panic!("findOne missing: {eps:?}"));
+            assert_eq!(find_one.role, RoleTag::RouteHandler);
+            assert_eq!(
+                (find_one.method.as_deref(), find_one.path.as_deref()),
+                (Some("GET"), Some("/cats/:id"))
+            );
+            let create = eps
+                .iter()
+                .find(|e| e.symbol == "create")
+                .unwrap_or_else(|| panic!("create missing: {eps:?}"));
+            assert_eq!(
+                (create.method.as_deref(), create.path.as_deref()),
+                (Some("POST"), Some("/cats"))
+            );
+
+            let _ = std::fs::remove_file(&db);
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    #[test]
+    fn semantic_entrypoint_nestjs_excludes_services_but_keeps_middleware() {
+        with_isolated_home("entrypoints", "nestjs-middleware", || {
+            let root = temp_root("nestjs-middleware");
+            std::fs::write(
+                root.join("app.ts"),
+                "@Injectable()\n\
+                 export class UsersService {\n\
+                 \x20\x20findOne(): string { return 'user'; }\n\
+                 }\n\
+                 \n\
+                 @Injectable()\n\
+                 export class LoggerMiddleware implements NestMiddleware {\n\
+                 \x20\x20use(): void {}\n\
+                 }\n",
+            )
+            .expect("write Nest services and middleware");
+
+            crate::build::run_with_force(root.to_str().unwrap(), true).expect("full build");
+            let db = crate::db::path::repo_db_path(&root);
+            let conn = Connection::open(&db).expect("open db");
+
+            let eps = detect(&conn).expect("detect computes");
+            assert!(
+                !eps.iter().any(|e| e.symbol == "UsersService"),
+                "ordinary @Injectable service must not be an entrypoint: {eps:?}"
+            );
+            assert!(
+                eps.iter()
+                    .any(|e| { e.symbol == "LoggerMiddleware" && e.role == RoleTag::Middleware }),
+                "@Injectable class implementing NestMiddleware must remain listed: {eps:?}"
+            );
+
+            let _ = std::fs::remove_file(&db);
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    /// Rails engines / namespaced controllers: a class extending Devise's
+    /// `Devise::SessionsController`, an app-specific `Admin::BaseController`,
+    /// or `ActionController::API` must all be route-handler entrypoints — the
+    /// `*Controller` base-class suffix rule catches bases the exact rules miss.
+    #[test]
+    fn semantic_entrypoint_rails_engine_and_namespaced_controllers() {
+        with_isolated_home("entrypoints", "rails-engine", || {
+            let root = temp_root("rails-engine");
+            std::fs::write(
+                root.join("sessions_controller.rb"),
+                "class Users::SessionsController < Devise::SessionsController\n  def create\n  end\nend\n",
+            )
+            .expect("write sessions");
+            std::fs::write(
+                root.join("admin_users_controller.rb"),
+                "class Admin::UsersController < Admin::BaseController\n  def index\n  end\nend\n",
+            )
+            .expect("write admin");
+
+            crate::build::run_with_force(root.to_str().unwrap(), true).expect("full build");
+            let db = crate::db::path::repo_db_path(&root);
+            let conn = Connection::open(&db).expect("open db");
+
+            let eps = detect(&conn).expect("detect computes");
+            for ctrl in ["Users::SessionsController", "Admin::UsersController"] {
+                assert!(
+                    eps.iter()
+                        .any(|e| e.symbol == ctrl && e.role == RoleTag::RouteHandler),
+                    "{ctrl} must be a route_handler entrypoint: {eps:?}"
+                );
+            }
 
             let _ = std::fs::remove_file(&db);
             let _ = std::fs::remove_dir_all(&root);

@@ -7,6 +7,179 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`nav_map` entrypoints now carry the HTTP method and path for
+  annotation/decorator frameworks.** Previously only call-based routes
+  (Gin/Ktor/C# minimal-API) surfaced as `"GET /users"`; a FastAPI/Spring/ASP.NET
+  MVC/Kotlin-Spring/NestJS handler surfaced only by function name because the
+  route decorator's verb+path was discarded at extraction. Extractors now stamp
+  `method`+`path` onto route `Decorator` entities (verb from the decorator name
+  via `http_verb_for_annotation`; path from its string argument), and
+  `entrypoints::detect` combines the class-level base path (`@RequestMapping`,
+  `[Route]`, `@Controller`) with the method-level path — e.g. `getUser` now
+  reports `GET /users/{id}`. The `symbol` stays the handler name (so it remains a
+  valid `explore` target and flow-tree root); the verb+path are added as
+  structured `method`/`path` fields and rendered as `getUser  (GET /users/{id})`
+  in the text nav_map. Tests: `route_method_and_path_captured_for_annotation_handlers`,
+  `semantic_entrypoint_nestjs_controller_routes`.
+
+### Fixed
+- **The repo-wide call fallback no longer over-converges on test doubles or
+  library receivers.** The single-definition fallback (namespace-import
+  languages: C#/Java/Kotlin/Scala/Swift) bound production callers to the wrong
+  target in three ways, now all closed: (1) a callee defined *only* in a test
+  file was "unique across the repo," so every production caller of that name
+  resolved to the test double (one run had a single test `next` capturing 82
+  production call sites) — test-file definitions are now excluded from the
+  uniqueness index (a name defined once in production and once in a test also
+  flips from ambiguous to the correct production def); (2) a call on a receiver
+  positively typed as a *library* type (`_repo.FindOne()` where `_repo`'s type
+  is not in the repo) bound to a coincidentally same-named in-repo method — the
+  fallback is now vetoed for known-external receivers, while unknown-type
+  receivers (inherited `obj.getId()`) still resolve; (3) a production caller
+  could still reach a test-file definition through the *type-directed* pass when
+  the only in-repo subtype of an external base was a unit-test fake
+  (`TimeProvider`'s sole in-repo `GetUtcNow` being a test `FixedUtcTimeProvider`)
+  — a production caller is now never allowed to resolve to a test-file
+  definition (caller-aware: test callers still reach test code). Verified on
+  semantic-kernel (643K entities): production→test call edges dropped to zero
+  with resolution otherwise unchanged. New pure-path `db::path_is_test` mirrors
+  the `files.is_test_path` SQL column for pre-persist resolution (parity-tested).
+  Tests: `repo_wide_fallback_excludes_test_file_definitions`,
+  `repo_wide_fallback_vetoes_library_receiver_calls`,
+  `production_caller_does_not_resolve_to_test_definition`,
+  `path_is_test_matches_sql_generated_column`.
+- **NestJS entrypoints are no longer empty; TS class/method decorators are
+  captured.** The TS extractor dropped a decorator on an *exported* class (it
+  hangs off the wrapping `export_statement`, not the `class_declaration`) and
+  never handled *method* decorators (a preceding sibling in the class body), so
+  a NestJS `@Controller`/`@Get` controller produced no `Decorator` entities and
+  no entrypoints. Both placements are now swept, so NestJS controllers and their
+  actions surface as route handlers (with verb+path, per Added). Tests:
+  `nestjs_exported_class_and_method_decorators_captured`,
+  `semantic_entrypoint_nestjs_controller_routes`.
+- **Rails-engine / namespaced controllers are now entrypoints.** Role-tag rules
+  matched only the exact base classes `ApplicationController`/`ActionController::{Base,API}`,
+  missing Devise engine controllers (`< Devise::SessionsController`) and
+  app-specific bases (`< Admin::BaseController`, `< Api::BaseController`). A
+  `*Controller` base-class *suffix* rule (new `*`-prefix mechanism in
+  `match_role_tag`) now catches any class extending something ending in
+  `Controller`. Tests: `semantic_entrypoint_rails_engine_and_namespaced_controllers`,
+  `ruby_controller_suffix_rule_matches_engine_and_namespaced_bases`.
+- **TypeScript `symbols_in_file` now includes class fields.** Class
+  `public_field_definition`s and interface `property_signature`s (a NestJS
+  entity/DTO's `@Column` properties) were dropped, so a TS type's data model was
+  invisible (C#/Python captured fields fine). They are now emitted as `Variable`
+  entities owned by their type. Test:
+  `ts_class_fields_and_interface_properties_captured`.
+- **Python receiver-qualified module calls now resolve.** A `crud.authenticate()`
+  call where `crud` is a module the file imported (`from app import crud`,
+  `import crud`) went unresolved — `from pkg import mod` targets the package, and
+  the last-segment cross-file pass dropped `users.create()`/`items.create()` as
+  ambiguous when `create` was defined in several sibling modules. The Python
+  extractor now records each import's local binding name on `Import.owner_type`,
+  and a new receiver-aware resolution pass maps `recv.method()` to the sibling
+  module whose file stem is `recv` and that defines `method` (unambiguous within
+  one file). Purely additive — the import graph is unchanged. Test:
+  `python_receiver_qualified_module_calls_resolve` (+ `python/module_calls` fixture).
+- **Scan: Ruby mixins no longer trigger interface SOLID rules.** Ruby `module`
+  maps to `Interface` and `include` to `Implements`, but Ruby has no interface
+  construct — `module`/`include` is mixin composition. The interface-contract
+  rules misfired: `solid-lsp` flagged every `include` as an unimplemented
+  contract, `too-many-interfaces` counted included mixins, and `fat-interface`
+  flagged large helper modules. `.rb` files are now excluded from the
+  interface-implementation rules (`solid-lsp`, `solid-isp`, `too-many-interfaces`)
+  and Ruby *modules* (not classes) from `fat-interface` — a Ruby fat *class* is
+  still flagged. Test: `ruby_mixins_do_not_trigger_interface_solid_rules`.
+- **Minified/generated bundles are no longer indexed as source.** A checked-in
+  minified/bundled file (a webpack bundle, a protoc stub) is machine output, not
+  source an agent navigates — but indexing one let it dominate the graph. The
+  cross-language audit found a single 490 KB `chat.js` (webpack, *not* named
+  `*.min.js`) supplying 74% of a Kotlin repo's entities and 93% of its call
+  edges, pushing real `.kt` files out of `foundational_files`/`symbols`/
+  `hotspots` and the module graph. Extraction now skips a file whose CONTENT
+  reads as minified/generated — a `Code generated … DO NOT EDIT` marker in the
+  header, or predominantly very long lines (`noise_filter::is_minified_source`,
+  applied in `scan::process_file`). The file stays tracked (hash recorded,
+  incremental unaffected) but contributes no entities/symbols. Measured: the
+  Kotlin sample repo dropped 90,603 → 19,360 entities and its foundational files
+  became real `.kt` modules. Tests: `is_minified_source_detects_generated_and_minified_content`.
+- **Scan no longer fires on more classes of generated files.** The
+  generated/vendored path filter (which suppresses both scan findings and nav
+  orientation) gained protoc Go (`*.pb.go`), the `*.gen.*` codegen convention
+  (OpenAPI clients, etc.), and Alembic/DB migration revisions
+  (`alembic/versions/`, `migrations/versions/`). The cross-language audit found
+  `duplicate-code-clone` false positives on all three (Go `*.pb.go`, a TS
+  `sdk.gen.ts`, Python migration files). Verified: 0 findings now land on any of
+  these on the audited Go/Python repos. Test:
+  `true_for_cross_language_audit_generated_files`.
+- **Call resolution: Swift object-protocol methods no longer invent edges.**
+  Extending the C# object-protocol fix to Swift (also a repo-wide-fallback
+  language): a `hash(into:)` (Hashable), `encode(to:)` (Encodable), or an
+  Equatable/Comparable operator (`==`, `<`, …) defined exactly once in a repo was
+  captured by the single-definition fallback for every matching call, even on an
+  unrelated receiver type (confirmed with a fixture: `widget.hash(into:)` wrongly
+  resolving to an unrelated `Report.hash`). `resolve::build_repo_wide_unique_index`
+  now skips these Swift protocol-requirement names alongside the C#/Java set.
+  Test: `swift_object_protocol_method_is_not_captured_by_repo_wide_fallback` (+
+  `swift/object_methods` fixture).
+- **`nav_map` subsystem names are now unique.** Directory-based naming is not
+  injective, so distinct Louvain communities sharing a dominant directory all
+  rendered with the same bare name (the ASP.NET Core audit repo produced five
+  separate `CatalogItemEndpoints` subsystems, plus repeated `Models`/`Interfaces`)
+  — indistinguishable for orientation. `subsystems::name_clusters` now qualifies
+  every collision with a representative member stem
+  (`CatalogItemEndpoints/BaseRequest`, `.../DuplicateException`) and, in the rare
+  case that is still not unique, the community id. Non-colliding names are left
+  bare. Tests: `subsystems_clustering_disambiguates_colliding_directory_names`,
+  `subsystems_clustering_leaves_unique_names_unqualified`.
+- **`nav_map` no longer lists empty controller classes as entrypoints.** A class
+  becomes an entrypoint via a type-level signal (`extends ControllerBase`,
+  `[ApiController]`), but a controller with no action methods serves no routes —
+  eShopOnWeb's `BaseApiController` (an empty `{ }` body commented "No longer
+  used") was surfaced purely on its base class, bloating the highest-priority
+  section. `entrypoints::detect` now gates class candidates on owning at least
+  one method (a method carries its class name in `owner_type`). Method
+  candidates are unaffected. Test:
+  `semantic_entrypoint_empty_controller_class_is_not_an_entrypoint`.
+- **`nav_map` flows no longer duplicate overloaded handlers.** A C# MVC GET/POST
+  action pair (`EnableAuthenticator()` + `EnableAuthenticator(model)`) is two
+  distinct entities sharing one (file, symbol), so it produced two near-identical
+  flow trees that read as noise and wasted the section's small item budget. The
+  flows assembly now keeps only the largest tree per (file, symbol). On
+  eShopOnWeb the flows section went from repeated `EnableAuthenticator`/
+  `ChangePassword` entries to five distinct call trees.
+- **Call resolution no longer invents edges for object-protocol methods.** The
+  repo-wide single-definition fallback (C#/Java/Kotlin/Scala/Swift) resolved a
+  call to the sole in-repo definition of a name — but `ToString`/`Equals`/
+  `GetHashCode` (and the Java `toString`/`equals`/`hashCode`, `close`, ...) have
+  their canonical definition on the framework base class, not in the repo, so a
+  single in-repo override captured *every* such call. On eShopOnWeb every
+  `.ToString()` resolved to `ErrorDetails.ToString`, injecting a false edge into
+  flows and the call graph. `resolve::build_repo_wide_unique_index` now skips
+  these object-protocol names (an override is still reachable via the
+  type-directed pass when the receiver type is known). Verified: 0 resolved call
+  edges target any `ToString` on eShopOnWeb (was capturing all of them). Test:
+  `csharp_object_protocol_method_is_not_captured_by_repo_wide_fallback`.
+- **`nav_map` module_layers no longer starves to empty on real repos.** The
+  architectural layering view (module dependency graph + cycles) is spent last
+  in the token-budget priority order, and on any non-trivial repo the
+  higher-priority sections exhausted the whole budget before it was reached —
+  so `module_layers.edges` came back empty (`shown: 0`) on essentially every
+  mainstream repo, silently dropping the single most useful architectural
+  artifact. Found while auditing a clean-architecture ASP.NET Core API
+  (eShopOnWeb): 20 real module edges computed, 0 shown. Fixed by reserving a
+  small up-front token allotment (`MODULE_LAYERS_RESERVE_TOKENS`, capped at ¼ of
+  the total budget so a tiny `maxTokensEstimate` isn't dominated) and trimming
+  the edge list to fit that allotment plus any leftover — replacing the old
+  all-or-nothing drop. Module edges are individually tiny (two directory paths +
+  a count), so the reservation surfaces the top ~18 edges at the default budget
+  without meaningfully shrinking the other sections (eShopOnWeb: 0→18 edges,
+  total ~7.1K tokens; at `maxTokensEstimate:1000`, 6 edges still show). Edge
+  truncation is now reported honestly via `guide.truncated["module_layers.edges"]`
+  with the real surviving-edge count. Test:
+  `module_layers_edges_survive_a_tight_budget`.
+
 ### Changed
 - **`nav_map` now has a token budget (audit F1).** nav_map is injected at
   session start, so it must be fixed-cost, not proportional to repo size —
