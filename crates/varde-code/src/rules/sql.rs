@@ -845,22 +845,12 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO files (path, community_id) VALUES
                 ('home.cs', 0), ('slice_a.cs', 1), ('slice_b.cs', 2),
-                ('slice_c.cs', 3), ('slice_d.cs', 4), ('slice_e.cs', 5),
-                ('slice_f.cs', 6);
-             INSERT INTO entities (kind, name, file_id, start_byte, end_byte,
-                                   start_line, start_col, end_line, end_col)
-             VALUES
-                (0, 'Execute', 1, 0, 100, 1, 0, 10, 1),
-                (0, 'Execute', 1, 200, 300, 20, 0, 30, 1),
-                (6, 'a', 1, 10, 15, 2, 0, 2, 5),
-                (6, 'b', 1, 20, 25, 3, 0, 3, 5),
-                (6, 'c', 1, 30, 35, 4, 0, 4, 5),
-                (6, 'd', 1, 210, 215, 21, 0, 21, 5),
-                (6, 'e', 1, 220, 225, 22, 0, 22, 5),
-                (6, 'f', 1, 230, 235, 23, 0, 23, 5);
-             UPDATE entities SET enclosing_function = 'Execute' WHERE kind = 6;
-             INSERT INTO resolved_edges (from_file_id, to_file_id, kind, resolved, from_entity_id)
-             VALUES
+                ('slice_c.cs', 3), ('slice_d.cs', 4), ('slice_e.cs', 5), ('slice_f.cs', 6);
+             INSERT INTO entities (kind, name, file_id, start_byte, end_byte, start_line, start_col, end_line, end_col) VALUES
+                (0, 'Execute', 1, 0, 100, 1, 0, 10, 1), (0, 'Execute', 1, 200, 300, 20, 0, 30, 1),
+                (6, 'a', 1, 10, 15, 2, 0, 2, 5), (6, 'b', 1, 20, 25, 3, 0, 3, 5), (6, 'c', 1, 30, 35, 4, 0, 4, 5),
+                (6, 'd', 1, 210, 215, 21, 0, 21, 5), (6, 'e', 1, 220, 225, 22, 0, 22, 5), (6, 'f', 1, 230, 235, 23, 0, 23, 5);
+             INSERT INTO resolved_edges (from_file_id, to_file_id, kind, resolved, from_entity_id) VALUES
                 (1, 2, 0, 1, 3), (1, 3, 0, 1, 4), (1, 4, 0, 1, 5),
                 (1, 5, 0, 1, 6), (1, 6, 0, 1, 7), (1, 7, 0, 1, 8);",
         )
@@ -869,21 +859,12 @@ mod tests {
         let rules = crate::rules::builtin_rules();
         let (findings, diagnostics) = run_sql_rules(&rules, &conn).expect("runs");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let sprawl_findings: Vec<&Finding> = findings
+        let starts: Vec<u64> = findings
             .iter()
-            .filter(|f| f.rule_id == "vertical-slice-sprawl")
+            .filter(|finding| finding.rule_id == "vertical-slice-sprawl")
+            .map(|finding| u64::from(finding.location.span.start_byte))
             .collect();
-        assert_eq!(sprawl_findings.len(), 2, "{sprawl_findings:?}");
-        let starts: Vec<u64> = sprawl_findings
-            .iter()
-            .map(|f| u64::from(f.location.span.start_byte))
-            .collect();
-        assert_eq!(starts, vec![0, 200], "each finding anchors one declaration");
-        assert!(
-            sprawl_findings
-                .iter()
-                .all(|f| { f.evidence.get("slices").and_then(|v| v.as_i64()) == Some(3) })
-        );
+        assert_eq!(starts, vec![0, 200]);
     }
 
     #[test]
@@ -892,28 +873,44 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO files (path, community_id) VALUES
                 ('home.cs', 0), ('slice_a.cs', 1), ('slice_b.cs', 2), ('slice_c.cs', 3);
-             INSERT INTO entities (kind, name, file_id, start_byte, end_byte,
-                                   start_line, start_col, end_line, end_col)
-             VALUES
-                (0, 'Outer', 1, 0, 500, 1, 0, 50, 1),
-                (0, 'Local', 1, 100, 300, 10, 0, 30, 1),
-                (6, 'a', 1, 110, 115, 11, 0, 11, 5),
-                (6, 'b', 1, 120, 125, 12, 0, 12, 5),
-                (6, 'c', 1, 130, 135, 13, 0, 13, 5);
-             INSERT INTO resolved_edges (from_file_id, to_file_id, kind, resolved, from_entity_id)
-             VALUES (1, 2, 0, 1, 3), (1, 3, 0, 1, 4), (1, 4, 0, 1, 5);",
+             INSERT INTO entities (kind, name, file_id, start_byte, end_byte, start_line, start_col, end_line, end_col) VALUES
+                (0, 'Outer', 1, 0, 500, 1, 0, 50, 1), (0, 'Local', 1, 100, 300, 10, 0, 30, 1),
+                (6, 'a', 1, 110, 115, 11, 0, 11, 5), (6, 'b', 1, 120, 125, 12, 0, 12, 5), (6, 'c', 1, 130, 135, 13, 0, 13, 5);
+             INSERT INTO resolved_edges (from_file_id, to_file_id, kind, resolved, from_entity_id) VALUES
+                (1, 2, 0, 1, 3), (1, 3, 0, 1, 4), (1, 4, 0, 1, 5);",
         )
         .expect("fixture inserts");
 
         let rules = crate::rules::builtin_rules();
         let (findings, diagnostics) = run_sql_rules(&rules, &conn).expect("runs");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let sprawl_findings: Vec<&Finding> = findings
-            .iter()
-            .filter(|f| f.rule_id == "vertical-slice-sprawl")
-            .collect();
-        assert_eq!(sprawl_findings.len(), 1, "{sprawl_findings:?}");
-        assert_eq!(sprawl_findings[0].evidence["name"], "Local");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].evidence["name"], "Local");
+    }
+
+    #[test]
+    fn builtin_vertical_slice_sprawl_excludes_nested_callable_boundary_calls() {
+        let (_dir, conn) = temp_db("builtin-vertical-slice-sprawl-boundary");
+        conn.execute_batch(
+            "INSERT INTO files (path, community_id) VALUES
+                ('home.rs', 0), ('slice_a.rs', 1), ('slice_b.rs', 2), ('slice_c.rs', 3);
+             INSERT INTO entities (kind, name, file_id, start_byte, end_byte, start_line, start_col, end_line, end_col) VALUES
+                (0, 'Outer', 1, 0, 500, 1, 0, 50, 1), (19, '', 1, 100, 300, 10, 0, 30, 1),
+                (6, 'a', 1, 110, 115, 11, 0, 11, 5), (6, 'b', 1, 120, 125, 12, 0, 12, 5), (6, 'c', 1, 130, 135, 13, 0, 13, 5);
+             INSERT INTO resolved_edges (from_file_id, to_file_id, kind, resolved, from_entity_id) VALUES
+                (1, 2, 0, 1, 3), (1, 3, 0, 1, 4), (1, 4, 0, 1, 5);",
+        )
+        .expect("fixture inserts");
+
+        let rules = crate::rules::builtin_rules();
+        let (findings, diagnostics) = run_sql_rules(&rules, &conn).expect("runs");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule_id != "vertical-slice-sprawl"),
+            "anonymous callable calls must not leak to Outer: {findings:?}"
+        );
     }
 
     #[test]

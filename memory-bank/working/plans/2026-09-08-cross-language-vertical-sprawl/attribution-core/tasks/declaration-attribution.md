@@ -1,8 +1,8 @@
 ---
 type: task
 parent: 2026-09-08-cross-language-vertical-sprawl/attribution-core
-status: backlog
-verified: pending
+status: done
+verified: passed
 depends_on:
   - callable-boundaries
 modifies:
@@ -31,3 +31,4 @@ Cherry-pick commits `a93866e` and `5c69763`. Extend rule exclusion to nested cal
 
 #### Progress
 
+- Imported declaration attribution and excluded callable boundaries.
