@@ -73,7 +73,7 @@ Each takes `--json '<object>'`; fields shown are in addition to
 | `find_imports` | `filePath` | Resolved import edges of a file |
 | `type_hierarchy` | `name?`, `filePath?` | Type hierarchy (extends/implements) |
 | `filter_symbols` | `kind?`, `tags?`, `language?`, `file?`, ... | Filter symbols by kind/tags/language/etc. |
-| `find_pattern` | `pattern`, `file?`, `path?`, `language?`, `inside?`, `has?`, `precedes?`, `follows?` | Find AST nodes matching a `$VAR`/`$$$VAR` pattern, optionally `$VAR:kind`-constrained and filtered by `{kind}` ancestor/descendant/sibling relations (live parse, no DB). Works on **every** `ast-grep`-linked grammar (not just the twenty-one indexed languages); `language` accepts `ast-grep` aliases (`c++`, `py`, `rb`, …) and is inferred from the extension for a single `file`. A directory `path` requires an explicit `language`. |
+| `find_pattern` | `pattern`, `filePath?` (`file?` alias), `path?`, `language?`, `inside?`, `has?`, `precedes?`, `follows?` | Find AST nodes matching a `$VAR`/`$$$VAR` pattern, optionally `$VAR:kind`-constrained and filtered by `{kind}` ancestor/descendant/sibling relations (live parse, no DB). Works on **every** `ast-grep`-linked grammar (not just the twenty-one indexed languages); `language` accepts `ast-grep` aliases (`c++`, `py`, `rb`, …) and is inferred from the extension for a single `filePath`. A directory `path` requires an explicit `language`. |
 
 ## Scan / rules
 

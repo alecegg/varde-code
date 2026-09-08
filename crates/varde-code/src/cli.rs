@@ -226,7 +226,7 @@ pub enum Command {
     /// (see `find_pattern` help for inputs)
     #[command(name = "find_pattern")]
     FindPattern {
-        /// JSON object: { repoRoot|dbPath, pattern, file?, language? }
+        /// JSON object: { repoRoot|dbPath, pattern, filePath? (or file?), language? }
         #[arg(long)]
         json: String,
     },
