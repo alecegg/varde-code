@@ -47,6 +47,8 @@ pub const FUNCTION_SCOPES: &[&str] = &[
     "function_declaration",
     "init_declaration",
     "protocol_function_declaration",
+    "computed_getter",
+    "computed_setter",
 ];
 
 /// Entity kinds the fixtures must produce (all 14 expressible in Swift).
@@ -97,8 +99,12 @@ pub fn visit(
         }
 
         // ---- structural ----
-        "function_declaration" | "init_declaration" | "protocol_function_declaration" => {
-            let name = field_name(node).unwrap_or_default();
+        "function_declaration"
+        | "init_declaration"
+        | "protocol_function_declaration"
+        | "computed_getter"
+        | "computed_setter" => {
+            let name = function_scope_name(node).unwrap_or_default();
             ctx.push(EntityKind::Function, name.clone(), node);
             maybe_export(node, &name, ctx);
         }
@@ -314,6 +320,28 @@ fn member_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<St
         .map(|n| n.text().into_owned())
 }
 
+/// Stable display and scope name for a Swift callable node.
+///
+/// Accessors only name their operation. Prefix the enclosing property or
+/// subscript so unrelated accessors do not share a diagnostic label.
+pub fn function_scope_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    if !matches!(node.kind().as_ref(), "computed_getter" | "computed_setter") {
+        return field_name(node);
+    }
+    let declaration = node.parent()?.parent()?;
+    let owner = match declaration.kind().as_ref() {
+        "property_declaration" => field_name(&declaration)?,
+        "subscript_declaration" => "subscript".to_string(),
+        _ => return None,
+    };
+    let operation = if node.kind() == "computed_getter" {
+        "get"
+    } else {
+        "set"
+    };
+    Some(format!("{owner}.{operation}"))
+}
+
 /// Walk a navigation chain down to its base identifier (`app.get` -> "app",
 /// `res.send` -> "res").
 fn base_identifier(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
@@ -491,5 +519,34 @@ mod tests {
             .collect();
         assert_eq!(implements.len(), 1, "entities: {entities:?}");
         assert_eq!(implements[0].name, "Collection");
+    }
+
+    #[test]
+    fn computed_property_and_subscript_accessors_are_named_functions() {
+        let src = "struct Settings {\n  var value: Int {\n    get { loadValue() }\n    set { saveValue(newValue) }\n  }\n  subscript(index: Int) -> Int {\n    get { loadEntry(index) }\n    set { saveEntry(index, newValue) }\n  }\n}\n";
+        let parsed = parse_source(&SupportLang::Swift, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        for (name, call_name) in [
+            ("value.get", "loadValue"),
+            ("value.set", "saveValue"),
+            ("subscript.get", "loadEntry"),
+            ("subscript.set", "saveEntry"),
+        ] {
+            let function = entities
+                .iter()
+                .find(|e| e.kind == EntityKind::Function && e.name == name)
+                .unwrap_or_else(|| panic!("missing {name}: {entities:?}"));
+            let call = entities
+                .iter()
+                .find(|e| e.kind == EntityKind::Call && e.name == call_name)
+                .unwrap_or_else(|| panic!("missing {call_name}: {entities:?}"));
+            assert!(
+                function.span.start_byte <= call.span.start_byte
+                    && function.span.end_byte >= call.span.end_byte,
+                "{name} must contain {call_name}: {entities:?}"
+            );
+        }
     }
 }

@@ -1,8 +1,8 @@
 ---
 type: task
 parent: 2026-09-08-cross-language-vertical-sprawl/jvm-swift-callables
-status: backlog
-verified: pending
+status: done
+verified: passed
 depends_on:
   - kotlin-accessors
 modifies:
@@ -25,3 +25,4 @@ Emit Functions for Swift computed-property and subscript accessors.
 
 #### Progress
 
+- Emitted named Functions for computed-property and subscript accessors.

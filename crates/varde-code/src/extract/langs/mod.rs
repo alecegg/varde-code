@@ -224,6 +224,7 @@ pub fn function_scope_name(
     match lang {
         SupportLang::CSharp => cs::function_scope_name(node),
         SupportLang::Kotlin => kotlin::function_scope_name(node),
+        SupportLang::Swift => swift::function_scope_name(node),
         _ => crate::extract::field_name(node),
     }
 }
