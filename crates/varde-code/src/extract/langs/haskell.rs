@@ -177,6 +177,7 @@ pub fn visit(
                 node,
             );
         }
+        "lambda" => ctx.push_callable_boundary(node),
 
         // ---- structural: types & typeclasses ----
         "data_type" | "newtype" | "type_synomym" => {
@@ -521,5 +522,17 @@ mod tests {
         assert!(find(&es, EntityKind::Literal, "2.5").is_some(), "{es:?}");
         assert!(find(&es, EntityKind::Literal, "\"hi\"").is_some(), "{es:?}");
         assert!(find(&es, EntityKind::Literal, "'c'").is_some(), "{es:?}");
+    }
+
+    #[test]
+    fn lambdas_are_callable_boundaries() {
+        let es = entities("outer :: Int -> Int\nouter x = (\\y -> remote y) x\n");
+        assert_eq!(
+            es.iter()
+                .filter(|e| e.kind == EntityKind::CallableBoundary)
+                .count(),
+            1,
+            "entities: {es:?}"
+        );
     }
 }

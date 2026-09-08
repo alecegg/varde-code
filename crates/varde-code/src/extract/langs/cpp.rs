@@ -87,6 +87,7 @@ pub fn visit(node: &Node<'_>, kind: &str, ctx: &mut ExtractCtx) {
                 ctx.push(EntityKind::Function, name, node);
             }
         }
+        "lambda_expression" => ctx.push_callable_boundary(node),
         "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
             if let Some(name) = node
                 .field("name")
@@ -412,5 +413,17 @@ mod tests {
         let lits = names(&e, EntityKind::Literal);
         assert!(lits.iter().any(|l| l == "true"));
         assert!(lits.iter().any(|l| l == "3.14"));
+    }
+
+    #[test]
+    fn lambdas_are_callable_boundaries() {
+        let e = extract("void outer() { auto callback = [] { remote(); }; }\n");
+        assert_eq!(
+            e.iter()
+                .filter(|e| e.kind == EntityKind::CallableBoundary)
+                .count(),
+            1,
+            "entities: {e:?}"
+        );
     }
 }

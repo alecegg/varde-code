@@ -1,8 +1,8 @@
 ---
 type: task
 parent: 2026-09-08-cross-language-vertical-sprawl/native-functional-closures
-status: backlog
-verified: pending
+status: done
+verified: passed
 depends_on: []
 modifies:
   - crates/varde-code/src/extract/langs/go.rs
@@ -35,3 +35,10 @@ Emit CallableBoundary entities for Go literals, Rust closures, C++ lambdas, Pyth
 
 #### Progress
 
+Completed 2026-09-08.
+
+- Emitted anonymous callable boundaries for Go literals, Rust closures,
+  C++ lambdas, Python lambdas, and Haskell lambdas.
+- Corrected Go's stale `function_literal` scope spelling. The grammar uses
+  `func_literal`; anonymous literals stay outside named scope attribution.
+- Passed focused language tests and `vertical_slice_sprawl` tests.

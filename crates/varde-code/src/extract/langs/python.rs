@@ -137,6 +137,7 @@ pub fn visit(
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Function, name, node);
         }
+        "lambda" if node.is_named() => ctx.push_callable_boundary(node),
         "class_definition" => {
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Class, name.clone(), node);
@@ -637,6 +638,24 @@ mod tests {
         assert_eq!(
             helper.owner_type, None,
             "module-level function has no owning type: {entities:?}"
+        );
+    }
+
+    #[test]
+    fn lambdas_are_callable_boundaries() {
+        let parsed = parse_source(
+            &SupportLang::Python,
+            "def outer():\n    callback = lambda: remote()\n",
+        );
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+        assert_eq!(
+            entities
+                .iter()
+                .filter(|e| e.kind == EntityKind::CallableBoundary)
+                .count(),
+            1,
+            "entities: {entities:?}"
         );
     }
 }
