@@ -107,6 +107,7 @@ pub fn visit(
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Function, name, node);
         }
+        "lambda_expression" => ctx.push_callable_boundary(node),
         "class_definition" | "object_definition" => {
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Class, name.clone(), node);
@@ -479,5 +480,17 @@ mod tests {
         let es = entities("object O {\n  val a = 42\n  val b = \"hi\"\n  val c = true\n}\n");
         assert!(find(&es, EntityKind::Literal, "42").is_some(), "{es:?}");
         assert!(find(&es, EntityKind::Literal, "true").is_some(), "{es:?}");
+    }
+
+    #[test]
+    fn lambdas_are_callable_boundaries() {
+        let es = entities("object O { def outer(): Unit = List(1).foreach(x => remote()) }\n");
+        assert_eq!(
+            es.iter()
+                .filter(|e| e.kind == EntityKind::CallableBoundary)
+                .count(),
+            1,
+            "{es:?}"
+        );
     }
 }

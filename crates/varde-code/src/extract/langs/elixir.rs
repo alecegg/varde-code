@@ -122,6 +122,8 @@ pub fn visit(
     ctx: &mut ExtractCtx,
 ) {
     match kind {
+        "anonymous_function" => ctx.push_callable_boundary(node),
+
         // Every macro/definition/call is a `call` node — dispatch on callee.
         "call" => visit_call(node, ctx),
 
@@ -639,5 +641,19 @@ mod tests {
             .expect("route entity");
         assert_eq!(route.method.as_deref(), Some("GET"));
         assert_eq!(route.path.as_deref(), Some("/users"));
+    }
+
+    #[test]
+    fn anonymous_functions_are_callable_boundaries() {
+        let es = entities(
+            "defmodule M do\n  def outer do\n    callback = fn -> remote() end\n  end\nend\n",
+        );
+        assert_eq!(
+            es.iter()
+                .filter(|e| e.kind == EntityKind::CallableBoundary)
+                .count(),
+            1,
+            "{es:?}"
+        );
     }
 }

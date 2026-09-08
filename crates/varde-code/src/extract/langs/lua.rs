@@ -109,7 +109,12 @@ pub fn visit(
         // (audit S3: table-literal method values were all emitted blank and
         // dropped). A truly anonymous closure keeps a blank name and is filtered.
         "function_definition" => {
-            ctx.push(EntityKind::Function, function_definition_name(node), node);
+            let name = function_definition_name(node);
+            if name.is_empty() {
+                ctx.push_callable_boundary(node);
+            } else {
+                ctx.push(EntityKind::Function, name, node);
+            }
         }
 
         // ---- variables ----
@@ -381,6 +386,16 @@ mod tests {
         let es = entities("local h = function(z) return z end\n");
         assert!(find(&es, EntityKind::Function, "").is_none());
         assert!(find(&es, EntityKind::Parameter, "z").is_some());
+    }
+
+    #[test]
+    fn unnamed_function_values_are_callable_boundaries() {
+        let es = entities("pcall(function() remote() end)\n");
+        assert!(
+            es.iter()
+                .any(|e| e.kind == EntityKind::CallableBoundary && e.name.is_empty()),
+            "{es:?}"
+        );
     }
 
     #[test]

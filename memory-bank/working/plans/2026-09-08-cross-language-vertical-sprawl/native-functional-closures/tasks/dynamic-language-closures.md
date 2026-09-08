@@ -1,8 +1,8 @@
 ---
 type: task
 parent: 2026-09-08-cross-language-vertical-sprawl/native-functional-closures
-status: backlog
-verified: pending
+status: done
+verified: passed
 depends_on:
   - closure-boundaries
 modifies:
@@ -34,3 +34,11 @@ Add CallableBoundary emitters for PHP, Ruby, Lua, Scala, and Elixir grammar form
 
 #### Progress
 
+Completed 2026-09-08.
+
+- Added boundaries for PHP anonymous and arrow functions.
+- Added boundaries for Ruby blocks and do-blocks.
+- Preserved Lua functions with inferred assignment names.
+- Added boundaries for unnamed Lua function values.
+- Added boundaries for Scala lambdas and Elixir `fn` expressions.
+- Passed focused language and vertical-sprawl tests.
