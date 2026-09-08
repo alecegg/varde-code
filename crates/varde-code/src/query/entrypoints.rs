@@ -28,7 +28,7 @@ use crate::model::EntityKind;
 use super::noise_filter::{
     is_frontend_asset_path, is_generated_or_vendored_path, is_scaffold_template_path,
 };
-use super::{db_err, ApiError};
+use super::{ApiError, db_err};
 
 /// Route metadata (`method`, `path`) stamped on `Decorator` entities, keyed by
 /// the decorated declaration `(file_id, enclosing_function)` — an action

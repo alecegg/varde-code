@@ -741,8 +741,14 @@ fn render_nav_map_text(envelope: &str) -> String {
         match data.get(section) {
             Some(serde_json::Value::Array(items)) if items.is_empty() => {
                 if let Some(info) = truncated.and_then(|sections| sections.get(section)) {
-                    let total = info.get("total").and_then(|value| value.as_u64()).unwrap_or(0);
-                    let more = info.get("more").and_then(|value| value.as_str()).unwrap_or("");
+                    let total = info
+                        .get("total")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let more = info
+                        .get("more")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
                     out.push_str(&format!("(truncated: 0/{total} shown; {more})\n\n"));
                 } else {
                     out.push_str("(none)\n\n");
