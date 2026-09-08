@@ -1,8 +1,8 @@
 ---
 type: task
 parent: 2026-09-08-cross-language-vertical-sprawl/web-callables
-status: backlog
-verified: pending
+status: done
+verified: passed
 depends_on: []
 modifies:
   - crates/varde-code/src/extract/langs/javascript.rs
@@ -30,3 +30,7 @@ Emit Functions for named generators. Emit callable boundaries for anonymous func
 
 #### Progress
 
+- Added Function entities for named generators.
+- Added anonymous callable boundaries for closures and arrows.
+- Kept callable boundaries through blank-name filtering.
+- Verified JavaScript, TypeScript, TSX, and sprawl tests.

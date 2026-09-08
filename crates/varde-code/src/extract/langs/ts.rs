@@ -46,7 +46,10 @@ pub fn visit(
 ) {
     match kind {
         // ---- structural kinds ----
-        "function_declaration" => push_named(node, EntityKind::Function, ctx),
+        "function_declaration" | "generator_function_declaration" => {
+            push_named(node, EntityKind::Function, ctx)
+        }
+        "function_expression" | "arrow_function" => ctx.push_callable_boundary(node),
         "class_declaration" => {
             let name = field_name(node).unwrap_or_default();
             push_named(node, EntityKind::Class, ctx);
@@ -565,6 +568,36 @@ mod tests {
             .collect();
         assert_eq!(implements.len(), 1, "entities: {entities:?}");
         assert_eq!(implements[0].name, "Comparable");
+    }
+
+    #[test]
+    fn generator_declarations_and_closures_have_callable_entities() {
+        let src = r#"
+            function* entries(): Iterable<string> { yield load(); }
+            function outer() {
+                const callback = () => remote();
+                queue(function () { deferred(); });
+            }
+        "#;
+        let parsed = parse_source(&SupportLang::TypeScript, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        let functions: Vec<&Entity> = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|e| e.name == "entries"),
+            "{entities:?}"
+        );
+
+        let boundaries: Vec<&Entity> = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::CallableBoundary)
+            .collect();
+        assert_eq!(boundaries.len(), 2, "{entities:?}");
+        assert!(boundaries.iter().all(|e| e.name.is_empty()));
     }
 
     #[test]

@@ -69,12 +69,16 @@ fn drop_blank_named(result: &mut ExtractResult) {
     result.symbols.retain(|s| !s.name.trim().is_empty());
 }
 
-/// True for the entity kinds whose name may legitimately be empty (control-flow
-/// and error markers named after a caught/thrown value that need not exist).
+/// True for the entity kinds whose name may legitimately be empty.
+///
+/// Callable boundaries deliberately have no queryable declaration name.
 fn kind_allows_blank_name(kind: EntityKind) -> bool {
     matches!(
         kind,
-        EntityKind::ControlFlow | EntityKind::Catch | EntityKind::Throw
+        EntityKind::CallableBoundary
+            | EntityKind::ControlFlow
+            | EntityKind::Catch
+            | EntityKind::Throw
     )
 }
 

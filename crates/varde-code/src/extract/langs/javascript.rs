@@ -58,7 +58,10 @@ pub fn visit(
 ) {
     match kind {
         // ---- structural kinds ----
-        "function_declaration" => push_named(node, EntityKind::Function, ctx),
+        "function_declaration" | "generator_function_declaration" => {
+            push_named(node, EntityKind::Function, ctx)
+        }
+        "function_expression" | "arrow_function" => ctx.push_callable_boundary(node),
         // Class methods — previously invisible to extraction; `owner_type`
         // (set from `ctx.type_scope`) links each back to its class. See ts.rs.
         "method_definition" => push_named(node, EntityKind::Function, ctx),
@@ -435,5 +438,35 @@ mod tests {
             inline.owner_type, None,
             "inline arrow handler names no resolvable function"
         );
+    }
+
+    #[test]
+    fn generator_declarations_and_closures_have_callable_entities() {
+        let src = r#"
+            function* entries() { yield load(); }
+            function outer() {
+                const callback = () => remote();
+                queue(function () { deferred(); });
+            }
+        "#;
+        let parsed = parse_source(&SupportLang::JavaScript, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        let functions: Vec<&Entity> = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|e| e.name == "entries"),
+            "{entities:?}"
+        );
+
+        let boundaries: Vec<&Entity> = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::CallableBoundary)
+            .collect();
+        assert_eq!(boundaries.len(), 2, "{entities:?}");
+        assert!(boundaries.iter().all(|e| e.name.is_empty()));
     }
 }
