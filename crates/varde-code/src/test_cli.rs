@@ -15,6 +15,8 @@ use crate::rules::test_runner::{TestResult, run_pattern_rule_tests, run_sql_rule
 use crate::rules::{Diagnostic, Rule, RuleKind};
 use std::path::Path;
 
+const RESULTS_LIMIT: usize = 100;
+
 /// Run the `test` flow for `{ rulesDir? }` and return the merged
 /// `{ results, summary, diagnostics }` payload.
 ///
@@ -57,11 +59,21 @@ pub fn run_tests(input: &serde_json::Value) -> Result<serde_json::Value, ApiErro
         })
         .collect();
 
-    Ok(serde_json::json!({
+    let total = results_json.len();
+    let mut results_json = results_json;
+    results_json.truncate(RESULTS_LIMIT);
+    let mut payload = serde_json::json!({
         "results": results_json,
         "summary": { "passed": passed, "failed": failed },
         "diagnostics": diagnostics,
-    }))
+    });
+    if total > RESULTS_LIMIT {
+        payload["guide"]["truncated"]["results"] = serde_json::json!({
+            "shown": RESULTS_LIMIT,
+            "total": total,
+        });
+    }
+    Ok(payload)
 }
 
 /// Resolve the rule set under test: `rulesDir` scopes discovery to the

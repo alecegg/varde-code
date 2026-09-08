@@ -50,8 +50,8 @@ fn unparseable_files_mixed_dir_exits_zero() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(value["diagnostics"].as_array().unwrap().len(), 3);
-    assert!(!value["entities"].as_array().unwrap().is_empty());
+    assert_eq!(value["data"]["diagnostics"].as_array().unwrap().len(), 3);
+    assert!(!value["data"]["entities"].as_array().unwrap().is_empty());
 }
 
 #[test]

@@ -195,7 +195,7 @@ fn unwritable_output_emits_error_envelope_and_exits_nonzero() {
     assert!(!out.status.success(), "unwritable output → non-zero exit");
     let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("envelope JSON");
     assert_eq!(payload["ok"], false);
-    assert!(payload["error"]["code"].as_str().is_some());
+    assert!(payload["data"]["error"]["code"].as_str().is_some());
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&repo);
 }

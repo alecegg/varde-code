@@ -16,6 +16,8 @@ use crate::rules::rewrite::{RewriteStatus, RewriteTarget};
 use std::collections::HashMap;
 use std::path::Path;
 
+const FINDINGS_LIMIT: usize = 100;
+
 /// Required `repoRoot` from the input, validated to be an existing directory.
 /// Shared by the rule-pack management endpoints (`rules_list`/`rules_seed`/
 /// `rules_remove`), which all take the same `{ repoRoot }` shape before doing
@@ -253,7 +255,54 @@ pub fn scan_repo(input: &serde_json::Value) -> Result<serde_json::Value, ApiErro
     //    the JSON never affects splicing.
     crate::query::output::postprocess(&mut payload, input);
 
+    truncate_findings(&mut payload);
+
     Ok(payload)
+}
+
+fn truncate_findings(payload: &mut serde_json::Value) {
+    let findings = payload["findings"].as_array_mut().expect("findings array");
+    let total = findings.len();
+    if total <= FINDINGS_LIMIT {
+        return;
+    }
+    findings.truncate(FINDINGS_LIMIT);
+    payload["guide"]["truncated"]["findings"] = serde_json::json!({
+        "shown": FINDINGS_LIMIT,
+        "total": total,
+    });
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::{FINDINGS_LIMIT, truncate_findings};
+
+    #[test]
+    fn findings_are_bounded_with_explicit_navigation_metadata() {
+        let findings: Vec<_> = (0..=FINDINGS_LIMIT)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("finding-{index}"),
+                    "location": {
+                        "file": format!("src/{index}.rs"),
+                        "span": { "start_line": index + 1, "end_line": index + 1 },
+                    },
+                })
+            })
+            .collect();
+        let mut payload = serde_json::json!({ "findings": findings });
+
+        truncate_findings(&mut payload);
+
+        let findings = payload["findings"].as_array().expect("findings array");
+        assert_eq!(findings.len(), FINDINGS_LIMIT);
+        assert_eq!(findings[0]["id"], "finding-0");
+        assert_eq!(findings[0]["location"]["span"]["start_line"], 1);
+        assert_eq!(
+            payload["guide"]["truncated"]["findings"],
+            serde_json::json!({ "shown": FINDINGS_LIMIT, "total": FINDINGS_LIMIT + 1 }),
+        );
+    }
 }
 
 /// The `rule_id` whose findings are collapsed one-per-band by

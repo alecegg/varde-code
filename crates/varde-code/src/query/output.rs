@@ -1,6 +1,6 @@
 //! Output post-processing applied at the single query/scan serialization
 //! boundary, after a mode has produced its payload but before it becomes the
-//! `{ok, data}` envelope.
+//! `{ok, data, meta}` envelope.
 //!
 //! Two token-efficiency transforms (audit F5 + F6), both keyed off the mode's
 //! own input object so no signature threading is needed:
@@ -10,10 +10,9 @@
 //!   literally `{repoRoot}{sep}{relative}` (walkdir preserves the exact root
 //!   prefix). So every emitted path re-states the absolute prefix (~200×/nav_map).
 //!   We strip that prefix from every string value in the payload, turning
-//!   `/abs/repo/src/main.rs` into `src/main.rs`. Prefix-matching (not a key
-//!   allowlist) so bare path strings inside arrays are caught too, and values
-//!   outside the repo (e.g. the `~/.config/.../index.db` `dbPath`) are left
-//!   untouched because they don't carry the prefix. Round-trips: query inputs
+//!   `/abs/repo/src/main.rs` into `src/main.rs`. Only known repository-path
+//!   fields are transformed, so source text and external paths stay verbatim.
+//!   Round-trips: query inputs
 //!   resolve a relative `filePath` against the stored path via a suffix match
 //!   (`simple::file_id`), so a relative path fed back in still matches.
 //!   Opt out with `absolutePaths: true`.
@@ -28,21 +27,48 @@
 //! Both transforms are idempotent, so the double pass a `batch` payload sees
 //! (once per sub-call, once for the aggregate) is harmless.
 
+use serde::Serialize;
 use serde_json::Value;
 
+/// Machine-output metadata supplied with every envelope.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct OutputMeta {
+    /// Whether the compact path/span output policy was applied.
+    pub compact: bool,
+    /// Whether a mode reported omitted results.
+    pub truncated: bool,
+}
+
+/// Render a result with the output policy derived from its input.
+///
+/// Errors have no payload to compact, so they retain default metadata. This
+/// avoids reporting a policy that could not have run.
+pub fn render_with_input(result: Result<Value, super::ApiError>, input: &Value) -> String {
+    match result {
+        Ok(mut data) => {
+            let meta = postprocess(&mut data, input);
+            super::render_with_meta(Ok(data), meta)
+        }
+        Err(error) => super::render_with_meta(Err(error), OutputMeta::default()),
+    }
+}
+
 /// Apply the F5 (relativize) and F6 (span trim) transforms to a mode payload
-/// in place, reading the opt-out/opt-in flags and `repoRoot` from `input`.
-pub(crate) fn postprocess(data: &mut Value, input: &Value) {
+/// in place, reading the opt-out/opt-in flags and path root from `input`.
+pub(crate) fn postprocess(data: &mut Value, input: &Value) -> OutputMeta {
     let keep_absolute = input
         .get("absolutePaths")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if !keep_absolute && let Some(root) = input.get("repoRoot").and_then(Value::as_str) {
-        let root = root.trim_end_matches(std::path::MAIN_SEPARATOR);
-        if !root.is_empty() {
-            let prefix = format!("{root}{}", std::path::MAIN_SEPARATOR);
-            relativize(data, &prefix);
-        }
+    let root = input
+        .get("repoRoot")
+        .or_else(|| input.get("rulesDir"))
+        .and_then(Value::as_str)
+        .map(|root| root.trim_end_matches(std::path::MAIN_SEPARATOR))
+        .filter(|root| !root.is_empty());
+    if !keep_absolute && let Some(root) = root {
+        let prefix = format!("{root}{}", std::path::MAIN_SEPARATOR);
+        relativize(data, &prefix);
     }
 
     let keep_span_detail = input
@@ -52,18 +78,75 @@ pub(crate) fn postprocess(data: &mut Value, input: &Value) {
     if !keep_span_detail {
         trim_spans(data);
     }
+
+    OutputMeta {
+        compact: root.is_some() && (!keep_absolute || !keep_span_detail),
+        truncated: is_truncated(data),
+    }
 }
 
-/// Strip `prefix` from the front of every string value in the tree.
+fn is_truncated(data: &Value) -> bool {
+    data.pointer("/guide/truncated")
+        .and_then(Value::as_object)
+        .is_some_and(|sections| !sections.is_empty())
+        || data.as_array().is_some_and(|results| {
+            results.iter().any(|result| {
+                result
+                    .pointer("/meta/truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+        })
+}
+
+/// Strip `prefix` from known repository-path fields only.
 fn relativize(v: &mut Value, prefix: &str) {
     match v {
-        Value::String(s) => {
-            if let Some(rest) = s.strip_prefix(prefix) {
-                *s = rest.to_string();
+        Value::Array(items) => items.iter_mut().for_each(|item| relativize(item, prefix)),
+        Value::Object(map) => {
+            for (key, value) in map {
+                if is_repo_path_field(key) {
+                    relativize_path(value, prefix);
+                }
+                relativize(value, prefix);
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(|x| relativize(x, prefix)),
-        Value::Object(map) => map.values_mut().for_each(|x| relativize(x, prefix)),
+        _ => {}
+    }
+}
+
+fn is_repo_path_field(field: &str) -> bool {
+    matches!(
+        field,
+        "file"
+            | "filePath"
+            | "sourceFile"
+            | "targetFile"
+            | "coversFile"
+            | "path"
+            | "files"
+            | "seedFiles"
+            | "targetDir"
+            | "changedFiles"
+            | "changedFilesSample"
+            | "reachable"
+            | "readingOrder"
+            | "members"
+            | "from"
+            | "to"
+    )
+}
+
+fn relativize_path(v: &mut Value, prefix: &str) {
+    match v {
+        Value::String(path) => {
+            if let Some(relative) = path.strip_prefix(prefix) {
+                *path = relative.to_string();
+            }
+        }
+        Value::Array(paths) => paths
+            .iter_mut()
+            .for_each(|path| relativize_path(path, prefix)),
         _ => {}
     }
 }
@@ -114,9 +197,10 @@ mod tests {
                 }
             },
             "dbPath": format!("{s}home{s}u{s}.config{s}index.db", s = sep()),
+            "source": format!("{root}{s}this is source text", s = sep()),
         });
 
-        postprocess(&mut data, &input);
+        let meta = postprocess(&mut data, &input);
 
         // F5: repo paths are relative; the out-of-repo dbPath is untouched.
         assert_eq!(data["file"], "src/main.rs".replace('/', &sep().to_string()));
@@ -128,6 +212,12 @@ mod tests {
             data["dbPath"],
             format!("{s}home{s}u{s}.config{s}index.db", s = sep())
         );
+        assert_eq!(
+            data["source"],
+            format!("{root}{s}this is source text", s = sep())
+        );
+        assert!(meta.compact);
+        assert!(!meta.truncated);
 
         // F6: byte/col dropped, line pair kept.
         let span = &data["location"]["span"];
@@ -169,6 +259,30 @@ mod tests {
         let once = data.clone();
         postprocess(&mut data, &input);
         assert_eq!(data, once);
+    }
+
+    #[test]
+    fn reports_nav_map_truncation_in_metadata() {
+        let input = json!({});
+        let mut data = json!({
+            "guide": { "truncated": { "symbols": { "shown": 1, "total": 2 } } }
+        });
+
+        let meta = postprocess(&mut data, &input);
+
+        assert!(meta.truncated);
+    }
+
+    #[test]
+    fn reports_batch_child_truncation_in_metadata() {
+        let input = json!({});
+        let mut data = json!([
+            { "mode": "find_pattern", "meta": { "truncated": true } }
+        ]);
+
+        let meta = postprocess(&mut data, &input);
+
+        assert!(meta.truncated);
     }
 
     #[test]

@@ -17,7 +17,7 @@ fn main() {
             repo_root,
             force,
             changed_files,
-        } => run_build(&repo_root, force, changed_files),
+        } => std::process::exit(run_build(&repo_root, force, changed_files)),
         Command::Batch { json } => run_query("batch", &json),
         Command::SymbolsInFile { json } => run_query("symbols_in_file", &json),
         Command::SymbolsInFiles { json } => run_query("symbols_in_files", &json),
@@ -145,12 +145,8 @@ fn run_scan(json: &str, apply: bool, force: bool) -> i32 {
         value["force"] = serde_json::json!(true);
     }
 
-    let result = varde_code::scan_cli::scan_repo(&value)
-        .map(|payload| serde_json::json!({ "ok": true, "data": payload }));
-    let envelope = match result {
-        Ok(envelope) => envelope.to_string(),
-        Err(err) => varde_code::query::render(Err(err)),
-    };
+    let (envelope, payload) =
+        render_with_truncation_meta(varde_code::scan_cli::scan_repo(&value), &value);
 
     if let Some(path) = value.get("output").and_then(|o| o.as_str()) {
         if let Err(e) = std::fs::write(path, &envelope) {
@@ -167,15 +163,6 @@ fn run_scan(json: &str, apply: bool, force: bool) -> i32 {
         println!("{envelope}");
     }
 
-    // Compute the exit code from the emitted payload: re-parse the envelope
-    // (already valid JSON — we just serialized it) and compare severities.
-    let payload: serde_json::Value = match serde_json::from_str(&envelope) {
-        Ok(payload) => payload,
-        Err(err) => {
-            eprintln!("varde-code: internal error re-parsing result envelope: {err}");
-            return 2;
-        }
-    };
     if payload["ok"] == true {
         let threshold = varde_code::scan_cli::severity_threshold(&value)
             .unwrap_or(varde_code::rules::Severity::Error);
@@ -214,27 +201,34 @@ fn run_test(json: &str) -> i32 {
         }
     };
 
-    let result = varde_code::test_cli::run_tests(&value)
-        .map(|payload| serde_json::json!({ "ok": true, "data": payload }));
-    let envelope = match result {
-        Ok(envelope) => envelope.to_string(),
-        Err(err) => varde_code::query::render(Err(err)),
-    };
+    let (envelope, payload) =
+        render_with_truncation_meta(varde_code::test_cli::run_tests(&value), &value);
     println!("{envelope}");
-
-    let payload: serde_json::Value = match serde_json::from_str(&envelope) {
-        Ok(payload) => payload,
-        Err(err) => {
-            eprintln!("varde-code: internal error re-parsing result envelope: {err}");
-            return 2;
-        }
-    };
     if payload["ok"] == true {
         let failed = payload["data"]["summary"]["failed"].as_u64().unwrap_or(0);
         if failed == 0 { 0 } else { 1 }
     } else {
         1
     }
+}
+
+/// Render a machine result and surface producer-reported list truncation in
+/// the common envelope metadata.
+fn render_with_truncation_meta(
+    result: Result<serde_json::Value, varde_code::query::ApiError>,
+    input: &serde_json::Value,
+) -> (String, serde_json::Value) {
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&varde_code::query::output::render_with_input(result, input))
+            .expect("query renderer produces JSON");
+    if payload
+        .pointer("/data/guide/truncated")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|sections| !sections.is_empty())
+    {
+        payload["meta"]["truncated"] = serde_json::json!(true);
+    }
+    (payload.to_string(), payload)
 }
 
 /// Resolve the watch list (explicit `--repo`s + optional config file, or
@@ -248,13 +242,21 @@ fn run_test(json: &str) -> i32 {
 fn run_watch(repos: &[String], config_path: Option<&str>, debounce_ms: u64) -> i32 {
     let resolved = match resolve_watch_repos(repos, config_path) {
         Ok(resolved) => resolved,
-        Err(code) => return code,
+        Err(err) => {
+            println!("{}", varde_code::query::render(Err(err)));
+            return 1;
+        }
     };
 
     match varde_code::watch::run(&resolved, std::time::Duration::from_millis(debounce_ms)) {
         Ok(()) => 0,
         Err(err) => {
-            eprintln!("varde-code watch: {err:#}");
+            println!(
+                "{}",
+                varde_code::query::render(Err::<serde_json::Value, _>(
+                    varde_code::query::ApiError::new("watch_error", err.to_string())
+                ))
+            );
             1
         }
     }
@@ -268,13 +270,15 @@ fn run_watch(repos: &[String], config_path: Option<&str>, debounce_ms: u64) -> i
 fn resolve_watch_repos(
     repos: &[String],
     config_path: Option<&str>,
-) -> Result<Vec<std::path::PathBuf>, i32> {
+) -> Result<Vec<std::path::PathBuf>, varde_code::query::ApiError> {
     let config = match config_path {
         Some(path) => match varde_code::watch::WatchConfig::load(std::path::Path::new(path)) {
             Ok(config) => Some(config),
             Err(err) => {
-                eprintln!("varde-code watch: {err:#}");
-                return Err(1);
+                return Err(varde_code::query::ApiError::new(
+                    "invalid_input",
+                    err.to_string(),
+                ));
             }
         },
         None => {
@@ -283,8 +287,10 @@ fn resolve_watch_repos(
                 match varde_code::watch::WatchConfig::load(&default_path) {
                     Ok(config) => Some(config),
                     Err(err) => {
-                        eprintln!("varde-code watch: {err:#}");
-                        return Err(1);
+                        return Err(varde_code::query::ApiError::new(
+                            "invalid_input",
+                            err.to_string(),
+                        ));
                     }
                 }
             } else {
@@ -293,10 +299,8 @@ fn resolve_watch_repos(
         }
     };
 
-    varde_code::watch::resolve_repos(repos, config.as_ref()).map_err(|err| {
-        eprintln!("varde-code watch: {err:#}");
-        1
-    })
+    varde_code::watch::resolve_repos(repos, config.as_ref())
+        .map_err(|err| varde_code::query::ApiError::new("invalid_input", err.to_string()))
 }
 
 /// `varde-code watch --list`: print every watcher instance (live or
@@ -307,12 +311,19 @@ fn run_watch_list() -> i32 {
         Ok(instances) => {
             println!(
                 "{}",
-                serde_json::to_string(&instances).unwrap_or_else(|_| "[]".to_string())
+                varde_code::query::render(serde_json::to_value(instances).map_err(|err| {
+                    varde_code::query::ApiError::new("serialization_error", err.to_string())
+                }))
             );
             0
         }
         Err(err) => {
-            eprintln!("varde-code watch --list: {err:#}");
+            println!(
+                "{}",
+                varde_code::query::render(Err::<serde_json::Value, _>(
+                    varde_code::query::ApiError::new("watch_error", err.to_string())
+                ))
+            );
             1
         }
     }
@@ -324,18 +335,28 @@ fn run_watch_list() -> i32 {
 fn run_watch_stop(repos: &[String], config_path: Option<&str>) -> i32 {
     let resolved = match resolve_watch_repos(repos, config_path) {
         Ok(resolved) => resolved,
-        Err(code) => return code,
+        Err(err) => {
+            println!("{}", varde_code::query::render(Err(err)));
+            return 1;
+        }
     };
     match varde_code::watch::stop(&resolved) {
         Ok(outcome) => {
             println!(
                 "{}",
-                serde_json::to_string(&outcome).unwrap_or_else(|_| "{}".to_string())
+                varde_code::query::render(serde_json::to_value(outcome).map_err(|err| {
+                    varde_code::query::ApiError::new("serialization_error", err.to_string())
+                }))
             );
             0
         }
         Err(err) => {
-            eprintln!("varde-code watch --stop: {err:#}");
+            println!(
+                "{}",
+                varde_code::query::render(Err::<serde_json::Value, _>(
+                    varde_code::query::ApiError::new("watch_error", err.to_string())
+                ))
+            );
             1
         }
     }
@@ -349,12 +370,19 @@ fn run_watch_stop_all() -> i32 {
         Ok(outcomes) => {
             println!(
                 "{}",
-                serde_json::to_string(&outcomes).unwrap_or_else(|_| "[]".to_string())
+                varde_code::query::render(serde_json::to_value(outcomes).map_err(|err| {
+                    varde_code::query::ApiError::new("serialization_error", err.to_string())
+                }))
             );
             0
         }
         Err(err) => {
-            eprintln!("varde-code watch --stop-all: {err:#}");
+            println!(
+                "{}",
+                varde_code::query::render(Err::<serde_json::Value, _>(
+                    varde_code::query::ApiError::new("watch_error", err.to_string())
+                ))
+            );
             1
         }
     }
@@ -379,7 +407,10 @@ fn run_rules_list(json: &str) {
     };
     println!(
         "{}",
-        varde_code::query::render(varde_code::scan_cli::rules_list(&value))
+        varde_code::query::output::render_with_input(
+            varde_code::scan_cli::rules_list(&value),
+            &value
+        )
     );
 }
 
@@ -402,7 +433,10 @@ fn run_rules_seed(json: &str, user: bool, force: bool) {
     };
     println!(
         "{}",
-        varde_code::query::render(varde_code::scan_cli::rules_seed(&value, user, force))
+        varde_code::query::output::render_with_input(
+            varde_code::scan_cli::rules_seed(&value, user, force),
+            &value,
+        )
     );
 }
 
@@ -425,7 +459,10 @@ fn run_rules_remove(json: &str, user: bool, force: bool) {
     };
     println!(
         "{}",
-        varde_code::query::render(varde_code::scan_cli::rules_remove(&value, user, force))
+        varde_code::query::output::render_with_input(
+            varde_code::scan_cli::rules_remove(&value, user, force),
+            &value,
+        )
     );
 }
 
@@ -1076,7 +1113,8 @@ fn init_tracing(verbose: bool) {
         .init();
 }
 
-fn run_build(repo_root: &str, force: bool, changed_files: bool) {
+fn run_build(repo_root: &str, force: bool, changed_files: bool) -> i32 {
+    let input = serde_json::json!({ "repoRoot": repo_root });
     match varde_code::build::run_with_force(repo_root, force) {
         Ok(summary) => {
             // The reparsed-path list is a drill-down handle, but on a full
@@ -1085,7 +1123,6 @@ fn run_build(repo_root: &str, force: bool, changed_files: bool) {
             // `--changed-files` opts back into the full array.
             const CHANGED_FILES_SAMPLE: usize = 10;
             let mut result = serde_json::json!({
-                "ok": true,
                 "dbPath": summary.db_path,
                 "entities": summary.entities,
                 "symbols": summary.symbols,
@@ -1102,46 +1139,67 @@ fn run_build(repo_root: &str, force: bool, changed_files: bool) {
             } else {
                 result["changedFilesSample"] = serde_json::json!(summary.changed_files);
             }
-            println!("{result}");
+            println!(
+                "{}",
+                varde_code::query::output::render_with_input(Ok(result), &input)
+            );
+            0
         }
         Err(e) => {
             tracing::error!(repo_root = repo_root, "fatal error: {e:#}");
-            eprintln!("varde-code: error: {e:#}");
-            std::process::exit(1);
+            println!(
+                "{}",
+                varde_code::query::output::render_with_input(
+                    Err::<serde_json::Value, _>(varde_code::query::ApiError::new(
+                        "build_error",
+                        e.to_string(),
+                    )),
+                    &input,
+                )
+            );
+            1
         }
     }
 }
 
 fn run_extract(path: &str) {
+    let input = extract_output_input(path);
     match varde_code::scan::run(path) {
         Ok(output) => {
             tracing::debug!(file = path, "emitting JSON document");
-            let mut doc = serde_json::to_value(&output).expect("output serializes");
-            // The JSON contract exposes a resolved `file` path per
-            // entity/symbol/diagnostic (external CLI consumers, not the
-            // in-process `file_id` used internally) — inject it here rather
-            // than growing `model::Entity`/`Symbol`/`Diagnostic` back to
-            // carrying an owned path.
-            for key in ["entities", "symbols", "diagnostics"] {
-                if let Some(items) = doc.get_mut(key).and_then(|v| v.as_array_mut()) {
-                    for item in items {
-                        if let Some(id) = item.get("file_id").and_then(|v| v.as_u64()) {
-                            item["file"] = serde_json::json!(output.files[id as usize]);
-                        }
-                    }
-                }
-            }
+            // `files` is the public path table. Entries retain `file_id`, so
+            // callers can navigate without repeating the same path per item.
+            let doc = serde_json::to_value(&output).expect("output serializes");
             println!(
                 "{}",
-                serde_json::to_string(&doc).expect("output serializes")
+                varde_code::query::output::render_with_input(Ok(doc), &input)
             );
         }
         Err(e) => {
             tracing::error!(file = path, "fatal error: {e:#}");
-            eprintln!("varde-code: error: {e:#}");
+            println!(
+                "{}",
+                varde_code::query::output::render_with_input(
+                    Err::<serde_json::Value, _>(varde_code::query::ApiError::new(
+                        "extract_error",
+                        e.to_string(),
+                    )),
+                    &input,
+                )
+            );
             std::process::exit(1);
         }
     }
+}
+
+/// Use an extract file's parent as the policy root. A bare relative path has
+/// no stable parent prefix, so it deliberately receives default metadata.
+fn extract_output_input(path: &str) -> serde_json::Value {
+    std::path::Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| serde_json::json!({ "repoRoot": parent }))
+        .unwrap_or_else(|| serde_json::json!({}))
 }
 
 #[cfg(test)]

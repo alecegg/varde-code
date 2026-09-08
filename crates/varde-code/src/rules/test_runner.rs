@@ -200,7 +200,7 @@ fn match_snippet(rule: &Rule, snippet: &str) -> Result<Vec<serde_json::Value>, A
         let result = crate::query::find_pattern::find_pattern(&input);
         let _ = std::fs::remove_file(&path);
         let matches = match result {
-            Ok(v) => v.as_array().cloned().unwrap_or_default(),
+            Ok(v) => v["matches"].as_array().cloned().unwrap_or_default(),
             // A snippet that doesn't parse (or a pattern that doesn't parse)
             // in this candidate language is expected for language-agnostic
             // rules tried against every supported language — skip, don't

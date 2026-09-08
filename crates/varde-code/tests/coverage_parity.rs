@@ -492,10 +492,10 @@ fn check_q_batch(db: &std::path::Path) -> Result<(), String> {
     if data[1]["ok"] != true || data[1]["data"]["name"] != "fn_b" {
         return Err(format!("batch: call 1 (get_symbol) failed: {env}"));
     }
-    if data[2]["ok"] != false || data[2]["error"]["code"] != "unknown_mode" {
+    if data[2]["ok"] != false || data[2]["data"]["error"]["code"] != "unknown_mode" {
         return Err(format!("batch: call 2 (unknown mode) should error: {env}"));
     }
-    if data[3]["ok"] != false || data[3]["error"]["code"] != "invalid_input" {
+    if data[3]["ok"] != false || data[3]["data"]["error"]["code"] != "invalid_input" {
         return Err(format!("batch: call 3 (nested batch) should reject: {env}"));
     }
     Ok(())
@@ -765,5 +765,11 @@ fn check_q_find_pattern(_db: &std::path::Path) -> Result<(), String> {
     );
     let stdout = varde_code::query::run_mode("find_pattern", &input);
     let env: serde_json::Value = serde_json::from_str(&stdout).expect("envelope is JSON");
-    nonempty(&env, "find_pattern")
+    assert_ok(&env, "find_pattern")?;
+    if env["data"]["matches"].as_array().is_none_or(Vec::is_empty) {
+        return Err(format!(
+            "find_pattern: expected non-empty matches, got {env}"
+        ));
+    }
+    Ok(())
 }

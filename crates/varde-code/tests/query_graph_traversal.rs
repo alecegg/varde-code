@@ -310,7 +310,7 @@ mod symbol_blast_radius_mode {
         let db = persist_synthetic("sbr-nf", 2, &[(0, 1)]);
         let env = envelope("symbol_blast_radius", &db, r#""name":"ghost_fn""#);
         assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "not_found");
+        assert_eq!(env["data"]["error"]["code"], "not_found");
     }
 }
 
@@ -378,7 +378,7 @@ mod type_hierarchy_mode {
         let db = persist_synthetic("th-nf", 2, &[(0, 1)]);
         let env = envelope("type_hierarchy", &db, r#""name":"Ghost""#);
         assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "not_found");
+        assert_eq!(env["data"]["error"]["code"], "not_found");
     }
 
     /// Regression: a mutually-recursive inheritance cycle (`A extends B` and

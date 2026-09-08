@@ -1,4 +1,4 @@
-//! CLI envelope contract tests: the uniform `{"ok",...}` JSON shape across
+//! CLI envelope contract tests: the uniform `{"ok", "data", "meta"}` JSON shape across
 //! all query subcommands, and the `--help` registration of all 17 modes.
 
 use std::process::Command;
@@ -49,7 +49,7 @@ fn help_lists_all_17_mode_subcommands() {
 }
 
 #[test]
-fn success_is_ok_true_with_data() {
+fn success_has_the_complete_machine_envelope() {
     // A real persisted database: extract+resolve+persist one fixture file.
     let db_dir = std::env::temp_dir().join(format!("varde-qenv-ok-{}", std::process::id()));
     std::fs::create_dir_all(&db_dir).expect("temp dir creates");
@@ -94,28 +94,30 @@ fn success_is_ok_true_with_data() {
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
     assert_eq!(value["ok"], true, "stdout: {stdout}");
     assert!(value.get("data").is_some(), "data key present: {stdout}");
-    assert!(
-        value.get("error").is_none(),
-        "no error key on success: {stdout}"
-    );
+    assert_eq!(value["meta"]["compact"], false, "stdout: {stdout}");
+    assert_eq!(value["meta"]["truncated"], false, "stdout: {stdout}");
     let _ = std::fs::remove_dir_all(&db_dir);
 }
 
 #[test]
-fn malformed_input_is_ok_false_with_error() {
+fn malformed_input_has_structured_error_data() {
     let stdout = run(&["symbols_in_file", "--json", "this is not json"]);
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
     assert_eq!(value["ok"], false, "stdout: {stdout}");
-    assert_eq!(value["error"]["code"], "invalid_input", "stdout: {stdout}");
-    assert!(value["error"]["message"].is_string(), "stdout: {stdout}");
-    assert!(
-        value.get("data").is_none(),
-        "no data key on failure: {stdout}"
+    assert_eq!(
+        value["data"]["error"]["code"], "invalid_input",
+        "stdout: {stdout}"
     );
+    assert!(
+        value["data"]["error"]["message"].is_string(),
+        "stdout: {stdout}"
+    );
+    assert_eq!(value["meta"]["compact"], false, "stdout: {stdout}");
+    assert_eq!(value["meta"]["truncated"], false, "stdout: {stdout}");
 }
 
 #[test]
-fn missing_required_field_is_ok_false_with_error() {
+fn missing_required_field_keeps_the_stable_error_code() {
     let db_dir = std::env::temp_dir().join(format!("varde-qenv-miss-{}", std::process::id()));
     std::fs::create_dir_all(&db_dir).expect("temp dir creates");
     let db = db_dir.join("index.db");
@@ -124,6 +126,36 @@ fn missing_required_field_is_ok_false_with_error() {
     let stdout = run(&["symbols_in_file", "--json", &json]);
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
     assert_eq!(value["ok"], false, "stdout: {stdout}");
-    assert_eq!(value["error"]["code"], "invalid_input", "stdout: {stdout}");
+    assert_eq!(
+        value["data"]["error"]["code"], "invalid_input",
+        "stdout: {stdout}"
+    );
     let _ = std::fs::remove_dir_all(&db_dir);
+}
+
+#[test]
+fn batch_children_have_complete_envelopes() {
+    let dir = std::env::temp_dir().join(format!("varde-qenv-batch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir creates");
+    let file = dir.join("input.rs");
+    std::fs::write(&file, "alpha(1);\n").expect("fixture writes");
+    let json = format!(
+        r#"{{"calls":[{{"mode":"find_pattern","filePath":"{}","pattern":"alpha($A)"}},{{"mode":"unknown_mode"}}]}}"#,
+        file.display()
+    );
+
+    let stdout = run(&["batch", "--json", &json]);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    let calls = value["data"].as_array().expect("batch results array");
+    assert_eq!(calls.len(), 2, "stdout: {stdout}");
+    assert_eq!(calls[0]["mode"], "find_pattern", "stdout: {stdout}");
+    assert_eq!(calls[0]["ok"], true, "stdout: {stdout}");
+    assert!(calls[0].get("data").is_some(), "stdout: {stdout}");
+    assert!(calls[0].get("meta").is_some(), "stdout: {stdout}");
+    assert_eq!(calls[1]["mode"], "unknown_mode", "stdout: {stdout}");
+    assert_eq!(calls[1]["ok"], false, "stdout: {stdout}");
+    assert_eq!(calls[1]["data"]["error"]["code"], "unknown_mode");
+    assert_eq!(calls[1]["meta"]["compact"], false, "stdout: {stdout}");
+    assert_eq!(calls[1]["meta"]["truncated"], false, "stdout: {stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

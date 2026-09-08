@@ -147,7 +147,7 @@ mod map_file_mode {
             &format!(r#"{{"dbPath":"{}","filePath":"ghost.rs"}}"#, db.display()),
         );
         assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "not_found");
+        assert_eq!(env["data"]["error"]["code"], "not_found");
     }
 }
 
@@ -233,7 +233,7 @@ mod map_symbol_mode {
             &format!(r#"{{"dbPath":"{}","name":"ghost"}}"#, db.display()),
         );
         assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "not_found");
+        assert_eq!(env["data"]["error"]["code"], "not_found");
     }
 }
 
@@ -346,7 +346,7 @@ mod map_path_mode {
             ),
         );
         assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "not_found");
+        assert_eq!(env["data"]["error"]["code"], "not_found");
     }
 }
 

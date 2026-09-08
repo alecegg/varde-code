@@ -40,6 +40,7 @@ use super::{ApiError, req_str};
 const SINGLE_PREFIX: &str = "__varde_meta_s_";
 const VARIADIC_PREFIX: &str = "__varde_meta_v_";
 const SUFFIX: &str = "__";
+const MATCH_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetaKind {
@@ -274,6 +275,10 @@ mod tests {
         run_pattern_ex(pattern, source, serde_json::json!({}))
     }
 
+    fn match_rows(output: &serde_json::Value) -> &[serde_json::Value] {
+        output["matches"].as_array().expect("matches array")
+    }
+
     fn run_pattern_ex(pattern: &str, source: &str, extra: serde_json::Value) -> serde_json::Value {
         let dir = std::env::temp_dir().join(format!(
             "fp-meta-test-{}-{}",
@@ -310,7 +315,7 @@ mod tests {
             "$KEY = $VAL",
             "const x = 1;\napi_key = \"sk-abc\";\nlet z;\n",
         );
-        let matches = out.as_array().expect("matches array");
+        let matches = match_rows(&out);
         assert_eq!(matches.len(), 1, "only the real assignment matches: {out}");
         assert_eq!(matches[0]["text"], "api_key = \"sk-abc\"");
         let caps = matches[0]["captures"].as_object().expect("captures object");
@@ -325,7 +330,7 @@ mod tests {
     #[test]
     fn kind_constraint_filters_single_capture() {
         let out = run_pattern("$KEY = $VAL:number", "x = 1;\ny = \"s\";\n");
-        let matches = out.as_array().expect("matches array");
+        let matches = match_rows(&out);
         assert_eq!(matches.len(), 1, "only the numeric RHS matches: {out}");
         assert_eq!(matches[0]["text"], "x = 1");
     }
@@ -335,7 +340,7 @@ mod tests {
         // $$$ARGS:number should only bind when every captured argument is a
         // number literal — mixed-kind argument lists must not match.
         let out = run_pattern("foo($$$ARGS:number)", "foo(1, 2, 3);\nfoo(1, \"x\");\n");
-        let matches = out.as_array().expect("matches array");
+        let matches = match_rows(&out);
         assert_eq!(matches.len(), 1, "only the all-numeric call matches: {out}");
         assert_eq!(matches[0]["text"], "foo(1, 2, 3)");
     }
@@ -360,7 +365,7 @@ mod tests {
         }))
         .expect("pattern runs");
         let _ = std::fs::remove_dir_all(&dir);
-        out.as_array().cloned().expect("matches array")
+        match_rows(&out).to_vec()
     }
 
     #[test]
@@ -432,7 +437,7 @@ mod tests {
             "function outer() { helper(); }\nhelper();\n",
             serde_json::json!({"inside": {"kind": "function_declaration"}}),
         );
-        let matches = out.as_array().expect("matches array");
+        let matches = match_rows(&out);
         assert_eq!(
             matches.len(),
             1,
@@ -447,7 +452,7 @@ mod tests {
             "function withCall() { helper(); }\nfunction empty() {}\n",
             serde_json::json!({"has": {"kind": "call_expression"}}),
         );
-        let matches = out.as_array().expect("matches array");
+        let matches = match_rows(&out);
         assert_eq!(
             matches.len(),
             1,
@@ -464,7 +469,7 @@ mod tests {
             "let a = 1;\nlet b = 2;\n",
             serde_json::json!({"follows": {"kind": "lexical_declaration"}}),
         );
-        let matches = out.as_array().expect("matches array");
+        let matches = match_rows(&out);
         assert_eq!(
             matches.len(),
             1,
@@ -480,7 +485,7 @@ mod tests {
             "let a = 1;\nlet b = 2;\n",
             serde_json::json!({"precedes": {"kind": "lexical_declaration"}}),
         );
-        let matches = out.as_array().expect("matches array");
+        let matches = match_rows(&out);
         assert_eq!(
             matches.len(),
             1,
@@ -557,7 +562,7 @@ mod tests {
                 ("no_atom.ts", "let x = 1;\n"),
             ],
         );
-        let matches = out.as_array().expect("matches array");
+        let matches = match_rows(&out);
         assert_eq!(matches.len(), 1, "only the real console.log matches: {out}");
         assert_eq!(matches[0]["captures"]["MSG"]["text"], "\"hi\"", "{out}");
     }
@@ -573,7 +578,7 @@ mod tests {
             "$A = $B",
             &[("a.ts", "x = 1;\n"), ("b.ts", "y = 2;\n")],
         );
-        let matches = out.as_array().expect("matches array");
+        let matches = match_rows(&out);
         assert_eq!(matches.len(), 2, "both assignments found: {out}");
     }
 }
@@ -1148,10 +1153,11 @@ fn match_source(
 /// `pattern_too_complex` error still fails a single-file call; in a directory
 /// search it drops that one file rather than failing the whole call.
 ///
-/// Output: array of matches `{kind, text, span, captures, file}` where
+/// Output: `{ matches, guide? }`; each match is `{kind, text, span, captures,
+/// file}` where
 /// `captures` maps each meta-variable name to its matched node(s) — a single
-/// node object for `$VAR`, an array for `$$$VAR`. Empty array when nothing
-/// matches.
+/// node object for `$VAR`, an array for `$$$VAR`. `guide.truncated.matches`
+/// reports shown and total counts when the bounded result omits matches.
 pub fn find_pattern(input: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
     let pattern_text = req_str(input, "pattern")?;
 
@@ -1205,7 +1211,7 @@ pub fn find_pattern(input: &serde_json::Value) -> Result<serde_json::Value, ApiE
                 m
             })
             .collect();
-        return Ok(serde_json::json!(out));
+        return Ok(compact_matches(out));
     }
 
     let profile = std::env::var_os("VARDE_PROFILE").is_some();
@@ -1321,5 +1327,17 @@ pub fn find_pattern(input: &serde_json::Value) -> Result<serde_json::Value, ApiE
             },
         );
     }
-    Ok(serde_json::json!(out))
+    Ok(compact_matches(out))
+}
+
+fn compact_matches(mut matches: Vec<serde_json::Value>) -> serde_json::Value {
+    let total = matches.len();
+    if total <= MATCH_LIMIT {
+        return serde_json::json!({ "matches": matches });
+    }
+    matches.truncate(MATCH_LIMIT);
+    serde_json::json!({
+        "matches": matches,
+        "guide": { "truncated": { "matches": { "shown": MATCH_LIMIT, "total": total } } },
+    })
 }

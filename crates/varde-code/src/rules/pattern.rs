@@ -276,7 +276,7 @@ fn run_pattern_rule(
             }
             Err(e) => return Err(e),
         };
-        let matches = matches.as_array().cloned().unwrap_or_default();
+        let matches = matches["matches"].as_array().cloned().unwrap_or_default();
         let kept = filter_matches(&matches, &compiled_constraints);
         for m in kept {
             let Some(file) = m.get("file").and_then(|f| f.as_str()) else {

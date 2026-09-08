@@ -4,9 +4,9 @@
 //! 20 query modes, one function per mode, all sharing one JSON envelope
 //! contract:
 //!
-//! - success: `{"ok": true, "data": <mode payload>}`
-//! - failure: `{"ok": false, "error": {"code": "<stable machine-readable code>",
-//!   "message": "<human-readable message>"}}`
+//! - success: `{"ok": true, "data": <mode payload>, "meta": <output policy>}`
+//! - failure: `{"ok": false, "data": {"error": {"code": "<stable code>",
+//!   "message": "<human-readable message>"}}, "meta": <output policy>}`
 //!
 //! Every mode except `find_pattern` reads directly from the persisted schema;
 //! nothing re-derives in-memory structures. This module owns the envelope and
@@ -46,15 +46,22 @@ impl std::error::Error for ApiError {}
 
 /// Render a mode result as the JSON envelope string.
 ///
-/// `Ok(data)` → `{"ok":true,"data":...}`; `Err(err)` →
-/// `{"ok":false,"error":{"code":...,"message":...}}`. This is the single
-/// serialization point every mode flows through.
+/// Render a result with default, un-compacted output metadata.
 pub fn render(result: Result<serde_json::Value, ApiError>) -> String {
+    render_with_meta(result, crate::query::output::OutputMeta::default())
+}
+
+/// Render one machine-readable result as the shared `{ok, data, meta}` envelope.
+pub fn render_with_meta(
+    result: Result<serde_json::Value, ApiError>,
+    meta: crate::query::output::OutputMeta,
+) -> String {
     match result {
-        Ok(data) => serde_json::json!({ "ok": true, "data": data }).to_string(),
+        Ok(data) => serde_json::json!({ "ok": true, "data": data, "meta": meta }).to_string(),
         Err(err) => serde_json::json!({
             "ok": false,
-            "error": { "code": err.code, "message": err.message }
+            "data": { "error": { "code": err.code, "message": err.message } },
+            "meta": meta,
         })
         .to_string(),
     }
@@ -412,7 +419,9 @@ pub fn run_mode(mode: &str, input: &str) -> String {
             )));
         }
     };
-    render(dispatch_mode(mode, &value))
+    let result = dispatch_mode_with_meta(mode, &value);
+    let meta = result.as_ref().map(|(_, meta)| *meta).unwrap_or_default();
+    render_with_meta(result.map(|(data, _)| data), meta)
 }
 
 /// Dispatch one mode by name against an already-parsed input object.
@@ -420,15 +429,18 @@ pub fn run_mode(mode: &str, input: &str) -> String {
 /// The single routing table shared by [`run_mode`] (top-level CLI/API entry)
 /// and [`batch`] (per-call routing inside a batch request) — adding a mode
 /// here wires it into both.
-fn dispatch_mode(mode: &str, value: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+fn dispatch_mode_with_meta(
+    mode: &str,
+    value: &serde_json::Value,
+) -> Result<(serde_json::Value, crate::query::output::OutputMeta), ApiError> {
     dispatch_mode_inner(mode, value).map(|mut data| {
         // Single output boundary for every mode (and, via `batch`, each of its
         // sub-calls): repo-relative paths (F5) + line-only spans (F6). Both
         // transforms are idempotent, so a `batch` payload seeing this twice —
         // once per sub-call with that call's own `repoRoot`, once for the
         // aggregate — is harmless.
-        crate::query::output::postprocess(&mut data, value);
-        data
+        let meta = crate::query::output::postprocess(&mut data, value);
+        (data, meta)
     })
 }
 
@@ -477,9 +489,9 @@ fn slice_state(value: &serde_json::Value) -> Result<serde_json::Value, ApiError>
 /// Inputs: `calls` (required array of `{mode, ...mode-specific fields}`
 /// objects). Each call inherits the batch's `repoRoot`/`dbPath` when it
 /// doesn't specify its own. `mode: "batch"` may not nest. Output: an array,
-/// one entry per call in order, each `{"mode", "ok", "data"}` or
-/// `{"mode", "ok": false, "error"}` — one call's failure never fails the
-/// batch. Calls dispatch through the same [`dispatch_mode`] every mode function
+/// one entry per call in order, each a `{mode, ok, data, meta}` envelope. One
+/// call's failure never fails the batch. Calls dispatch through the same
+/// [`dispatch_mode_with_meta`] every mode function
 /// calls its own `freshen_for_mode` from, but for the duration of the batch a
 /// freshen plan (slices + scope) is brought up to date at most once: the batch
 /// is a single filesystem snapshot, so five graph traversals pay the
@@ -497,26 +509,52 @@ fn batch(input: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
     let mut results = Vec::with_capacity(calls.len());
     for call in calls {
         let Some(mode) = call.get("mode").and_then(|v| v.as_str()) else {
-            results.push(serde_json::json!({
-                "ok": false,
-                "error": {"code": "invalid_input", "message": "batch call missing string field \"mode\""},
-            }));
+            results.push(batch_result(
+                None,
+                Err(ApiError::new(
+                    "invalid_input",
+                    "batch call missing string field \"mode\"",
+                )),
+            ));
             continue;
         };
         if mode == "batch" {
-            results.push(serde_json::json!({
-                "mode": mode, "ok": false,
-                "error": {"code": "invalid_input", "message": "batch calls cannot nest \"batch\""},
-            }));
+            results.push(batch_result(
+                Some(mode),
+                Err(ApiError::new(
+                    "invalid_input",
+                    "batch calls cannot nest \"batch\"",
+                )),
+            ));
             continue;
         }
         let merged = merge_repo_context(input, call);
-        results.push(match dispatch_mode(mode, &merged) {
-            Ok(data) => serde_json::json!({"mode": mode, "ok": true, "data": data}),
-            Err(e) => serde_json::json!({"mode": mode, "ok": false, "error": {"code": e.code, "message": e.message}}),
-        });
+        results.push(batch_result(
+            Some(mode),
+            dispatch_mode_with_meta(mode, &merged),
+        ));
     }
     Ok(serde_json::Value::Array(results))
+}
+
+fn batch_result(
+    mode: Option<&str>,
+    result: Result<(serde_json::Value, crate::query::output::OutputMeta), ApiError>,
+) -> serde_json::Value {
+    match result {
+        Ok((data, meta)) => serde_json::json!({
+            "mode": mode,
+            "ok": true,
+            "data": data,
+            "meta": meta,
+        }),
+        Err(error) => serde_json::json!({
+            "mode": mode,
+            "ok": false,
+            "data": { "error": { "code": error.code, "message": error.message } },
+            "meta": crate::query::output::OutputMeta::default(),
+        }),
+    }
 }
 
 /// A batch call's own `repoRoot`/`dbPath` wins; otherwise it inherits the
@@ -620,7 +658,7 @@ mod batch_freshen_tests {
             for call in calls["calls"].as_array().unwrap() {
                 let mut merged = call.clone();
                 merged["repoRoot"] = serde_json::json!(rr);
-                let _ = dispatch_mode(call["mode"].as_str().unwrap(), &merged);
+                let _ = dispatch_mode_with_meta(call["mode"].as_str().unwrap(), &merged);
             }
             let standalone_runs = FRESHEN_RUN_CALLS.load(Ordering::Relaxed) - before;
             assert_eq!(

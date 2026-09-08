@@ -9,13 +9,23 @@ Global flag: `-v`/`--verbose` (only applies when `RUST_LOG` is unset).
 
 ## Conventions
 
-Every query subcommand takes a single `--json '<object>'` argument and prints a
-uniform envelope to stdout:
+Every machine-readable command prints one JSON envelope to stdout. Query modes
+take a single `--json '<object>'` argument; commands with flat flags still use
+the same output envelope:
 
 ```json
-{"ok": true, "data": ...}
-{"ok": false, "error": {...}}
+{"ok": true, "data": {"...": "payload"}, "meta": {"compact": true, "truncated": false}}
+{"ok": false, "data": {"error": {"code": "not_found", "message": "not found: ..."}}, "meta": {"compact": false, "truncated": false}}
 ```
+
+`ok` is the operation result. Payloads always use `data`.
+Failures use `data.error.code` and `data.error.message`.
+`meta.compact` reports the active compacting policy.
+`meta.truncated` reports declared omissions. Query errors remain
+process-successful, so callers inspect `ok`. CI gates can return nonzero after
+printing their envelope. See
+[`machine-output-contract.md`](../memory-bank/knowledge/reference/machine-output-contract.md)
+for the full contract.
 
 The JSON object always accepts `repoRoot` or `dbPath` to locate the index,
 plus mode-specific fields (documented per command below).
@@ -31,6 +41,9 @@ Two output-shaping fields are accepted by every query mode and by `scan`:
 - **`includeSpanDetail?`** (default `false`) — a `span` carries only
   `start_line`/`end_line` by default; set `true` to also include the
   `start_byte`/`end_byte`/`start_col`/`end_col` fields.
+
+`nav_map` JSON uses the same envelope and compacting rules.
+`nav_map --format text` is the deliberate text renderer. Tools should use JSON.
 
 ## Build / index
 

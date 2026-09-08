@@ -259,7 +259,7 @@ mod symbols_in_file {
         let db = persist_project("sif-suffix-boundary", entities, symbols, files);
         let env = envelope("symbols_in_file", &db, r#""filePath":"a.rs""#);
         assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "not_found");
+        assert_eq!(env["data"]["error"]["code"], "not_found");
     }
 
     #[test]
@@ -304,7 +304,7 @@ mod symbols_in_file {
         let db = persist_project("sif-nf", entities.clone(), symbols.clone(), files.clone());
         let env = envelope("symbols_in_file", &db, r#""filePath":"ghost.rs""#);
         assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "not_found");
+        assert_eq!(env["data"]["error"]["code"], "not_found");
     }
 }
 
@@ -375,7 +375,7 @@ mod get_symbol {
             &format!(r#""name":"{}","kind":"binding""#, sym.name),
         );
         assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "not_found");
+        assert_eq!(env["data"]["error"]["code"], "not_found");
     }
 
     #[test]
@@ -384,7 +384,7 @@ mod get_symbol {
         let db = persist_project("gs-nf", entities.clone(), symbols.clone(), files.clone());
         let env = envelope("get_symbol", &db, r#""name":"ghost_symbol""#);
         assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "not_found");
+        assert_eq!(env["data"]["error"]["code"], "not_found");
     }
 }
 
@@ -435,7 +435,7 @@ mod tests_for_file {
         let db = persist_project("tff-nf", entities.clone(), symbols.clone(), files.clone());
         let env = envelope("tests_for_file", &db, r#""filePath":"ghost.rs""#);
         assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "not_found");
+        assert_eq!(env["data"]["error"]["code"], "not_found");
     }
 }
 
@@ -478,7 +478,7 @@ mod find_imports {
         let db = persist_project("fi-nf", entities.clone(), symbols.clone(), files.clone());
         let env = envelope("find_imports", &db, r#""filePath":"ghost.rs""#);
         assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "not_found");
+        assert_eq!(env["data"]["error"]["code"], "not_found");
     }
 }
 
@@ -511,6 +511,6 @@ mod filter_symbols {
         let db = persist_project("fs-nf", entities.clone(), symbols.clone(), files.clone());
         let env = envelope("filter_symbols", &db, r#""file":"ghost.rs""#);
         assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "not_found");
+        assert_eq!(env["data"]["error"]["code"], "not_found");
     }
 }

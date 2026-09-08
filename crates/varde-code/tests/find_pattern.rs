@@ -35,7 +35,7 @@ fn run(pattern: &str, extra: &str) -> serde_json::Value {
 }
 
 fn matches_of(env: &serde_json::Value) -> Vec<String> {
-    env["data"]
+    env["data"]["matches"]
         .as_array()
         .expect("data array")
         .iter()
@@ -51,7 +51,7 @@ fn single_node_capture_matches_all_calls_with_one_arg() {
     assert_eq!(texts, vec!["alpha(1)", "alpha(2)"], "{env}");
 
     // Capture binding: $A holds the single argument node.
-    let captures = &env["data"][0]["captures"];
+    let captures = &env["data"]["matches"][0]["captures"];
     assert_eq!(captures["A"]["kind"], "integer_literal", "{env}");
     assert_eq!(captures["A"]["text"], "1", "{env}");
 }
@@ -66,7 +66,7 @@ fn variadic_capture_matches_any_argument_count() {
     assert!(texts.contains(&"alpha(3, 4)".to_string()));
 
     // The variadic capture binds an array of argument nodes.
-    let three_four = env["data"]
+    let three_four = env["data"]["matches"]
         .as_array()
         .unwrap()
         .iter()
@@ -91,7 +91,7 @@ fn variadic_capture_matches_any_argument_count() {
 fn no_match_is_empty_not_error() {
     let env = run("gamma($A)", "");
     assert_eq!(env["ok"], true, "{env}");
-    assert_eq!(env["data"], serde_json::json!([]));
+    assert_eq!(env["data"], serde_json::json!({ "matches": [] }));
 }
 
 #[test]
@@ -106,7 +106,7 @@ fn callee_name_is_respected() {
 fn invalid_pattern_is_an_error_not_a_panic() {
     let env = run("fn main( $A", "");
     assert_eq!(env["ok"], false, "{env}");
-    assert_eq!(env["error"]["code"], "invalid_pattern");
+    assert_eq!(env["data"]["error"]["code"], "invalid_pattern");
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn unknown_file_is_an_error() {
     let stdout = query::run_mode("find_pattern", &input);
     let env: serde_json::Value = serde_json::from_str(&stdout).expect("envelope is JSON");
     assert_eq!(env["ok"], false);
-    assert_eq!(env["error"]["code"], "file_error");
+    assert_eq!(env["data"]["error"]["code"], "file_error");
 }
 
 // find_pattern searches every language `ast-grep` links, not just the
@@ -167,5 +167,5 @@ fn unsupported_language_name_is_an_error() {
         r#","language":"cobol""#,
     );
     assert_eq!(env["ok"], false, "{env}");
-    assert_eq!(env["error"]["code"], "invalid_input", "{env}");
+    assert_eq!(env["data"]["error"]["code"], "invalid_input", "{env}");
 }
