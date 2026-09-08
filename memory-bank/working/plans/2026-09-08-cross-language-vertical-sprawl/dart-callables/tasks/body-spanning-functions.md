@@ -1,8 +1,8 @@
 ---
 type: task
 parent: 2026-09-08-cross-language-vertical-sprawl/dart-callables
-status: backlog
-verified: pending
+status: done
+verified: passed
 depends_on: []
 modifies:
   - crates/varde-code/src/extract/langs/dart.rs
@@ -25,3 +25,4 @@ Cover functions, constructors, factories, getters, and setters. Preserve stable 
 
 #### Progress
 
+- Dart callable entities now span executable declaration bodies.

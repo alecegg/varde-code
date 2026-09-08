@@ -3,13 +3,9 @@
 //! Mapping notes (fixture-driven, superset-safe; node kinds from
 //! tree-sitter-dart via ast-grep-language 0.45.1, verified against a grammar
 //! dump):
-//! - `function_signature` (top-level `int add(...)`, method bodies) AND
-//!   `constructor_signature` (`Animal(this.name)`) -> Function; name via field
-//!   `name`. The signature node — not the enclosing `function_declaration` /
-//!   `method_declaration` — is what carries the `name`/`parameters` fields, so
-//!   it is both the Function entity and the enclosing-function scope. (A body-
-//!   less abstract `method_signature` inside an abstract class still contains a
-//!   `function_signature`, so it is covered too.)
+//! - Callable declarations -> Function. Their declaration spans contain the
+//!   executable body. The nested signature provides the stable callable name.
+//!   Body-less abstract declarations retain their signature entity.
 //! - `class_declaration` (plain `class` and `abstract class`) -> Class. Dart's
 //!   `abstract class` has no distinct node kind and is Dart's interface analog
 //!   (any class can be `implements`-ed), so it stays Class — there is no
@@ -116,15 +112,22 @@ pub fn visit(
         }
 
         // ---- structural ----
-        // Factory constructors and getters/setters are accessor/constructor
-        // methods that were previously dropped (audit S3: `factory Client()`
-        // and top-level `get zoneClient` invisible). Mapped to Function.
+        "function_declaration"
+        | "getter_declaration"
+        | "setter_declaration"
+        | "method_declaration" => {
+            let name = callable_name(node).unwrap_or_default();
+            ctx.push(EntityKind::Function, name, node);
+        }
+        // Abstract and redirecting declarations have no executable body.
         "function_signature"
         | "constructor_signature"
         | "factory_constructor_signature"
         | "redirecting_factory_constructor_signature"
         | "getter_signature"
-        | "setter_signature" => {
+        | "setter_signature"
+            if !signature_has_body_spanning_declaration(node) =>
+        {
             let name = field_name(node).unwrap_or_default();
             ctx.push(EntityKind::Function, name, node);
         }
@@ -271,6 +274,37 @@ fn catch_var(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> String {
         .unwrap_or_default()
 }
 
+/// Callable declarations own their signature through the `signature` field.
+/// The nested signature carries the stable identifier, while the declaration
+/// span reaches the block or expression body.
+fn callable_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    let signature = node.field("signature")?;
+    field_name(&signature).or_else(|| signature.children().find_map(|child| field_name(&child)))
+}
+
+/// True when a signature belongs to a declaration with an executable body.
+fn signature_has_body_spanning_declaration(
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let declaration = if parent.kind() == "method_signature" {
+        parent.parent()
+    } else {
+        Some(parent)
+    };
+    declaration.is_some_and(|node| {
+        matches!(
+            node.kind().as_ref(),
+            "function_declaration"
+                | "getter_declaration"
+                | "setter_declaration"
+                | "method_declaration"
+        )
+    })
+}
+
 /// Unquoted URI of an `import_specification` / `library_export` directive: the
 /// `configurable_uri`'s inner string literal, quotes stripped (`'b.dart'` ->
 /// `b.dart`). Dart string quotes are single or double, so backticks are not
@@ -318,6 +352,31 @@ mod tests {
             .filter(|e| e.kind == EntityKind::Function && e.name == "Client")
             .count();
         assert!(ctors >= 2, "factory + named ctor both captured: {es:?}");
+    }
+
+    #[test]
+    fn callable_spans_contain_their_body_calls() {
+        let es = entities(
+            "void topLevel() { remoteTopLevel(); }\nclass Client {\n  Client() { remoteConstructor(); }\n  factory Client.create() { remoteFactory(); return Client(); }\n  int get value { return remoteGetter(); }\n  set value(int next) { remoteSetter(next); }\n}\n",
+        );
+        for (call, function) in [
+            ("remoteTopLevel", "topLevel"),
+            ("remoteConstructor", "Client"),
+            ("remoteFactory", "Client"),
+            ("remoteGetter", "value"),
+            ("remoteSetter", "value"),
+        ] {
+            let call = find(&es, EntityKind::Call, call).expect("body call");
+            assert!(
+                es.iter().any(|candidate| {
+                    candidate.kind == EntityKind::Function
+                        && candidate.name == function
+                        && candidate.span.start_byte <= call.span.start_byte
+                        && call.span.end_byte <= candidate.span.end_byte
+                }),
+                "a {function} Function must contain {call:?}: {es:?}",
+            );
+        }
     }
 
     #[test]
