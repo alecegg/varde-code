@@ -155,7 +155,8 @@ fn walk(
     // Named functions/methods push onto the enclosing stack for children.
     let is_scope = langs::function_scopes(ctx.lang).contains(&kind);
     if is_scope {
-        ctx.enclosing.push(field_name(node).unwrap_or_default());
+        ctx.enclosing
+            .push(langs::function_scope_name(ctx.lang, node).unwrap_or_default());
     }
     // Named classes/interfaces/impl-blocks push onto the type-scope stack so
     // methods nested inside record their owning type (`Entity::owner_type`).

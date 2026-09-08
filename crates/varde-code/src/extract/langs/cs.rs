@@ -43,6 +43,7 @@ pub const FUNCTION_SCOPES: &[&str] = &[
     "method_declaration",
     "constructor_declaration",
     "local_function_statement",
+    "accessor_declaration",
 ];
 
 /// Entity kinds the fixtures must produce.
@@ -93,10 +94,13 @@ pub fn visit(
         }
 
         // ---- structural ----
-        "method_declaration" | "constructor_declaration" | "local_function_statement" => {
+        "method_declaration"
+        | "constructor_declaration"
+        | "local_function_statement"
+        | "accessor_declaration" => {
             ctx.push(
                 EntityKind::Function,
-                field_name(node).unwrap_or_default(),
+                function_scope_name(node).unwrap_or_default(),
                 node,
             );
         }
@@ -330,6 +334,27 @@ pub fn visit(
 
         _ => {}
     }
+}
+
+/// Stable display and scope name for a C# function declaration.
+///
+/// Accessors only name their operation (`get`, `set`, ...). Prefixing the
+/// declared property, event, or indexer owner prevents unrelated accessors
+/// from sharing the same diagnostic label and enclosing-function tag.
+pub fn function_scope_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    if node.kind() != "accessor_declaration" {
+        return field_name(node);
+    }
+    let operation = field_name(node)?;
+    let owner = node.parent()?.parent()?;
+    let owner_name = field_name(&owner).unwrap_or_else(|| {
+        if owner.kind() == "indexer_declaration" {
+            "this".to_string()
+        } else {
+            String::new()
+        }
+    });
+    (!owner_name.is_empty()).then(|| format!("{owner_name}.{operation}"))
 }
 
 /// Emit a `TypeRef` entity linking a variable/parameter to its declared type:
@@ -650,6 +675,26 @@ mod tests {
                 .any(|e| e.kind == EntityKind::Implements && e.name == "IEquatable"),
             "struct interface as Implements: {entities:?}"
         );
+    }
+
+    #[test]
+    fn property_accessor_is_a_named_function_scope() {
+        let src = "class Catalog { int Count { get { return Load(); } } }";
+        let parsed = parse_source(&SupportLang::CSharp, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        assert!(
+            entities
+                .iter()
+                .any(|e| { e.kind == EntityKind::Function && e.name == "Count.get" }),
+            "accessor function: {entities:?}"
+        );
+        let call = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Call && e.name == "Load")
+            .expect("Load call captured");
+        assert_eq!(call.enclosing_function.as_deref(), Some("Count.get"));
     }
 
     #[test]

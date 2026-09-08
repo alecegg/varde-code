@@ -201,6 +201,21 @@ pub fn function_scopes(lang: SupportLang) -> &'static [&'static str] {
     }
 }
 
+/// Stable name for the function scope introduced by `node`.
+///
+/// Most grammars expose a declaration's own `name` field. C# accessors need
+/// their containing member added because their direct name is only `get`,
+/// `set`, `add`, or `remove`.
+pub fn function_scope_name(
+    lang: SupportLang,
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+) -> Option<String> {
+    match lang {
+        SupportLang::CSharp => cs::function_scope_name(node),
+        _ => crate::extract::field_name(node),
+    }
+}
+
 /// Node kinds that introduce a named class/interface/impl-target type scope
 /// (for `Entity::owner_type` linkage on methods — see `super::entity`).
 ///

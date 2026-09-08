@@ -840,6 +840,53 @@ mod tests {
     }
 
     #[test]
+    fn builtin_vertical_slice_sprawl_keeps_same_named_declarations_separate() {
+        let (_dir, conn) = temp_db("builtin-vertical-slice-sprawl-declarations");
+        conn.execute_batch(
+            "INSERT INTO files (path, community_id) VALUES
+                ('home.cs', 0), ('slice_a.cs', 1), ('slice_b.cs', 2),
+                ('slice_c.cs', 3), ('slice_d.cs', 4), ('slice_e.cs', 5),
+                ('slice_f.cs', 6);
+             INSERT INTO entities (kind, name, file_id, start_byte, end_byte,
+                                   start_line, start_col, end_line, end_col)
+             VALUES
+                (0, 'Execute', 1, 0, 100, 1, 0, 10, 1),
+                (0, 'Execute', 1, 200, 300, 20, 0, 30, 1),
+                (6, 'a', 1, 10, 15, 2, 0, 2, 5),
+                (6, 'b', 1, 20, 25, 3, 0, 3, 5),
+                (6, 'c', 1, 30, 35, 4, 0, 4, 5),
+                (6, 'd', 1, 210, 215, 21, 0, 21, 5),
+                (6, 'e', 1, 220, 225, 22, 0, 22, 5),
+                (6, 'f', 1, 230, 235, 23, 0, 23, 5);
+             UPDATE entities SET enclosing_function = 'Execute' WHERE kind = 6;
+             INSERT INTO resolved_edges (from_file_id, to_file_id, kind, resolved, from_entity_id)
+             VALUES
+                (1, 2, 0, 1, 3), (1, 3, 0, 1, 4), (1, 4, 0, 1, 5),
+                (1, 5, 0, 1, 6), (1, 6, 0, 1, 7), (1, 7, 0, 1, 8);",
+        )
+        .expect("fixture inserts");
+
+        let rules = crate::rules::builtin_rules();
+        let (findings, diagnostics) = run_sql_rules(&rules, &conn).expect("runs");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let sprawl_findings: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.rule_id == "vertical-slice-sprawl")
+            .collect();
+        assert_eq!(sprawl_findings.len(), 2, "{sprawl_findings:?}");
+        let starts: Vec<u64> = sprawl_findings
+            .iter()
+            .map(|f| u64::from(f.location.span.start_byte))
+            .collect();
+        assert_eq!(starts, vec![0, 200], "each finding anchors one declaration");
+        assert!(
+            sprawl_findings
+                .iter()
+                .all(|f| { f.evidence.get("slices").and_then(|v| v.as_i64()) == Some(3) })
+        );
+    }
+
+    #[test]
     fn builtin_duplicate_code_clone_fires_only_for_bands_at_or_above_min_size() {
         let (_dir, conn) = temp_db("builtin-clone");
         conn.execute_batch(
