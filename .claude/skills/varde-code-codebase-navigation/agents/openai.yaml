@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codebase Navigation"
+  short_description: "Navigate codebases with varde-code"
+  default_prompt: "Use $varde-code-codebase-navigation to orient me in this repository."

@@ -119,21 +119,21 @@ customized directly (instead of only overridden by id). All three take
 
 ## Skills
 
-Install or remove the Claude Code skills bundled in the binary (rule authoring,
+Install or remove the agent skills bundled in the binary (rule authoring,
 rule-scan triage, codebase navigation). These use flat flags, not `--json`, and
-never require a DB.
+never require a DB. Install targets match each harness's global discovery path:
+Claude (`~/.claude/skills`), Codex (`~/.agents/skills`), OpenCode
+(`~/.config/opencode/skills`), and Pi (`~/.pi/agent/skills`).
 
-- **`skills_list`** — List the bundled skill packs and the directory name each
-  installs as (`varde-code-<name>`). No filesystem writes.
-- **`skills_install --dir DIR [--force]`** — Install each pack into `DIR` (your
-  choice, e.g. `~/.claude/skills` or `./.claude/skills`) as its own
-  `varde-code-<name>/` subdirectory. Existing files are left untouched unless
-  `--force`.
-- **`skills_remove --dir DIR [--force]`** — Undo `skills_install`: delete the
-  `varde-code-<name>/` directories from `DIR`. Only shipped skill-pack files
-  are touched; anything else (including your own skills) is left alone. A file
-  edited since install is skipped unless `--force`. Emptied pack directories
-  are removed.
+- **`skills_list`** — List bundled packs, files, and harness destinations.
+  No filesystem writes.
+- **`skills_install [--agent A...] [--dir DIR] [--force]`** — Install every
+  pack for Claude, Codex, OpenCode, and Pi by default. Limit targets with
+  repeatable or comma-separated `--agent` values. `--dir` overrides every
+  selected target, for a project-local shared installation or testing.
+- **`skills_remove [--agent A...] [--dir DIR] [--force]`** — Undo
+  `skills_install` for the selected targets. Only shipped skill-pack files are
+  touched. Locally edited files are skipped unless `--force`.
 
 ## Hooks
 

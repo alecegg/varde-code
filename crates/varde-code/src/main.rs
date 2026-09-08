@@ -53,8 +53,12 @@ fn main() {
         Command::RulesSeed { json, user, force } => run_rules_seed(&json, user, force),
         Command::RulesRemove { json, user, force } => run_rules_remove(&json, user, force),
         Command::SkillsList => run_skills_list(),
-        Command::SkillsInstall { dir, force } => run_skills_install(&dir, force),
-        Command::SkillsRemove { dir, force } => run_skills_remove(&dir, force),
+        Command::SkillsInstall { agent, dir, force } => {
+            run_skills_install(&agent, force, dir.as_deref())
+        }
+        Command::SkillsRemove { agent, dir, force } => {
+            run_skills_remove(&agent, force, dir.as_deref())
+        }
         Command::Hooks(HooksCommand::List) => run_hooks_list(),
         Command::Hooks(HooksCommand::Install { agent, force, dir }) => {
             run_hooks_install(&agent, force, dir.as_deref())
@@ -425,77 +429,127 @@ fn run_rules_remove(json: &str, user: bool, force: bool) {
     );
 }
 
-/// Run one `skills_list` invocation: describes the bundled skill packs and
-/// the directory name each installs as. No filesystem access.
+/// Run one `skills_list` invocation: describes bundled skill packs and the
+/// supported harness targets. No filesystem access.
 fn run_skills_list() {
     let packs: Vec<serde_json::Value> = varde_code::skills::SKILL_PACKS
         .iter()
         .map(|pack| {
             serde_json::json!({
                 "name": pack.name,
+                "skillName": varde_code::skills::install_dir_name(pack.name),
                 "installDirName": varde_code::skills::install_dir_name(pack.name),
                 "files": pack.files.iter().map(|f| f.rel_path).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let targets: Vec<serde_json::Value> = varde_code::hooks::HOOK_TARGETS
+        .iter()
+        .map(|target| {
+            let default_dir = default_skill_dir(target.agent);
+            serde_json::json!({
+                "agent": target.agent,
+                "defaultTargetDir": default_dir.display().to_string(),
             })
         })
         .collect();
     println!(
         "{}",
         varde_code::query::render(Ok::<_, varde_code::query::ApiError>(
-            serde_json::json!({ "packs": packs })
+            serde_json::json!({ "packs": packs, "targets": targets })
         ))
     );
 }
 
-/// Run one `skills_install` invocation: writes every bundled skill pack into
-/// `dir` as `varde-code-<name>/`, prints the uniform envelope. Never exits
-/// non-zero — installing skills is not a CI gate.
-fn run_skills_install(dir: &str, force: bool) {
-    let target_dir = std::path::Path::new(dir);
-    let result = varde_code::skills::install_skills(target_dir, force)
-        .map(|installed| {
-            let installed_json: Vec<serde_json::Value> = installed
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "packName": r.pack_name,
-                        "path": r.path.display().to_string(),
-                        "written": r.written,
-                        "skippedExisting": r.skipped_existing,
-                    })
-                })
-                .collect();
-            serde_json::json!({ "targetDir": target_dir.display().to_string(), "installed": installed_json })
-        })
-        .map_err(|e| {
-            varde_code::query::ApiError::new("io_error", format!("failed to install skills into {}: {e}", target_dir.display()))
-        });
+/// Run one `skills_install` invocation for the selected harnesses. Without
+/// `--agent`, installs for all four supported harnesses.
+fn run_skills_install(agents: &[String], force: bool, dir: Option<&str>) {
+    let agents = match resolve_skill_agents(agents) {
+        Ok(agents) => agents,
+        Err(err) => return print_invalid_argument(err),
+    };
+    let result = install_skills_for_agents(&agents, force, dir).map_err(|e| {
+        varde_code::query::ApiError::new("io_error", format!("failed to install skills: {e}"))
+    });
     println!("{}", varde_code::query::render(result));
 }
 
-/// Run one `skills_remove` invocation: deletes previously installed
-/// `varde-code-<name>/` skill directories from `dir`, prints the uniform
-/// envelope. Never exits non-zero — removing skills is not a CI gate.
-fn run_skills_remove(dir: &str, force: bool) {
-    let target_dir = std::path::Path::new(dir);
-    let result = varde_code::skills::remove_skills(target_dir, force)
-        .map(|removed| {
-            let removed_json: Vec<serde_json::Value> = removed
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "packName": r.pack_name,
-                        "path": r.path.display().to_string(),
-                        "removed": r.removed,
-                        "skippedModified": r.skipped_modified,
-                    })
-                })
-                .collect();
-            serde_json::json!({ "targetDir": target_dir.display().to_string(), "removed": removed_json })
-        })
-        .map_err(|e| {
-            varde_code::query::ApiError::new("io_error", format!("failed to remove skills from {}: {e}", target_dir.display()))
-        });
+/// Run one `skills_remove` invocation for the selected harnesses. Without
+/// `--agent`, removes installations for all four supported harnesses.
+fn run_skills_remove(agents: &[String], force: bool, dir: Option<&str>) {
+    let agents = match resolve_skill_agents(agents) {
+        Ok(agents) => agents,
+        Err(err) => return print_invalid_argument(err),
+    };
+    let result = remove_skills_for_agents(&agents, force, dir).map_err(|e| {
+        varde_code::query::ApiError::new("io_error", format!("failed to remove skills: {e}"))
+    });
     println!("{}", varde_code::query::render(result));
+}
+
+fn print_invalid_argument(message: String) {
+    println!(
+        "{}",
+        varde_code::query::render(Err::<serde_json::Value, _>(
+            varde_code::query::ApiError::new("invalid_argument", message)
+        ))
+    );
+}
+
+fn install_skills_for_agents(
+    agents: &[&str],
+    force: bool,
+    dir: Option<&str>,
+) -> std::io::Result<serde_json::Value> {
+    let mut target_dirs = Vec::new();
+    let mut installed = Vec::new();
+    for &agent in agents {
+        let target_dir = dir
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| default_skill_dir(agent));
+        target_dirs.push(serde_json::json!({
+            "agent": agent,
+            "targetDir": target_dir.display().to_string(),
+        }));
+        for result in varde_code::skills::install_skills(&target_dir, force)? {
+            installed.push(serde_json::json!({
+                "agent": agent,
+                "packName": result.pack_name,
+                "path": result.path.display().to_string(),
+                "written": result.written,
+                "skippedExisting": result.skipped_existing,
+            }));
+        }
+    }
+    Ok(serde_json::json!({ "targetDirs": target_dirs, "installed": installed }))
+}
+
+fn remove_skills_for_agents(
+    agents: &[&str],
+    force: bool,
+    dir: Option<&str>,
+) -> std::io::Result<serde_json::Value> {
+    let mut target_dirs = Vec::new();
+    let mut removed = Vec::new();
+    for &agent in agents {
+        let target_dir = dir
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| default_skill_dir(agent));
+        target_dirs.push(serde_json::json!({
+            "agent": agent,
+            "targetDir": target_dir.display().to_string(),
+        }));
+        for result in varde_code::skills::remove_skills(&target_dir, force)? {
+            removed.push(serde_json::json!({
+                "agent": agent,
+                "packName": result.pack_name,
+                "path": result.path.display().to_string(),
+                "removed": result.removed,
+                "skippedModified": result.skipped_modified,
+            }));
+        }
+    }
+    Ok(serde_json::json!({ "targetDirs": target_dirs, "removed": removed }))
 }
 
 /// Resolve the requested `--agent` names to `HookTarget`s. Empty (no
@@ -536,6 +590,27 @@ fn default_hook_dir(agent: &str) -> std::path::PathBuf {
         varde_code::hooks::PI_AGENT => home.join(".pi").join("agent").join("extensions"),
         other => home.join(format!(".{other}")),
     }
+}
+
+/// The user-level skill directory each supported harness discovers by default.
+fn default_skill_dir(agent: &str) -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("~"));
+    match agent {
+        varde_code::hooks::CLAUDE_AGENT => home.join(".claude").join("skills"),
+        varde_code::hooks::CODEX_AGENT => home.join(".agents").join("skills"),
+        varde_code::hooks::OPENCODE_AGENT => home.join(".config").join("opencode").join("skills"),
+        varde_code::hooks::PI_AGENT => home.join(".pi").join("agent").join("skills"),
+        other => home.join(format!(".{other}")).join("skills"),
+    }
+}
+
+/// Resolve the selected skill-install targets. The harness list is shared with
+/// session-start hooks so both surfaces accept the same target names.
+fn resolve_skill_agents(agents: &[String]) -> Result<Vec<&'static str>, String> {
+    resolve_hook_targets(agents)
+        .map(|targets| targets.into_iter().map(|target| target.agent).collect())
 }
 
 /// Run one `hooks list` invocation: describes the 4 supported agent hook
@@ -1072,7 +1147,8 @@ fn run_extract(path: &str) {
 #[cfg(test)]
 mod nav_map_text_tests {
     use super::{
-        default_hook_dir, install_or_remove_hooks, render_nav_map_text, resolve_hook_targets,
+        default_hook_dir, default_skill_dir, install_or_remove_hooks, install_skills_for_agents,
+        remove_skills_for_agents, render_nav_map_text, resolve_hook_targets, resolve_skill_agents,
         run_hooks_list,
     };
 
@@ -1416,5 +1492,55 @@ mod nav_map_text_tests {
         // Sanity: install_or_remove_hooks with dir=None would target these
         // dirs (not exercised here to avoid touching the real home dir).
         assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
+    fn skill_agents_default_to_all_four_harnesses() {
+        let agents = resolve_skill_agents(&[]).expect("empty --agent resolves");
+        assert_eq!(agents.len(), 4);
+        assert!(agents.contains(&varde_code::hooks::CLAUDE_AGENT));
+        assert!(agents.contains(&varde_code::hooks::CODEX_AGENT));
+        assert!(agents.contains(&varde_code::hooks::OPENCODE_AGENT));
+        assert!(agents.contains(&varde_code::hooks::PI_AGENT));
+    }
+
+    #[test]
+    fn skill_default_dirs_match_harness_discovery_locations() {
+        assert!(default_skill_dir("claude").ends_with(".claude/skills"));
+        assert!(default_skill_dir("codex").ends_with(".agents/skills"));
+        assert!(default_skill_dir("opencode").ends_with(".config/opencode/skills"));
+        assert!(default_skill_dir("pi").ends_with(".pi/agent/skills"));
+    }
+
+    #[test]
+    fn skill_install_with_dir_installs_for_each_selected_harness() {
+        let dir = tempdir("skills-install-all");
+        let agents = resolve_skill_agents(&[]).expect("empty --agent resolves");
+        let result = install_skills_for_agents(&agents, false, Some(dir.to_str().unwrap()))
+            .expect("install succeeds");
+        let targets = result["targetDirs"].as_array().expect("target dirs array");
+        let installed = result["installed"].as_array().expect("installed array");
+        assert_eq!(targets.len(), 4);
+        let shipped_file_count: usize = varde_code::skills::SKILL_PACKS
+            .iter()
+            .map(|pack| pack.files.len())
+            .sum();
+        assert_eq!(installed.len(), shipped_file_count * 4);
+        assert!(dir.join("varde-code-codebase-navigation/SKILL.md").exists());
+        assert!(
+            dir.join("varde-code-codebase-navigation/agents/openai.yaml")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn skill_remove_with_dir_removes_shared_harness_installation() {
+        let dir = tempdir("skills-remove-all");
+        let agents = resolve_skill_agents(&[]).expect("empty --agent resolves");
+        install_skills_for_agents(&agents, false, Some(dir.to_str().unwrap()))
+            .expect("install succeeds");
+        remove_skills_for_agents(&agents, false, Some(dir.to_str().unwrap()))
+            .expect("remove succeeds");
+        assert!(!dir.join("varde-code-codebase-navigation").exists());
     }
 }

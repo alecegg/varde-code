@@ -1,9 +1,9 @@
-//! Installable Claude Code skills shipped with the binary.
+//! Installable agent skills shipped with the binary.
 //!
 //! These are the same skill files this repo uses on itself (under
 //! `.claude/skills/`), compiled in via `include_str!` so `skills_install` can
-//! write them into any target directory the user chooses (their global
-//! `~/.claude/skills/`, a project's `.claude/skills/`, or anywhere else) —
+//! write them into any target directory the user chooses (their global agent
+//! skill directory, a project's skill directory, or anywhere else) —
 //! no network access, no separate download step. Installed skill directories
 //! are always named `varde-code-<pack name>` so they're recognizable and
 //! never collide with a user's own skills.
@@ -30,12 +30,14 @@ pub const SKILL_PACKS: &[SkillPack] = &[
         files: &[
             SkillFile {
                 rel_path: "SKILL.md",
-                contents: include_str!("../../../.claude/skills/rule-authoring/SKILL.md"),
+                contents: include_str!(
+                    "../../../.claude/skills/varde-code-rule-authoring/SKILL.md"
+                ),
             },
             SkillFile {
                 rel_path: "references/RULE-FORMAT.md",
                 contents: include_str!(
-                    "../../../.claude/skills/rule-authoring/references/RULE-FORMAT.md"
+                    "../../../.claude/skills/varde-code-rule-authoring/references/RULE-FORMAT.md"
                 ),
             },
         ],
@@ -44,15 +46,25 @@ pub const SKILL_PACKS: &[SkillPack] = &[
         name: "rule-scan-triage",
         files: &[SkillFile {
             rel_path: "SKILL.md",
-            contents: include_str!("../../../.claude/skills/rule-scan-triage/SKILL.md"),
+            contents: include_str!("../../../.claude/skills/varde-code-rule-scan-triage/SKILL.md"),
         }],
     },
     SkillPack {
         name: "codebase-navigation",
-        files: &[SkillFile {
-            rel_path: "SKILL.md",
-            contents: include_str!("../../../.claude/skills/codebase-navigation/SKILL.md"),
-        }],
+        files: &[
+            SkillFile {
+                rel_path: "SKILL.md",
+                contents: include_str!(
+                    "../../../.claude/skills/varde-code-codebase-navigation/SKILL.md"
+                ),
+            },
+            SkillFile {
+                rel_path: "agents/openai.yaml",
+                contents: include_str!(
+                    "../../../.claude/skills/varde-code-codebase-navigation/agents/openai.yaml"
+                ),
+            },
+        ],
     },
 ];
 
@@ -201,6 +213,14 @@ mod tests {
             dir.join("varde-code-rule-authoring/references/RULE-FORMAT.md")
                 .exists()
         );
+        assert!(
+            dir.join("varde-code-codebase-navigation/agents/openai.yaml")
+                .exists()
+        );
+        let navigation_ui =
+            fs::read_to_string(dir.join("varde-code-codebase-navigation/agents/openai.yaml"))
+                .expect("navigation UI metadata reads");
+        assert!(navigation_ui.contains("$varde-code-codebase-navigation"));
 
         let removed = remove_skills(&dir, false).expect("remove succeeds");
         assert_eq!(removed.len(), installed.len());
@@ -243,5 +263,22 @@ mod tests {
             .expect("entry present");
         assert!(entry.removed && !entry.skipped_modified);
         assert!(!edited.exists());
+    }
+
+    #[test]
+    fn skill_names_match_portable_install_directories() {
+        for pack in SKILL_PACKS {
+            let skill = pack
+                .files
+                .iter()
+                .find(|file| file.rel_path == "SKILL.md")
+                .expect("every pack has SKILL.md");
+            let name = format!("name: {}", install_dir_name(pack.name));
+            assert!(
+                skill.contents.contains(&name),
+                "{} must declare {name}",
+                pack.name
+            );
+        }
     }
 }

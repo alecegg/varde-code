@@ -1,5 +1,5 @@
 ---
-name: rule-authoring
+name: varde-code-rule-authoring
 description: >
   TRIGGER: Walk through creating a custom varde-code scan rule (kind=pattern
   or kind=sql) with the user — collaboratively pick the rule type, table/

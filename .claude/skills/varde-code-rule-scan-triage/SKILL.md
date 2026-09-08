@@ -1,5 +1,5 @@
 ---
-name: rule-scan-triage
+name: varde-code-rule-scan-triage
 description: >
   TRIGGER: Run a varde-code scan, triage each finding as a real issue or a
   false positive, and fix the real ones. Use when the user asks to "run a

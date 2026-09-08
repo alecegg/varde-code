@@ -25,11 +25,11 @@ Scan rules (built-in + user + repo scope):\n\
   varde-code rules_remove --json '{\"repoRoot\":\"<path>\"}' # undo a seed (skips locally-edited files)\n\
   Add --user to rules_seed/rules_remove to target ~/.config/varde-code/rules/ instead.\n\
 \n\
-Claude Code skills (rule authoring, rule-scan triage, codebase navigation):\n\
-  varde-code skills_list                                    # see what's bundled, no writes\n\
-  varde-code skills_install --dir <path>                    # install as varde-code-<name>/ under <path>\n\
-  varde-code skills_remove --dir <path>                     # undo an install (skips locally-edited files)\n\
-  <path> is your choice, e.g. ~/.claude/skills or ./.claude/skills.\n\
+Agent skills (rule authoring, rule-scan triage, codebase navigation):\n\
+  varde-code skills_list                                    # list packs and harness targets\n\
+  varde-code skills_install [--agent <harness>]             # install for Claude, Codex, OpenCode, or Pi\n\
+  varde-code skills_remove [--agent <harness>]              # undo an install (skips locally-edited files)\n\
+  --agent is repeatable or comma-separated; omitting it targets all harnesses.\n\
 \n\
 Run `varde-code <subcommand> --help` for a subcommand's full input shape."
 )]
@@ -327,40 +327,45 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// List the Claude Code skills that ship with this binary (rule
-    /// authoring, rule-scan triage, codebase navigation) and the directory
-    /// name each installs as (`varde-code-<name>`) — no filesystem writes.
+    /// List the agent skills that ship with this binary and their supported
+    /// harness targets (Claude, Codex, OpenCode, Pi) — no filesystem writes.
     /// (see `skills_list` help for inputs)
     #[command(name = "skills_list")]
     SkillsList,
-    /// Install the bundled Claude Code skills into a directory of your
-    /// choice — e.g. your global `~/.claude/skills/` or a project's
-    /// `.claude/skills/`. Each pack is written as its own
-    /// `varde-code-<name>/` subdirectory so it's easy to identify and never
-    /// collides with your own skills. Existing files are left untouched
-    /// unless `--force`. Undo with `skills_remove` (same `--dir`/`--force`).
+    /// Install the bundled agent skills for Claude, Codex, OpenCode, and Pi.
+    /// Omitting `--agent` targets all four harnesses. Each pack is written as
+    /// its own `varde-code-<name>/` subdirectory. Existing files are left
+    /// untouched unless `--force`. `--dir` overrides each selected harness's
+    /// default directory, primarily for project-local installs and testing.
     /// (see `skills_install` help)
     #[command(name = "skills_install")]
     SkillsInstall {
+        /// Harnesses to target: `claude`, `codex`, `opencode`, `pi`.
+        /// Repeatable or comma-separated. Defaults to all four.
+        #[arg(long = "agent", value_delimiter = ',')]
+        agent: Vec<String>,
         /// Target directory to install skill packs into.
         #[arg(long)]
-        dir: String,
+        dir: Option<String>,
         /// Overwrite files that already exist (default: leave them alone).
         #[arg(long)]
         force: bool,
     },
-    /// Undo `skills_install`: delete previously installed
-    /// `varde-code-<name>/` skill directories from `--dir`. Only files
-    /// matching a shipped skill pack are touched; anything else in the
-    /// directory (including your own skills) is left alone. A file edited
-    /// since install is skipped unless `--force` (which discards those local
-    /// edits). Empty pack directories are removed once cleared.
+    /// Undo `skills_install` for the selected harnesses (all four by default).
+    /// `--dir` overrides each selected harness's default directory. Only files
+    /// matching a shipped skill pack are touched. A file edited since install
+    /// is skipped unless `--force`. Empty pack directories are removed once
+    /// cleared.
     /// (see `skills_remove` help)
     #[command(name = "skills_remove")]
     SkillsRemove {
+        /// Harnesses to target: `claude`, `codex`, `opencode`, `pi`.
+        /// Repeatable or comma-separated. Defaults to all four.
+        #[arg(long = "agent", value_delimiter = ',')]
+        agent: Vec<String>,
         /// Directory skill packs were installed into.
         #[arg(long)]
-        dir: String,
+        dir: Option<String>,
         /// Also remove installed files that were locally modified.
         #[arg(long)]
         force: bool,
