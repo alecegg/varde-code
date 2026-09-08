@@ -1,8 +1,8 @@
 ---
 type: task
 parent: 2026-09-08-cross-language-vertical-sprawl/jvm-swift-callables
-status: backlog
-verified: pending
+status: done
+verified: passed
 depends_on:
   - swift-accessors
 modifies:
@@ -24,3 +24,5 @@ Emit Functions for Java compact record constructors.
 
 #### Progress
 
+- Emitted named Functions for compact record constructors.
+- Verified Java extraction and vertical sprawl tests.

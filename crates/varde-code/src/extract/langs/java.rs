@@ -1,7 +1,8 @@
 //! Java entity extraction.
 //!
 //! Java-specific mapping notes (fixture-driven, superset-safe):
-//! - method_declaration / constructor_declaration -> Function.
+//! - method_declaration / constructor_declaration / compact_constructor_declaration
+//!   -> Function.
 //! - class_declaration -> Class; interface_declaration -> Interface.
 //! - field_declaration / local_variable_declaration / constant_declaration ->
 //!   Variable, one Entity per variable_declarator name (handles `int a = 1,
@@ -29,7 +30,11 @@ use ast_grep_language::SupportLang;
 
 /// Node kinds that introduce a named function scope.
 pub const TYPE_SCOPES: &[&str] = &["class_declaration", "interface_declaration"];
-pub const FUNCTION_SCOPES: &[&str] = &["method_declaration", "constructor_declaration"];
+pub const FUNCTION_SCOPES: &[&str] = &[
+    "method_declaration",
+    "constructor_declaration",
+    "compact_constructor_declaration",
+];
 
 /// Entity kinds the fixtures must produce.
 pub const REQUIRED_KINDS: [EntityKind; 14] = [
@@ -71,10 +76,10 @@ pub fn visit(
         }
 
         // ---- structural ----
-        "method_declaration" | "constructor_declaration" => {
+        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
             ctx.push(
                 EntityKind::Function,
-                field_name(node).unwrap_or_default(),
+                function_scope_name(node).unwrap_or_default(),
                 node,
             );
         }
@@ -415,6 +420,22 @@ fn annotation_owner_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) ->
         .and_then(|a| field_name(&a))
 }
 
+/// Stable name for a Java callable scope.
+///
+/// Compact record constructors have no direct `name` field. Their record
+/// declaration supplies the constructor name instead.
+pub fn function_scope_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    field_name(node).or_else(|| {
+        (node.kind() == "compact_constructor_declaration")
+            .then(|| {
+                node.ancestors()
+                    .find(|ancestor| ancestor.kind() == "record_declaration")
+                    .and_then(|ancestor| field_name(&ancestor))
+            })
+            .flatten()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,5 +510,26 @@ mod tests {
         assert_eq!(decorators.len(), 1, "entities: {entities:?}");
         assert_eq!(decorators[0].name, "Override");
         assert_eq!(decorators[0].enclosing_function.as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn compact_record_constructor_is_a_named_function_scope() {
+        let src = "record Order(String id) { Order { validate(id); } }";
+        let parsed = parse_source(&SupportLang::Java, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        let functions: Vec<&Entity> = entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(functions.len(), 1, "entities: {entities:?}");
+        assert_eq!(functions[0].name, "Order");
+
+        let call = entities
+            .iter()
+            .find(|entity| entity.kind == EntityKind::Call)
+            .expect("compact constructor call");
+        assert_eq!(call.enclosing_function.as_deref(), Some("Order"));
     }
 }
