@@ -180,7 +180,14 @@ pub fn visit(
             if let Some(ty) = node.field("type") {
                 push_type_ref_for_var(ctx, &strip_generic_args(&ty.text()), &name, node);
             }
-            ctx.push(EntityKind::Variable, name, node);
+            ctx.push(EntityKind::Variable, name.clone(), node);
+            if is_expression_bodied_property(node) {
+                ctx.push(
+                    EntityKind::Function,
+                    function_scope_name(node).unwrap_or_default(),
+                    node,
+                );
+            }
         }
 
         // ---- variables / parameters ----
@@ -342,6 +349,9 @@ pub fn visit(
 /// declared property, event, or indexer owner prevents unrelated accessors
 /// from sharing the same diagnostic label and enclosing-function tag.
 pub fn function_scope_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    if is_expression_bodied_property(node) {
+        return field_name(node).map(|name| format!("{name}.get"));
+    }
     if node.kind() != "accessor_declaration" {
         return field_name(node);
     }
@@ -355,6 +365,19 @@ pub fn function_scope_name(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) 
         }
     });
     (!owner_name.is_empty()).then(|| format!("{owner_name}.{operation}"))
+}
+
+/// Whether `node` is a property whose getter is an arrow-expression body.
+pub fn is_expression_bodied_property(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> bool {
+    node.kind() == "property_declaration"
+        && node
+            .field("value")
+            .is_some_and(|body| body.kind() == "arrow_expression_clause")
+}
+
+/// Whether this node introduces a C# function scope.
+pub fn is_function_scope(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>, kind: &str) -> bool {
+    FUNCTION_SCOPES.contains(&kind) || is_expression_bodied_property(node)
 }
 
 /// Emit a `TypeRef` entity linking a variable/parameter to its declared type:
@@ -689,6 +712,26 @@ mod tests {
                 .iter()
                 .any(|e| { e.kind == EntityKind::Function && e.name == "Count.get" }),
             "accessor function: {entities:?}"
+        );
+        let call = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Call && e.name == "Load")
+            .expect("Load call captured");
+        assert_eq!(call.enclosing_function.as_deref(), Some("Count.get"));
+    }
+
+    #[test]
+    fn expression_bodied_property_is_a_named_function_scope() {
+        let src = "class Catalog { int Count => Load(); }";
+        let parsed = parse_source(&SupportLang::CSharp, src);
+        assert!(!parsed.has_error(), "fixture must parse cleanly");
+        let entities = extract::extract(&parsed, 0).entities;
+
+        assert!(
+            entities
+                .iter()
+                .any(|e| { e.kind == EntityKind::Function && e.name == "Count.get" }),
+            "property function: {entities:?}"
         );
         let call = entities
             .iter()

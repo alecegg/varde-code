@@ -201,6 +201,18 @@ pub fn function_scopes(lang: SupportLang) -> &'static [&'static str] {
     }
 }
 
+/// Whether this syntax node introduces a function scope.
+pub fn is_function_scope(
+    lang: SupportLang,
+    node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>,
+    kind: &str,
+) -> bool {
+    match lang {
+        SupportLang::CSharp => cs::is_function_scope(node, kind),
+        _ => function_scopes(lang).contains(&kind),
+    }
+}
+
 /// Stable name for the function scope introduced by `node`.
 ///
 /// Most grammars expose a declaration's own `name` field. C# accessors need

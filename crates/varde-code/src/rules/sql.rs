@@ -887,6 +887,36 @@ mod tests {
     }
 
     #[test]
+    fn builtin_vertical_slice_sprawl_excludes_nested_function_calls() {
+        let (_dir, conn) = temp_db("builtin-vertical-slice-sprawl-nested");
+        conn.execute_batch(
+            "INSERT INTO files (path, community_id) VALUES
+                ('home.cs', 0), ('slice_a.cs', 1), ('slice_b.cs', 2), ('slice_c.cs', 3);
+             INSERT INTO entities (kind, name, file_id, start_byte, end_byte,
+                                   start_line, start_col, end_line, end_col)
+             VALUES
+                (0, 'Outer', 1, 0, 500, 1, 0, 50, 1),
+                (0, 'Local', 1, 100, 300, 10, 0, 30, 1),
+                (6, 'a', 1, 110, 115, 11, 0, 11, 5),
+                (6, 'b', 1, 120, 125, 12, 0, 12, 5),
+                (6, 'c', 1, 130, 135, 13, 0, 13, 5);
+             INSERT INTO resolved_edges (from_file_id, to_file_id, kind, resolved, from_entity_id)
+             VALUES (1, 2, 0, 1, 3), (1, 3, 0, 1, 4), (1, 4, 0, 1, 5);",
+        )
+        .expect("fixture inserts");
+
+        let rules = crate::rules::builtin_rules();
+        let (findings, diagnostics) = run_sql_rules(&rules, &conn).expect("runs");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let sprawl_findings: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.rule_id == "vertical-slice-sprawl")
+            .collect();
+        assert_eq!(sprawl_findings.len(), 1, "{sprawl_findings:?}");
+        assert_eq!(sprawl_findings[0].evidence["name"], "Local");
+    }
+
+    #[test]
     fn builtin_duplicate_code_clone_fires_only_for_bands_at_or_above_min_size() {
         let (_dir, conn) = temp_db("builtin-clone");
         conn.execute_batch(

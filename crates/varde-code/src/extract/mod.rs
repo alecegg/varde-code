@@ -153,7 +153,7 @@ fn walk(
     }
 
     // Named functions/methods push onto the enclosing stack for children.
-    let is_scope = langs::function_scopes(ctx.lang).contains(&kind);
+    let is_scope = langs::is_function_scope(ctx.lang, node, kind);
     if is_scope {
         ctx.enclosing
             .push(langs::function_scope_name(ctx.lang, node).unwrap_or_default());
