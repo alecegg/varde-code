@@ -268,7 +268,7 @@ fn run_pattern_rule(
             "path": repo_root.display().to_string(),
             "language": crate::parse::language_name(&lang),
         });
-        let matches = match crate::query::find_pattern::find_pattern(&input) {
+        let matches = match crate::query::find_pattern::find_pattern_unbounded(&input) {
             Ok(matches) => matches,
             Err(e) if e.code == "invalid_pattern" => {
                 parse_failures += 1;

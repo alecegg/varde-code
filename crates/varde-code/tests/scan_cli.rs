@@ -33,9 +33,13 @@ fn write(path: &Path, contents: &str) {
 
 /// Build the fixture repo and return (home, repo).
 fn build_fixture(tag: &str, severity: &str) -> (PathBuf, PathBuf) {
+    build_fixture_with_source(tag, severity, TS_FIXTURE)
+}
+
+fn build_fixture_with_source(tag: &str, severity: &str, source: &str) -> (PathBuf, PathBuf) {
     let home = tempdir(&format!("{tag}-home"));
     let repo = tempdir(&format!("{tag}-repo"));
-    write(&repo.join("main.ts"), TS_FIXTURE);
+    write(&repo.join("main.ts"), source);
     write(
         &repo.join(".varde-code/rules/pack.toml"),
         &format!(
@@ -80,6 +84,30 @@ fn error_finding_exits_nonzero_with_default_threshold() {
         payload["data"]["findings"].as_array().map(|a| a.len()),
         Some(1)
     );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn scan_returns_every_finding_without_truncation_metadata() {
+    let traces = (0..101)
+        .map(|index| format!("  console.trace(\"trace-{index}\");\n"))
+        .collect::<String>();
+    let source = format!("function traceEverything() {{\n{traces}}}\n");
+    let (home, repo) = build_fixture_with_source("unlimited", "warning", &source);
+
+    let out = scan(&home, &[&format!(r#"{{"repoRoot":"{}"}}"#, repo.display())]);
+    assert!(out.status.success(), "warning findings → exit 0");
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("envelope JSON");
+    let findings = payload["data"]["findings"]
+        .as_array()
+        .expect("findings array");
+    assert_eq!(findings.len(), 101, "every finding is returned");
+    assert!(
+        payload["data"]["guide"]["truncated"]["findings"].is_null(),
+        "scan reports no finding truncation"
+    );
+
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -175,6 +203,62 @@ fn ruby_mixins_do_not_trigger_interface_solid_rules() {
     assert!(
         offenders.is_empty(),
         "Ruby mixins must not trigger interface SOLID rules, got: {offenders:?}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn csharp_auto_properties_do_not_trigger_solid_isp() {
+    let home = tempdir("csharp-auto-properties-home");
+    let repo = tempdir("csharp-auto-properties-repo");
+    write(
+        &repo.join("Worker.cs"),
+        r#"
+interface IWide {
+  void First(); void Second(); void Third(); void Fourth();
+  void Fifth(); void Sixth(); void Seventh(); void Eighth();
+}
+
+class Worker : IWide {
+  public int One { get; set; }
+  public int Two { get; set; }
+  public int Three { get; set; }
+  public int Four { get; set; }
+  public int Five { get; set; }
+  public int Six { get; set; }
+  public int Seven { get; set; }
+  public int Eight { get; set; }
+
+  public void First() { System.Console.WriteLine(); }
+  public void Second() { System.Console.WriteLine(); }
+  public void Third() { System.Console.WriteLine(); }
+  public void Fourth() { System.Console.WriteLine(); }
+  public void Fifth() { System.Console.WriteLine(); }
+  public void Sixth() { System.Console.WriteLine(); }
+  public void Seventh() { System.Console.WriteLine(); }
+  public void Eighth() { System.Console.WriteLine(); }
+}
+"#,
+    );
+    let build = Command::new(bin())
+        .args(["build", "--repo-root"])
+        .arg(&repo)
+        .env("HOME", &home)
+        .output()
+        .expect("build runs");
+    assert!(build.status.success(), "build fails: {:?}", build.status);
+
+    let out = scan(&home, &[&format!(r#"{{"repoRoot":"{}"}}"#, repo.display())]);
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("envelope JSON");
+    let findings = payload["data"]["findings"]
+        .as_array()
+        .expect("findings array");
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding["rule_id"] == "solid-isp"),
+        "auto-properties must not count as empty ISP stubs: {findings:?}"
     );
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&repo);

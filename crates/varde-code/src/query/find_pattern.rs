@@ -1159,6 +1159,20 @@ fn match_source(
 /// node object for `$VAR`, an array for `$$$VAR`. `guide.truncated.matches`
 /// reports shown and total counts when the bounded result omits matches.
 pub fn find_pattern(input: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+    find_pattern_with_compaction(input, true)
+}
+
+/// Internal scan path that preserves every match.
+pub(crate) fn find_pattern_unbounded(
+    input: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    find_pattern_with_compaction(input, false)
+}
+
+fn find_pattern_with_compaction(
+    input: &serde_json::Value,
+    compact: bool,
+) -> Result<serde_json::Value, ApiError> {
     let pattern_text = req_str(input, "pattern")?;
 
     let single_file = input
@@ -1211,7 +1225,7 @@ pub fn find_pattern(input: &serde_json::Value) -> Result<serde_json::Value, ApiE
                 m
             })
             .collect();
-        return Ok(compact_matches(out));
+        return Ok(compact_matches(out, compact));
     }
 
     let profile = std::env::var_os("VARDE_PROFILE").is_some();
@@ -1327,12 +1341,12 @@ pub fn find_pattern(input: &serde_json::Value) -> Result<serde_json::Value, ApiE
             },
         );
     }
-    Ok(compact_matches(out))
+    Ok(compact_matches(out, compact))
 }
 
-fn compact_matches(mut matches: Vec<serde_json::Value>) -> serde_json::Value {
+fn compact_matches(mut matches: Vec<serde_json::Value>, compact: bool) -> serde_json::Value {
     let total = matches.len();
-    if total <= MATCH_LIMIT {
+    if !compact || total <= MATCH_LIMIT {
         return serde_json::json!({ "matches": matches });
     }
     matches.truncate(MATCH_LIMIT);

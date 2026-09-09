@@ -94,10 +94,14 @@ pub fn visit(
         }
 
         // ---- structural ----
-        "method_declaration"
-        | "constructor_declaration"
-        | "local_function_statement"
-        | "accessor_declaration" => {
+        "method_declaration" | "constructor_declaration" | "local_function_statement" => {
+            ctx.push(
+                EntityKind::Function,
+                function_scope_name(node).unwrap_or_default(),
+                node,
+            );
+        }
+        "accessor_declaration" if has_accessor_body(node) => {
             ctx.push(
                 EntityKind::Function,
                 function_scope_name(node).unwrap_or_default(),
@@ -386,9 +390,20 @@ pub fn is_expression_bodied_property(node: &ast_grep_core::Node<'_, StrDoc<Suppo
         .is_some_and(|body| body.kind() == "arrow_expression_clause")
 }
 
+/// Whether an accessor has an explicit block or arrow-expression body.
+///
+/// Auto-property accessors (`get;` / `set;`) have no `body` field. They are
+/// compiler-generated implementation details, not functions authored by the
+/// caller, so they must not affect function-based rules such as SOLID ISP.
+pub fn has_accessor_body(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>) -> bool {
+    node.kind() == "accessor_declaration" && node.field("body").is_some()
+}
+
 /// Whether this node introduces a C# function scope.
 pub fn is_function_scope(node: &ast_grep_core::Node<'_, StrDoc<SupportLang>>, kind: &str) -> bool {
-    FUNCTION_SCOPES.contains(&kind) || is_expression_bodied_property(node)
+    (FUNCTION_SCOPES.contains(&kind) && kind != "accessor_declaration")
+        || has_accessor_body(node)
+        || is_expression_bodied_property(node)
 }
 
 /// Emit a `TypeRef` entity linking a variable/parameter to its declared type:
@@ -713,22 +728,24 @@ mod tests {
 
     #[test]
     fn property_accessor_is_a_named_function_scope() {
-        let src = "class Catalog { int Count { get { return Load(); } } }";
+        let src = "class Catalog { int Count { get { return Load(); } set => Save(value); } }";
         let parsed = parse_source(&SupportLang::CSharp, src);
         assert!(!parsed.has_error(), "fixture must parse cleanly");
         let entities = extract::extract(&parsed, 0).entities;
 
-        assert!(
-            entities
+        for (name, call_name) in [("Count.get", "Load"), ("Count.set", "Save")] {
+            assert!(
+                entities
+                    .iter()
+                    .any(|e| e.kind == EntityKind::Function && e.name == name),
+                "accessor function {name}: {entities:?}"
+            );
+            let call = entities
                 .iter()
-                .any(|e| { e.kind == EntityKind::Function && e.name == "Count.get" }),
-            "accessor function: {entities:?}"
-        );
-        let call = entities
-            .iter()
-            .find(|e| e.kind == EntityKind::Call && e.name == "Load")
-            .expect("Load call captured");
-        assert_eq!(call.enclosing_function.as_deref(), Some("Count.get"));
+                .find(|e| e.kind == EntityKind::Call && e.name == call_name)
+                .expect("accessor call captured");
+            assert_eq!(call.enclosing_function.as_deref(), Some(name));
+        }
     }
 
     #[test]
