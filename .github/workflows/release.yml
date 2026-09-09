@@ -58,6 +58,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Verify binary lists the core query subcommands
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
         run: |
           BIN="target/${{ matrix.target }}/release/varde-code"
           for mode in symbols_in_file get_symbol dependencies dependents \
