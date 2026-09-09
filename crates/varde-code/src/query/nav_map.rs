@@ -1499,7 +1499,10 @@ mod nav_map_tests {
             );
         }
         assert!(
-            data["module_layers"]["edges"].as_array().unwrap().len() > 0,
+            !data["module_layers"]["edges"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
             "module edges lost their reserve to cycles: {data}"
         );
         assert_eq!(
